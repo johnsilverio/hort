@@ -4,7 +4,7 @@
 # hort is a binary crate → KEEP Cargo.lock committed (do not ignore it).
 
 # --- Private design & local tooling (kept OUT of the public repo) ---
-/docs/
+/specs/
 /.claude/
 CLAUDE.md mirrors the private design decisions. Uncomment to keep it private too:
 /CLAUDE.md
