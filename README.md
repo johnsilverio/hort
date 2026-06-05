@@ -1,6 +1,7 @@
 <p align="center">
-  <img width="640" height="320" alt="hort cli tool logo" src="https://github.com/user-attachments/assets/95763b65-1875-443c-8e4e-5f9d6d885f4a" />
+  <img width="640" height="202" alt="hort cli tool logo" src="https://github.com/user-attachments/assets/c1e65c63-cdeb-4d11-aa09-6b597dbf5ccc" />
 </p>
+
 <p align="center">
   <strong>Give your coding agents a place to work that isn't your machine.</strong>
 </p>
