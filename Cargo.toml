@@ -1,0 +1,40 @@
+[package]
+name = "hort"
+version = "0.1.0"
+edition = "2024"
+# MSRV tracks the youki `libcontainer` floor (0.6.0 → Rust 1.85 / edition 2024).
+# Bumping the youki crates may raise this (ADR-0001, ADR-0009).
+rust-version = "1.85"
+
+[features]
+# Privileged integration & acceptance suites (C1–C6) need real user namespaces,
+# a prepared rootfs, and pasta. They are `#[ignore]`-by-default and/or gated on
+# this feature, run only in CI that provides them (testing.md §4.3–§4.4).
+privileged-tests = []
+
+[dependencies]
+clap = { version = "4.6.1", features = ["derive"] }
+json-strip-comments = "3.1.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+
+# --- Deferred dependencies (kept commented; see backlog S-01 note + specs/dependencies.md) ---
+# Not activated by the scaffold: no compiled code uses them yet, and the kernel/network
+# crates pull system libs that would slow or break the skeleton build. Uncomment each one
+# when its adapter/spike lands, and RE-CONFIRM the live version first (ADR-0009).
+#
+# humantime = "2.3.0"      # `prune --idle <duration>` parsing                      (lands in C-05)
+# libcontainer = "0.6.0"   # in-process OCI runtime: namespaces, pivot_root, tenant (lands in A-S1 / SP)
+# libcgroups = "0.6.0"     # per-sandbox cgroup v2 resource ceiling                 (lands in A-S1)
+# landlock = "0.4.5"       # filesystem LSM + egress Layer 2 connect-port restrict  (lands in A-S2)
+# seccompiler = "0.5.0"    # seccomp-BPF syscall filter (SPEC-5: survey said 0.4.0) (lands in A-S1)
+# rustls = "0.23.40"       # SNI/CONNECT proxy TLS primitives (SPEC-2: may be cut)  (lands in A-S2 / SP-1)
+# tls-parser = "0.12.2"    # ClientHello SNI peek, no MITM (SPEC-3)                  (lands in A-S2 / SP-1)
+# inotify = "0.11.2"       # host-side notify-dir watcher                           (lands in A-07)
+# dialoguer = "0.12.0"     # `hort config` onboarding prompts only                  (lands in C-06)
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+serial_test = "3.5.0"
+tempfile = "3.27.0"

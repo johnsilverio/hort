@@ -6,7 +6,8 @@
 # --- Private design & local tooling (kept OUT of the public repo) ---
 /specs/
 /.claude/
-CLAUDE.md mirrors the private design decisions. Uncomment to keep it private too:
+# CLAUDE.md mirrors the private design decisions, so it is kept private too.
+# (Comment out the line below if you ever want it in the public repo.)
 /CLAUDE.md
 
 # --- OS / editor noise ---
