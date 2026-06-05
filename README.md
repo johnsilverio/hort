@@ -1,5 +1,5 @@
 <p align="center">
-  <img width="640" height="202" alt="hort cli tool logo" src="https://github.com/user-attachments/assets/c1e65c63-cdeb-4d11-aa09-6b597dbf5ccc" />
+  <img width="640" height="202" alt="hort cli tool logo" src="https://github.com/user-attachments/assets/bef15444-2edc-429d-8d12-9eb16f1eda96" />
 </p>
 
 <p align="center">
