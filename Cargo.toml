@@ -5,6 +5,12 @@ edition = "2024"
 # MSRV tracks the youki `libcontainer` floor (0.6.0 → Rust 1.85 / edition 2024).
 # Bumping the youki crates may raise this (ADR-0001, ADR-0009).
 rust-version = "1.85"
+description = "Terminal-operated, agent-agnostic manager of ephemeral sandboxes (a git worktree + an embedded-libcontainer OCI container) for running CLI LLM agents in unrestricted mode without exposing the host"
+license = "AGPL-3.0-only"
+repository = "https://github.com/johnsilverio/hort"
+readme = "README.md"
+keywords = ["sandbox", "container", "llm", "agent", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [features]
 # Privileged integration & acceptance suites (C1–C6) need real user namespaces,
