@@ -1,8 +1,17 @@
-//! `HortError`: an enum whose specific variants each carry their VERBATIM
-//! canonical message (PRD §3.0; catalogue in backlog §14). No catch-all
-//! `Other(String)`. `InvalidName` is a unit variant. Hand-written `Display`/
-//! `Error` + `exit_code()` (no `thiserror` — it is not in the dependency survey).
-//!
-//! See backlog D-02.
+//! `HortError`: the domain error type. Specific variants carry their verbatim
+//! canonical message inline (no catch-all `Other(String)` that would drop the
+//! wording), with hand-written `Display`/`Error` and `exit_code()` (no
+//! `thiserror`). Only `InvalidName` exists so far.
 
-// TODO(D-02): the error enum + verbatim canonical messages + exit_code().
+/// Domain error type.
+///
+/// Carries only the `InvalidName` unit variant: the signal a validated newtype
+/// (`SandboxName`/`BranchName`/`Domain`) returns when it rejects its input.
+#[derive(Debug)]
+pub enum HortError {
+    /// A validated domain newtype rejected its input. Matched as a **unit**
+    /// variant (`HortError::InvalidName`), never `HortError::InvalidName { .. }`.
+    InvalidName,
+}
+
+// TODO(D-02): the specific variants + verbatim canonical messages + Display/Error + exit_code().

@@ -33,9 +33,10 @@ serde_json = "1.0.150"
 # libcontainer = "0.6.0"   # in-process OCI runtime: namespaces, pivot_root, tenant (lands in A-S1 / SP)
 # libcgroups = "0.6.0"     # per-sandbox cgroup v2 resource ceiling                 (lands in A-S1)
 # landlock = "0.4.5"       # filesystem LSM + egress Layer 2 connect-port restrict  (lands in A-S2)
-# seccompiler = "0.5.0"    # seccomp-BPF syscall filter (SPEC-5: survey said 0.4.0) (lands in A-S1)
-# rustls = "0.23.40"       # SNI/CONNECT proxy TLS primitives (SPEC-2: may be cut)  (lands in A-S2 / SP-1)
-# tls-parser = "0.12.2"    # ClientHello SNI peek, no MITM (SPEC-3)                  (lands in A-S2 / SP-1)
+# seccompiler = "0.5.0"    # seccomp-BPF syscall filter                             (lands in A-S1)
+# rustls: CUT by SPEC-2. A no-MITM splice proxy never terminates TLS, so it is not needed;
+#         re-add only if hort ever adopts MITM (forbidden by constraint 2). See dependencies.md.
+# tls-parser = "0.12.2"    # ClientHello SNI peek for the no-MITM proxy             (lands in A-S2 / SP-1)
 # inotify = "0.11.2"       # host-side notify-dir watcher                           (lands in A-07)
 # dialoguer = "0.12.0"     # `hort config` onboarding prompts only                  (lands in C-06)
 
