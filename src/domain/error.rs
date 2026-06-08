@@ -24,6 +24,10 @@ pub enum HortError {
     UnknownSandboxOnAttach { name: String },
     /// `down`: no sandbox of this name is known ("what exists" wording).
     UnknownSandboxOnDown { name: String },
+    /// Config parsing failed: the input was not valid JSONC. Carries a
+    /// human-readable detail; the rendered message is not a canonical product
+    /// string, so callers match the variant, not the text.
+    InvalidConfig { detail: String },
 }
 
 impl HortError {
@@ -54,6 +58,7 @@ impl fmt::Display for HortError {
                 f,
                 "no sandbox named '{name}' (run 'hort ls' to see what exists)"
             ),
+            HortError::InvalidConfig { detail } => write!(f, "invalid config: {detail}"),
         }
     }
 }
