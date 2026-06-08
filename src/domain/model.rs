@@ -1,6 +1,9 @@
 //! Domain newtypes: `SandboxName`, `BranchName`, `Domain`, `AnchorPid`,
-//! `MountNsInode`, `LivenessToken`. A validated newtype makes an illegal value
-//! unrepresentable: its constructor returns `Err` instead of wrapping bad input.
+//! `MountNsInode`, `LivenessToken`, plus the `Warning` advisory message. A
+//! validated newtype makes an illegal value unrepresentable: its constructor
+//! returns `Err` instead of wrapping bad input.
+
+use std::fmt;
 
 use crate::domain::error::HortError;
 
@@ -79,6 +82,26 @@ pub struct MountNsInode(u64);
 pub struct LivenessToken {
     pub pid: AnchorPid,
     pub mnt_ns: MountNsInode,
+}
+
+/// A non-fatal advisory surfaced to the user: a config key hort cannot honor, a
+/// `devcontainer.json` field it ignores while mapping, or a host capability it
+/// could not detect during onboarding. A plain message wrapper, not a validated
+/// newtype.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Warning(String);
+
+impl Warning {
+    /// Wrap a human-readable warning message.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl fmt::Display for Warning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 // TODO(D-06): the persisted `SandboxRecord` (private fields) + `Capabilities`.
