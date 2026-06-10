@@ -126,7 +126,7 @@ impl fmt::Display for Warning {
 pub struct SandboxRecord {
     schema_version: u32,
     name: SandboxName,
-    branch: BranchName,
+    branch: Option<BranchName>,
     worktree_path: PathBuf,
     overlay_path: PathBuf,
     created_at: String,
@@ -137,12 +137,14 @@ pub struct SandboxRecord {
 }
 
 impl SandboxRecord {
-    /// Build a fresh pre-anchor record from the intent known at `up` time. The
-    /// liveness token starts `None` because the anchor has not been started yet;
-    /// call [`with_token`](SandboxRecord::with_token) once it is running.
+    /// Build a fresh pre-anchor record from the intent known at `up` time. A
+    /// `branch` of `None` is no-git mode, where hort created no disposable
+    /// worktree. The liveness token starts `None` because the anchor has not been
+    /// started yet; call [`with_token`](SandboxRecord::with_token) once it is
+    /// running.
     pub fn new(
         name: SandboxName,
-        branch: BranchName,
+        branch: Option<BranchName>,
         worktree_path: PathBuf,
         overlay_path: PathBuf,
         created_at: String,
@@ -169,14 +171,33 @@ impl SandboxRecord {
         Self { token: Some(token), ..self }
     }
 
+    /// Record the PID of the host-side notify watcher `up` spawned, returning the
+    /// updated record to persist. A record carries one only when a notify channel
+    /// is configured, so its presence is what later marks a watcher to stop.
+    pub fn with_watcher_pid(self, pid: u32) -> Self {
+        Self { watcher_pid: Some(pid), ..self }
+    }
+
     /// The sandbox identity this record belongs to.
     pub fn name(&self) -> &SandboxName {
         &self.name
     }
 
+    /// The branch hort checked out in the worktree, or `None` in no-git mode
+    /// (where there is no disposable worktree to remove on teardown).
+    pub fn branch(&self) -> Option<&BranchName> {
+        self.branch.as_ref()
+    }
+
     /// The host path of this sandbox's worktree.
     pub fn worktree_path(&self) -> &Path {
         &self.worktree_path
+    }
+
+    /// The PID of the host-side notify watcher, or `None` when no notify channel
+    /// is configured and none was spawned.
+    pub fn watcher_pid(&self) -> Option<u32> {
+        self.watcher_pid
     }
 
     /// The kernel liveness token, or `None` before the anchor has started.
@@ -246,7 +267,7 @@ mod tests {
     fn record_token_is_none_before_anchor() {
         let record = SandboxRecord::new(
             SandboxName::new("demo").unwrap(),
-            BranchName::new("demo").unwrap(),
+            Some(BranchName::new("demo").unwrap()),
             PathBuf::from("/state/sandboxes/demo/worktree-demo"),
             PathBuf::from("/state/sandboxes/demo/overlay"),
             "2026-06-10T12:00:00Z".to_string(),

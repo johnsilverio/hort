@@ -83,7 +83,7 @@ mod tests {
     fn fresh_record() -> SandboxRecord {
         SandboxRecord::new(
             SandboxName::new("demo").unwrap(),
-            BranchName::new("demo").unwrap(),
+            Some(BranchName::new("demo").unwrap()),
             PathBuf::from("/state/sandboxes/demo/worktree-demo"),
             PathBuf::from("/state/sandboxes/demo/overlay"),
             "2026-06-10T12:00:00Z".to_string(),
@@ -145,7 +145,7 @@ mod tests {
     fn record_at(name: &str, worktree_path: &str) -> SandboxRecord {
         SandboxRecord::new(
             SandboxName::new(name).unwrap(),
-            BranchName::new(name).unwrap(),
+            Some(BranchName::new(name).unwrap()),
             PathBuf::from(worktree_path),
             PathBuf::from("/state/sandboxes/overlay"),
             "2026-06-10T12:00:00Z".to_string(),
