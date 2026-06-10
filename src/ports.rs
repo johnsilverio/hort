@@ -7,6 +7,17 @@
 //!
 //! See backlog P-01.
 
-// TODO(P-01): the port traits + plain-data types (OciSpec, NetworkSpec,
-//             Capabilities, Worktree, DbForward, Warning, OnboardingAnswers),
-//             copied verbatim from the ARCH Canonical signatures block.
+use crate::domain::model::LivenessToken;
+
+/// Is this recorded anchor still the live one? Alive iff the PID exists **and**
+/// its mount-namespace inode matches the token — the inode guards against PID
+/// reuse. The real adapter reads `/proc`; tests script the answer.
+pub trait LivenessProbe {
+    fn is_alive(&self, token: &LivenessToken) -> bool;
+}
+
+// TODO(P-01): the remaining port traits + plain-data types — ContainerRuntime,
+//             NetworkProvider, MetadataStore, WorktreeProvider, Notifier, Clock,
+//             EnvironmentProbe, NotifyWatcher, ContainerRegistry, SessionProbe,
+//             OciSpec, NetworkSpec, Capabilities, Worktree, DbForward,
+//             OnboardingAnswers — copied verbatim from the Canonical signatures.

@@ -4,13 +4,17 @@
 //! returns `Err` instead of wrapping bad input.
 
 use std::fmt;
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
 
 use crate::domain::error::HortError;
 
 /// A sandbox identity (the tmux-style name from `hort up <name>`). Validated at
 /// construction: non-empty and usable as both a git branch name and a single
 /// directory component, so `/` is rejected. You cannot hold an invalid one.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct SandboxName(String);
 
 impl SandboxName {
@@ -25,7 +29,8 @@ impl SandboxName {
 
 /// A git branch name. Validated at construction: non-empty. Unlike a sandbox
 /// name a `/` is allowed, since git branches are hierarchical.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct BranchName(String);
 
 impl BranchName {
@@ -72,20 +77,23 @@ fn is_hostname_label(label: &str) -> bool {
 }
 
 /// The anchor process id. Thin wrapper, constructed by tuple (no validation).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AnchorPid(u32);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AnchorPid(pub u32);
 
 /// The mount-namespace inode at `/proc/<pid>/ns/mnt`; guards against PID reuse.
 /// Thin wrapper, constructed by tuple (no validation).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MountNsInode(u64);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MountNsInode(pub u64);
 
 /// The kernel liveness token of a sandbox: the anchor PID plus the
 /// mount-namespace inode (the inode guards PID reuse). A sandbox is alive iff the
 /// PID exists *and* the inode matches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LivenessToken {
     pub pid: AnchorPid,
+    #[serde(rename = "mntNsInode")]
     pub mnt_ns: MountNsInode,
 }
 
@@ -109,7 +117,70 @@ impl fmt::Display for Warning {
     }
 }
 
-// TODO(D-06): the persisted `SandboxRecord` (private fields) + `Capabilities`.
+/// The persisted memory of a sandbox: the intent recorded when `up` builds it,
+/// plus the kernel liveness token filled in once the anchor is running. It is a
+/// cache of intent, never the authority on liveness. The kernel process table
+/// holds that truth. Serialized to `metadata.json` with camelCase keys.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxRecord {
+    schema_version: u32,
+    name: SandboxName,
+    branch: BranchName,
+    worktree_path: PathBuf,
+    overlay_path: PathBuf,
+    created_at: String,
+    last_attach_at: String,
+    notify_channel: Option<String>,
+    watcher_pid: Option<u32>,
+    token: Option<LivenessToken>,
+}
+
+impl SandboxRecord {
+    /// Build a fresh pre-anchor record from the intent known at `up` time. The
+    /// liveness token starts `None` because the anchor has not been started yet;
+    /// call [`with_token`](SandboxRecord::with_token) once it is running.
+    pub fn new(
+        name: SandboxName,
+        branch: BranchName,
+        worktree_path: PathBuf,
+        overlay_path: PathBuf,
+        created_at: String,
+        last_attach_at: String,
+        notify_channel: Option<String>,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            name,
+            branch,
+            worktree_path,
+            overlay_path,
+            created_at,
+            last_attach_at,
+            notify_channel,
+            watcher_pid: None,
+            token: None,
+        }
+    }
+
+    /// Record the running anchor's liveness token (its PID and mount-namespace
+    /// inode), returning the updated record to persist.
+    pub fn with_token(self, token: LivenessToken) -> Self {
+        Self { token: Some(token), ..self }
+    }
+
+    /// The sandbox identity this record belongs to.
+    pub fn name(&self) -> &SandboxName {
+        todo!()
+    }
+
+    /// The kernel liveness token, or `None` before the anchor has started.
+    pub fn liveness_token(&self) -> Option<LivenessToken> {
+        self.token
+    }
+}
+
+// TODO(P-01): `Capabilities` (host/kernel detection) lands with the ports.
 
 #[cfg(test)]
 mod tests {
@@ -164,5 +235,20 @@ mod tests {
     #[test]
     fn domain_rejects_trailing_hyphen_label() {
         assert!(matches!(Domain::new("api-.com"), Err(HortError::InvalidName)));
+    }
+
+    #[test]
+    fn record_token_is_none_before_anchor() {
+        let record = SandboxRecord::new(
+            SandboxName::new("demo").unwrap(),
+            BranchName::new("demo").unwrap(),
+            PathBuf::from("/state/sandboxes/demo/worktree-demo"),
+            PathBuf::from("/state/sandboxes/demo/overlay"),
+            "2026-06-10T12:00:00Z".to_string(),
+            "2026-06-10T12:00:00Z".to_string(),
+            None,
+        );
+
+        assert_eq!(record.liveness_token(), None);
     }
 }
