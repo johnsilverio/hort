@@ -4,7 +4,7 @@
 //! returns `Err` instead of wrapping bad input.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -171,7 +171,12 @@ impl SandboxRecord {
 
     /// The sandbox identity this record belongs to.
     pub fn name(&self) -> &SandboxName {
-        todo!()
+        &self.name
+    }
+
+    /// The host path of this sandbox's worktree.
+    pub fn worktree_path(&self) -> &Path {
+        &self.worktree_path
     }
 
     /// The kernel liveness token, or `None` before the anchor has started.
