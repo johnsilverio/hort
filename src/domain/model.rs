@@ -53,6 +53,11 @@ impl Domain {
             Err(HortError::InvalidName)
         }
     }
+
+    /// The wrapped hostname.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 fn is_hostname(value: &str) -> bool {
