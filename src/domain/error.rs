@@ -46,6 +46,11 @@ pub enum HortError {
     /// a human-readable detail; the rendered message is not a canonical product
     /// string, so callers match the variant, not the text.
     InvalidTimestamp { detail: String },
+    /// On-disk metadata could not be read as a valid record: unreadable JSON, an
+    /// invalid name, an unparseable timestamp, or an unknown schema version.
+    /// Carries a human-readable detail; the rendered message is not a canonical
+    /// product string, so callers match the variant, not the text.
+    CorruptMetadata { detail: String },
 }
 
 impl HortError {
@@ -101,6 +106,7 @@ impl fmt::Display for HortError {
             ),
             HortError::InvalidConfig { detail } => write!(f, "invalid config: {detail}"),
             HortError::InvalidTimestamp { detail } => write!(f, "invalid timestamp: {detail}"),
+            HortError::CorruptMetadata { detail } => write!(f, "corrupt metadata: {detail}"),
         }
     }
 }

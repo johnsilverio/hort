@@ -14,7 +14,7 @@ use crate::domain::error::HortError;
 /// construction: non-empty and usable as both a git branch name and a single
 /// directory component, so `/` is rejected. You cannot hold an invalid one.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(into = "String", try_from = "String")]
 pub struct SandboxName(String);
 
 impl SandboxName {
@@ -32,10 +32,24 @@ impl SandboxName {
     }
 }
 
+impl TryFrom<String> for SandboxName {
+    type Error = HortError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(&value)
+    }
+}
+
+impl From<SandboxName> for String {
+    fn from(name: SandboxName) -> Self {
+        name.0
+    }
+}
+
 /// A git branch name. Validated at construction: non-empty. Unlike a sandbox
 /// name a `/` is allowed, since git branches are hierarchical.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(into = "String", try_from = "String")]
 pub struct BranchName(String);
 
 impl BranchName {
@@ -50,6 +64,20 @@ impl BranchName {
     /// The wrapped branch name.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl TryFrom<String> for BranchName {
+    type Error = HortError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(&value)
+    }
+}
+
+impl From<BranchName> for String {
+    fn from(name: BranchName) -> Self {
+        name.0
     }
 }
 
