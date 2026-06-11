@@ -131,7 +131,7 @@ impl fmt::Display for Warning {
 /// plus the kernel liveness token filled in once the anchor is running. It is a
 /// cache of intent, never the authority on liveness. The kernel process table
 /// holds that truth. Serialized to `metadata.json` with camelCase keys.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SandboxRecord {
     schema_version: u32,
@@ -216,7 +216,35 @@ impl SandboxRecord {
     }
 }
 
-// TODO(P-01): `Capabilities` (host/kernel detection) lands with the ports.
+/// What the host and kernel can actually do, as detected by the environment
+/// probe. The single source for `up`/`attach` preconditions, per-controller
+/// cgroup degradation, and the onboarding generator. Rootfs validity is not here:
+/// validating one needs the configured rootfs path, which is config rather than a
+/// host fact.
+#[derive(Clone)]
+pub struct Capabilities {
+    pub user_ns: bool,
+    pub pasta: Option<PathBuf>,
+    pub cgroup: CgroupCaps,
+    pub landlock_abi: Option<u8>,
+    pub overlayfs_rootless: bool,
+    pub notify_send: bool,
+    pub git: bool,
+}
+
+/// Which cgroup v2 controllers are delegated to hort's user slice. The resource
+/// ceiling caps what is present and degrades with a warning for what is missing.
+#[derive(Clone)]
+pub struct CgroupCaps {
+    pub memory: bool,
+    pub pids: bool,
+    pub cpu: bool,
+    pub cpuset: bool,
+}
+
+/// The answers the onboarding flow collects to drive config generation. An empty
+/// placeholder for now; its fields arrive with the onboarding command.
+pub struct OnboardingAnswers;
 
 #[cfg(test)]
 mod tests {
