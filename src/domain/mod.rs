@@ -5,6 +5,7 @@
 pub mod config;
 pub mod egress;
 pub mod error;
+pub mod idle;
 pub mod model;
 pub mod onboarding;
 pub mod reconcile;

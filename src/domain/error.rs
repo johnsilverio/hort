@@ -28,6 +28,10 @@ pub enum HortError {
     /// human-readable detail; the rendered message is not a canonical product
     /// string, so callers match the variant, not the text.
     InvalidConfig { detail: String },
+    /// A persisted timestamp could not be parsed as strict RFC 3339 UTC. Carries
+    /// a human-readable detail; the rendered message is not a canonical product
+    /// string, so callers match the variant, not the text.
+    InvalidTimestamp { detail: String },
 }
 
 impl HortError {
@@ -59,6 +63,7 @@ impl fmt::Display for HortError {
                 "no sandbox named '{name}' (run 'hort ls' to see what exists)"
             ),
             HortError::InvalidConfig { detail } => write!(f, "invalid config: {detail}"),
+            HortError::InvalidTimestamp { detail } => write!(f, "invalid timestamp: {detail}"),
         }
     }
 }

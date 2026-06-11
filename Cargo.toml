@@ -20,6 +20,7 @@ privileged-tests = []
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
+humantime = "2.3.0"
 json-strip-comments = "3.1.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -29,7 +30,6 @@ serde_json = "1.0.150"
 # crates pull system libs that would slow or break the skeleton build. Uncomment each one
 # when its adapter/spike lands, and RE-CONFIRM the live version first (ADR-0009).
 #
-# humantime = "2.3.0"      # `prune --idle <duration>` parsing                      (lands in C-05)
 # libcontainer = "0.6.0"   # in-process OCI runtime: namespaces, pivot_root, tenant (lands in A-S1 / SP)
 # libcgroups = "0.6.0"     # per-sandbox cgroup v2 resource ceiling                 (lands in A-S1)
 # landlock = "0.4.5"       # filesystem LSM + egress Layer 2 connect-port restrict  (lands in A-S2)
