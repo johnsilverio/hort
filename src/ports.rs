@@ -114,6 +114,15 @@ pub trait Notifier {
     fn notify(&self, message: &str) -> Result<(), HortError>;
 }
 
+/// Asks the user to confirm a destructive action; only `down` and `prune` use it.
+/// The message arrives already rendered, like the notifier's, and the prompt
+/// wording is not a product guarantee: callers assert that the confirmation
+/// happened, never its text. Whether stdin is a TTY is not this port's concern,
+/// the CLI detects that and passes a plain bool into the command.
+pub trait Confirmer {
+    fn confirm(&self, message: &str) -> Result<bool, HortError>;
+}
+
 /// The current wall-clock instant, behind a port so age and idle are computed
 /// against a time the test fixes.
 pub trait Clock {

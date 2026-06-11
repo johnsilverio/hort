@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::SystemTime;
 
 use crate::domain::error::HortError;
@@ -15,10 +16,16 @@ use crate::domain::model::{
     AnchorPid, BranchName, Capabilities, LivenessToken, MountNsInode, SandboxName, SandboxRecord,
 };
 use crate::ports::{
-    Clock, ContainerRegistry, ContainerRuntime, EnvironmentProbe, LivenessProbe, MetadataStore,
-    NetworkProvider, NetworkSpec, Notifier, OciSpec, RegistryEntry, SandboxLock, SessionProbe,
-    Worktree, WorktreeProvider,
+    Clock, Confirmer, ContainerRegistry, ContainerRuntime, EnvironmentProbe, LivenessProbe,
+    MetadataStore, NetworkProvider, NetworkSpec, Notifier, OciSpec, RegistryEntry, SandboxLock,
+    SessionProbe, Worktree, WorktreeProvider,
 };
+
+/// The shared teardown-order witness threaded through the fakes that perform a
+/// teardown step. Each fake, when given one of these, appends its pinned label as
+/// its step runs, so a `down`/`prune` test can assert the mandatory C5 order from
+/// a single recorded sequence (the chartered call-order case of testing.md 7).
+type TeardownTrace = Rc<RefCell<Vec<String>>>;
 
 /// The records a sandbox should exist, kept in a map keyed by name. Honors the
 /// same contract as the file-backed store: `put` upserts, `get` is `Ok(None)`
@@ -26,11 +33,18 @@ use crate::ports::{
 #[derive(Default)]
 pub struct InMemoryMetadataStore {
     records: RefCell<HashMap<SandboxName, SandboxRecord>>,
+    trace: Option<TeardownTrace>,
 }
 
 impl InMemoryMetadataStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record the `store.remove` step on the shared teardown trace.
+    pub fn with_trace(mut self, trace: TeardownTrace) -> Self {
+        self.trace = Some(trace);
+        self
     }
 }
 
@@ -50,6 +64,9 @@ impl MetadataStore for InMemoryMetadataStore {
 
     fn remove(&self, name: &SandboxName) -> Result<(), HortError> {
         self.records.borrow_mut().remove(name);
+        if let Some(trace) = &self.trace {
+            trace.borrow_mut().push("store.remove".to_string());
+        }
         Ok(())
     }
 }
@@ -63,6 +80,7 @@ pub struct FakeRuntime {
     start_fails: bool,
     joins: RefCell<Vec<SandboxName>>,
     teardowns: RefCell<Vec<SandboxName>>,
+    trace: Option<TeardownTrace>,
 }
 
 impl FakeRuntime {
@@ -72,6 +90,7 @@ impl FakeRuntime {
             start_fails: false,
             joins: RefCell::new(Vec::new()),
             teardowns: RefCell::new(Vec::new()),
+            trace: None,
         }
     }
 
@@ -80,6 +99,12 @@ impl FakeRuntime {
     /// the witness is the half-built persisted record, not the error variant.
     pub fn failing_start(token: LivenessToken) -> Self {
         Self { start_fails: true, ..Self::new(token) }
+    }
+
+    /// Record the `runtime.teardown` step on the shared teardown trace.
+    pub fn with_trace(mut self, trace: TeardownTrace) -> Self {
+        self.trace = Some(trace);
+        self
     }
 
     pub fn joins(&self) -> Vec<SandboxName> {
@@ -108,6 +133,9 @@ impl ContainerRuntime for FakeRuntime {
 
     fn teardown(&self, name: &SandboxName) -> Result<(), HortError> {
         self.teardowns.borrow_mut().push(name.clone());
+        if let Some(trace) = &self.trace {
+            trace.borrow_mut().push("runtime.teardown".to_string());
+        }
         Ok(())
     }
 }
@@ -118,11 +146,18 @@ impl ContainerRuntime for FakeRuntime {
 pub struct FakeNetwork {
     provisioned: RefCell<Vec<SandboxName>>,
     teardowns: RefCell<Vec<SandboxName>>,
+    trace: Option<TeardownTrace>,
 }
 
 impl FakeNetwork {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record the `network.teardown` step on the shared teardown trace.
+    pub fn with_trace(mut self, trace: TeardownTrace) -> Self {
+        self.trace = Some(trace);
+        self
     }
 
     pub fn provisioned(&self) -> Vec<SandboxName> {
@@ -142,6 +177,9 @@ impl NetworkProvider for FakeNetwork {
 
     fn teardown(&self, name: &SandboxName) -> Result<(), HortError> {
         self.teardowns.borrow_mut().push(name.clone());
+        if let Some(trace) = &self.trace {
+            trace.borrow_mut().push("network.teardown".to_string());
+        }
         Ok(())
     }
 }
@@ -231,6 +269,7 @@ pub struct FakeWorktreeProvider {
     is_git_repo: bool,
     existing_branches: Vec<BranchName>,
     checked_out_branches: Vec<BranchName>,
+    trace: Option<TeardownTrace>,
 }
 
 impl FakeWorktreeProvider {
@@ -241,7 +280,14 @@ impl FakeWorktreeProvider {
             is_git_repo: true,
             existing_branches: Vec::new(),
             checked_out_branches: Vec::new(),
+            trace: None,
         }
+    }
+
+    /// Record the `worktrees.remove` step on the shared teardown trace.
+    pub fn with_trace(mut self, trace: TeardownTrace) -> Self {
+        self.trace = Some(trace);
+        self
     }
 
     /// Script the project as not a git repository.
@@ -292,6 +338,9 @@ impl WorktreeProvider for FakeWorktreeProvider {
     fn remove(&self, name: &SandboxName) -> Result<(), HortError> {
         let path = fake_worktree_path(name);
         self.paths.borrow_mut().retain(|present| present != &path);
+        if let Some(trace) = &self.trace {
+            trace.borrow_mut().push("worktrees.remove".to_string());
+        }
         Ok(())
     }
 
@@ -385,6 +434,37 @@ impl SandboxLock for FakeSandboxLock {
     fn release(&self, name: &SandboxName) -> Result<(), HortError> {
         self.releases.borrow_mut().push(name.clone());
         Ok(())
+    }
+}
+
+/// Answers every confirmation with the same scripted verdict and records the
+/// prompts it was asked, so a test can assert that the confirmation happened
+/// without pinning its wording.
+pub struct FakeConfirmer {
+    answer: bool,
+    prompts: RefCell<Vec<String>>,
+}
+
+impl FakeConfirmer {
+    /// A confirmer that always answers yes.
+    pub fn yes() -> Self {
+        Self { answer: true, prompts: RefCell::new(Vec::new()) }
+    }
+
+    /// A confirmer that always answers no.
+    pub fn no() -> Self {
+        Self { answer: false, prompts: RefCell::new(Vec::new()) }
+    }
+
+    pub fn prompts(&self) -> Vec<String> {
+        self.prompts.borrow().clone()
+    }
+}
+
+impl Confirmer for FakeConfirmer {
+    fn confirm(&self, message: &str) -> Result<bool, HortError> {
+        self.prompts.borrow_mut().push(message.to_owned());
+        Ok(self.answer)
     }
 }
 

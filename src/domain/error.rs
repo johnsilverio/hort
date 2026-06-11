@@ -34,6 +34,10 @@ pub enum HortError {
     UnknownSandboxOnAttach { name: String },
     /// `down`: no sandbox of this name is known ("what exists" wording).
     UnknownSandboxOnDown { name: String },
+    /// `down`/`prune`: confirmation was required but stdin is not a TTY and
+    /// `--force` was not passed. The `command` placeholder renders as "down" or
+    /// "prune".
+    RefusedWithoutConfirmation { command: String },
     /// Config parsing failed: the input was not valid JSONC. Carries a
     /// human-readable detail; the rendered message is not a canonical product
     /// string, so callers match the variant, not the text.
@@ -90,6 +94,10 @@ impl fmt::Display for HortError {
             HortError::UnknownSandboxOnDown { name } => write!(
                 f,
                 "no sandbox named '{name}' (run 'hort ls' to see what exists)"
+            ),
+            HortError::RefusedWithoutConfirmation { command } => write!(
+                f,
+                "refusing to {command} without confirmation: stdin is not a TTY (pass --force to proceed)"
             ),
             HortError::InvalidConfig { detail } => write!(f, "invalid config: {detail}"),
             HortError::InvalidTimestamp { detail } => write!(f, "invalid timestamp: {detail}"),
@@ -188,6 +196,16 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "--branch requires a git repository, but this project is not one"
+        );
+    }
+
+    #[test]
+    fn refused_without_confirmation_error_renders_canonical_string() {
+        let error = HortError::RefusedWithoutConfirmation { command: "down".to_string() };
+
+        assert_eq!(
+            error.to_string(),
+            "refusing to down without confirmation: stdin is not a TTY (pass --force to proceed)"
         );
     }
 
