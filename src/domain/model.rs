@@ -25,6 +25,11 @@ impl SandboxName {
         }
         Ok(Self(value.to_owned()))
     }
+
+    /// The wrapped sandbox name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// A git branch name. Validated at construction: non-empty. Unlike a sandbox
@@ -40,6 +45,11 @@ impl BranchName {
             return Err(HortError::InvalidName);
         }
         Ok(Self(value.to_owned()))
+    }
+
+    /// The wrapped branch name.
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 

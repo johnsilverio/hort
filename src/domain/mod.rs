@@ -8,5 +8,6 @@ pub mod error;
 pub mod idle;
 pub mod model;
 pub mod onboarding;
+pub mod policy;
 pub mod reconcile;
 pub mod teardown;

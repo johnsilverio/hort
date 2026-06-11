@@ -11,13 +11,21 @@ use std::fmt;
 /// interpolates; the message itself is produced by `Display`. `InvalidName` is
 /// the signal a validated newtype (`SandboxName`/`BranchName`/`Domain`) returns
 /// when it rejects its input, matched as a **unit** variant.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum HortError {
     /// A validated domain newtype rejected its input. Matched as a **unit**
     /// variant (`HortError::InvalidName`), never `HortError::InvalidName { .. }`.
     InvalidName,
     /// `up`: a fully built sandbox of this name already exists.
     DuplicateName { name: String },
+    /// `up`: the new branch named after the sandbox already exists.
+    BranchExists { name: String },
+    /// `up`: the target branch is already checked out in another worktree.
+    BranchCheckedOut { branch: String },
+    /// `up`: another invocation for this name is already in progress.
+    UpInProgress { name: String },
+    /// `up`: a branch flag was given in a project that is not a git repository.
+    BranchRequiresGit,
     /// `attach`: the name has metadata but no live anchor.
     SandboxNotRunning { name: String },
     /// `attach`: no sandbox of this name is known ("what's alive" wording).
@@ -49,6 +57,21 @@ impl fmt::Display for HortError {
             HortError::DuplicateName { name } => write!(
                 f,
                 "a sandbox named '{name}' already exists (run 'hort attach {name}' to join it, or 'hort down {name}' first)"
+            ),
+            HortError::BranchExists { name } => write!(
+                f,
+                "branch '{name}' already exists; choose another name or use --branch to target an existing branch"
+            ),
+            HortError::BranchCheckedOut { branch } => write!(
+                f,
+                "branch '{branch}' is already checked out in another worktree"
+            ),
+            HortError::UpInProgress { name } => {
+                write!(f, "another 'hort up {name}' is already in progress")
+            }
+            HortError::BranchRequiresGit => write!(
+                f,
+                "--branch requires a git repository, but this project is not one"
             ),
             HortError::SandboxNotRunning { name } => write!(
                 f,
@@ -107,6 +130,46 @@ mod tests {
             "no sandbox named 'demo' (run 'hort ls' to see what exists)"
         );
         assert_ne!(down.to_string(), attach.to_string());
+    }
+
+    #[test]
+    fn branch_exists_error_renders_canonical_string() {
+        let error = HortError::BranchExists { name: "demo".to_string() };
+
+        assert_eq!(
+            error.to_string(),
+            "branch 'demo' already exists; choose another name or use --branch to target an existing branch"
+        );
+    }
+
+    #[test]
+    fn branch_checked_out_error_renders_canonical_string() {
+        let error = HortError::BranchCheckedOut { branch: "feature-x".to_string() };
+
+        assert_eq!(
+            error.to_string(),
+            "branch 'feature-x' is already checked out in another worktree"
+        );
+    }
+
+    #[test]
+    fn up_in_progress_error_renders_canonical_string() {
+        let error = HortError::UpInProgress { name: "demo".to_string() };
+
+        assert_eq!(
+            error.to_string(),
+            "another 'hort up demo' is already in progress"
+        );
+    }
+
+    #[test]
+    fn branch_requires_git_error_renders_canonical_string() {
+        let error = HortError::BranchRequiresGit;
+
+        assert_eq!(
+            error.to_string(),
+            "--branch requires a git repository, but this project is not one"
+        );
     }
 
     #[test]
