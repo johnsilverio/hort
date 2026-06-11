@@ -204,6 +204,16 @@ impl SandboxRecord {
         &self.worktree_path
     }
 
+    /// The RFC 3339 creation timestamp, as persisted.
+    pub fn created_at(&self) -> &str {
+        &self.created_at
+    }
+
+    /// The RFC 3339 timestamp of the most recent attach, as persisted.
+    pub fn last_attach_at(&self) -> &str {
+        &self.last_attach_at
+    }
+
     /// The PID of the host-side notify watcher, or `None` when no notify channel
     /// is configured and none was spawned.
     pub fn watcher_pid(&self) -> Option<u32> {
