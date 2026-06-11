@@ -75,7 +75,9 @@ pub trait MetadataStore {
     fn remove(&self, name: &SandboxName) -> Result<(), HortError>;
 }
 
-/// The git worktrees that back the sandboxes' `/workdir` mounts.
+/// The git worktrees that back the sandboxes' `/workdir` mounts. The read side
+/// supplies the observations `up` needs to decide what to do about a branch
+/// before it touches git.
 pub trait WorktreeProvider {
     /// Create a worktree for `name` checked out on `branch`.
     fn create(&self, name: &SandboxName, branch: &BranchName) -> Result<Worktree, HortError>;
@@ -83,6 +85,27 @@ pub trait WorktreeProvider {
     fn remove(&self, name: &SandboxName) -> Result<(), HortError>;
     /// Every worktree currently registered.
     fn list(&self) -> Result<Vec<Worktree>, HortError>;
+    /// Whether the project directory is a git repository at all.
+    fn is_git_repo(&self) -> Result<bool, HortError>;
+    /// Whether a branch of this name already exists in the repository.
+    fn branch_exists(&self, branch: &BranchName) -> Result<bool, HortError>;
+    /// Whether this branch is checked out in any worktree, the main checkout
+    /// included.
+    fn is_checked_out(&self, branch: &BranchName) -> Result<bool, HortError>;
+}
+
+/// Serializes the build of a single sandbox name so two concurrent `up`
+/// invocations cannot both clear the duplicate-name check and race to create the
+/// same sandbox. The lock is released once the build completes, before any
+/// session opens, so a fully built sandbox reports as a duplicate rather than as
+/// a build still in progress. The real adapter is an advisory file lock the
+/// kernel releases on process death, so a crashed `up` never wedges the name.
+pub trait SandboxLock {
+    /// Try to take the build lock for `name`; `Ok(false)` means another build
+    /// already holds it.
+    fn try_acquire(&self, name: &SandboxName) -> Result<bool, HortError>;
+    /// Release the build lock for `name`.
+    fn release(&self, name: &SandboxName) -> Result<(), HortError>;
 }
 
 /// The sink an agent-completion signal is raised on. The message arrives already

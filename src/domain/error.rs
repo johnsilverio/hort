@@ -22,6 +22,8 @@ pub enum HortError {
     BranchExists { name: String },
     /// `up`: the target branch is already checked out in another worktree.
     BranchCheckedOut { branch: String },
+    /// `up`: `--branch` named a branch that does not exist.
+    BranchDoesNotExist { branch: String, name: String },
     /// `up`: another invocation for this name is already in progress.
     UpInProgress { name: String },
     /// `up`: a branch flag was given in a project that is not a git repository.
@@ -65,6 +67,10 @@ impl fmt::Display for HortError {
             HortError::BranchCheckedOut { branch } => write!(
                 f,
                 "branch '{branch}' is already checked out in another worktree"
+            ),
+            HortError::BranchDoesNotExist { branch, name } => write!(
+                f,
+                "branch '{branch}' does not exist; create it first or omit --branch to create a new branch named '{name}'"
             ),
             HortError::UpInProgress { name } => {
                 write!(f, "another 'hort up {name}' is already in progress")
@@ -149,6 +155,19 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "branch 'feature-x' is already checked out in another worktree"
+        );
+    }
+
+    #[test]
+    fn branch_does_not_exist_error_renders_canonical_string() {
+        let error = HortError::BranchDoesNotExist {
+            branch: "feature-x".to_string(),
+            name: "demo".to_string(),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "branch 'feature-x' does not exist; create it first or omit --branch to create a new branch named 'demo'"
         );
     }
 

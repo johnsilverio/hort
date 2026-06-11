@@ -16,8 +16,8 @@ use crate::domain::model::{
 };
 use crate::ports::{
     Clock, ContainerRegistry, ContainerRuntime, EnvironmentProbe, LivenessProbe, MetadataStore,
-    NetworkProvider, NetworkSpec, Notifier, OciSpec, RegistryEntry, SessionProbe, Worktree,
-    WorktreeProvider,
+    NetworkProvider, NetworkSpec, Notifier, OciSpec, RegistryEntry, SandboxLock, SessionProbe,
+    Worktree, WorktreeProvider,
 };
 
 /// The records a sandbox should exist, kept in a map keyed by name. Honors the
@@ -55,16 +55,31 @@ impl MetadataStore for InMemoryMetadataStore {
 }
 
 /// Returns a canned liveness token from `start_anchor` and remembers which
-/// sandboxes it joined and tore down.
+/// sandboxes it joined and tore down. Can also be scripted to fail its
+/// `start_anchor`, so a test can witness that `up` persists the metadata record
+/// before it ever starts the container.
 pub struct FakeRuntime {
     token: LivenessToken,
+    start_fails: bool,
     joins: RefCell<Vec<SandboxName>>,
     teardowns: RefCell<Vec<SandboxName>>,
 }
 
 impl FakeRuntime {
     pub fn new(token: LivenessToken) -> Self {
-        Self { token, joins: RefCell::new(Vec::new()), teardowns: RefCell::new(Vec::new()) }
+        Self {
+            token,
+            start_fails: false,
+            joins: RefCell::new(Vec::new()),
+            teardowns: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// A runtime whose `start_anchor` fails. The error value is an unasserted
+    /// stand-in: the catalog carries no dedicated runtime-failure message yet, so
+    /// the witness is the half-built persisted record, not the error variant.
+    pub fn failing_start(token: LivenessToken) -> Self {
+        Self { start_fails: true, ..Self::new(token) }
     }
 
     pub fn joins(&self) -> Vec<SandboxName> {
@@ -78,6 +93,11 @@ impl FakeRuntime {
 
 impl ContainerRuntime for FakeRuntime {
     fn start_anchor(&self, _spec: &OciSpec) -> Result<LivenessToken, HortError> {
+        if self.start_fails {
+            return Err(HortError::InvalidConfig {
+                detail: "fake runtime: start_anchor scripted to fail".to_string(),
+            });
+        }
         Ok(self.token)
     }
 
@@ -201,21 +221,70 @@ impl EnvironmentProbe for FakeCapabilities {
 }
 
 /// Tracks the worktrees it created so `list` reflects `create`/`remove` without
-/// touching git.
-#[derive(Default)]
+/// touching git, records the branch of each `create`, and answers the read-side
+/// observations (git or not, which branches exist, which are checked out) from
+/// scripted state. `new` is a fresh git repository with no branches or
+/// worktrees; the builder methods layer scripted state on top.
 pub struct FakeWorktreeProvider {
     paths: RefCell<Vec<PathBuf>>,
+    creates: RefCell<Vec<BranchName>>,
+    is_git_repo: bool,
+    existing_branches: Vec<BranchName>,
+    checked_out_branches: Vec<BranchName>,
 }
 
 impl FakeWorktreeProvider {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            paths: RefCell::new(Vec::new()),
+            creates: RefCell::new(Vec::new()),
+            is_git_repo: true,
+            existing_branches: Vec::new(),
+            checked_out_branches: Vec::new(),
+        }
+    }
+
+    /// Script the project as not a git repository.
+    pub fn no_git(mut self) -> Self {
+        self.is_git_repo = false;
+        self
+    }
+
+    /// Script a branch as already existing in the repository.
+    pub fn with_existing_branch(mut self, branch: &str) -> Self {
+        self.existing_branches.push(BranchName::new(branch).unwrap());
+        self
+    }
+
+    /// Script a branch as checked out in some worktree.
+    pub fn with_checked_out_branch(mut self, branch: &str) -> Self {
+        self.checked_out_branches.push(BranchName::new(branch).unwrap());
+        self
+    }
+
+    /// Seed the canonical worktree of `name` as already listed, without recording
+    /// a `create`, simulating a worktree left by a prior crashed build.
+    pub fn with_listed_worktree(self, name: &SandboxName) -> Self {
+        self.paths.borrow_mut().push(fake_worktree_path(name));
+        self
+    }
+
+    /// The branch of every `create` call, in order.
+    pub fn creates(&self) -> Vec<BranchName> {
+        self.creates.borrow().clone()
+    }
+}
+
+impl Default for FakeWorktreeProvider {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl WorktreeProvider for FakeWorktreeProvider {
-    fn create(&self, name: &SandboxName, _branch: &BranchName) -> Result<Worktree, HortError> {
+    fn create(&self, name: &SandboxName, branch: &BranchName) -> Result<Worktree, HortError> {
         let path = fake_worktree_path(name);
+        self.creates.borrow_mut().push(branch.clone());
         self.paths.borrow_mut().push(path.clone());
         Ok(Worktree { path })
     }
@@ -228,6 +297,18 @@ impl WorktreeProvider for FakeWorktreeProvider {
 
     fn list(&self) -> Result<Vec<Worktree>, HortError> {
         Ok(self.paths.borrow().iter().cloned().map(|path| Worktree { path }).collect())
+    }
+
+    fn is_git_repo(&self) -> Result<bool, HortError> {
+        Ok(self.is_git_repo)
+    }
+
+    fn branch_exists(&self, branch: &BranchName) -> Result<bool, HortError> {
+        Ok(self.existing_branches.contains(branch))
+    }
+
+    fn is_checked_out(&self, branch: &BranchName) -> Result<bool, HortError> {
+        Ok(self.checked_out_branches.contains(branch))
     }
 }
 
@@ -270,6 +351,40 @@ impl FakeSessionProbe {
 impl SessionProbe for FakeSessionProbe {
     fn session_pids(&self, _name: &SandboxName) -> Result<Vec<u32>, HortError> {
         Ok(self.pids.clone())
+    }
+}
+
+/// A scripted build lock, either free or already held, that records the names it
+/// was asked to release.
+pub struct FakeSandboxLock {
+    held: bool,
+    releases: RefCell<Vec<SandboxName>>,
+}
+
+impl FakeSandboxLock {
+    /// A lock no other build holds: `try_acquire` succeeds.
+    pub fn free() -> Self {
+        Self { held: false, releases: RefCell::new(Vec::new()) }
+    }
+
+    /// A lock another build already holds: `try_acquire` reports it taken.
+    pub fn held() -> Self {
+        Self { held: true, releases: RefCell::new(Vec::new()) }
+    }
+
+    pub fn releases(&self) -> Vec<SandboxName> {
+        self.releases.borrow().clone()
+    }
+}
+
+impl SandboxLock for FakeSandboxLock {
+    fn try_acquire(&self, _name: &SandboxName) -> Result<bool, HortError> {
+        Ok(!self.held)
+    }
+
+    fn release(&self, name: &SandboxName) -> Result<(), HortError> {
+        self.releases.borrow_mut().push(name.clone());
+        Ok(())
     }
 }
 
