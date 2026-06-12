@@ -40,6 +40,18 @@ pub struct LsCommand<'a> {
     clock: &'a dyn Clock,
 }
 
+impl<'a> LsCommand<'a> {
+    pub fn new(
+        store: &'a dyn MetadataStore,
+        registry: &'a dyn ContainerRegistry,
+        worktrees: &'a dyn WorktreeProvider,
+        sessions: &'a dyn SessionProbe,
+        clock: &'a dyn Clock,
+    ) -> Self {
+        Self { store, registry, worktrees, sessions, clock }
+    }
+}
+
 impl LsCommand<'_> {
     pub fn run(&self) -> Result<Vec<LsEntry>, HortError> {
         let records = self.store.list()?;

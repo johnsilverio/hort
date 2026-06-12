@@ -2,6 +2,8 @@
 //! filesystem, external binaries). Each implements a port from `ports`
 //! (architecture.md). Kernel adapters land as `todo!()` stubs gated on spikes.
 
+pub mod clock;
+pub mod confirm;
 pub mod environment;
 pub mod liveness;
 pub mod metadata;

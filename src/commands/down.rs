@@ -24,6 +24,19 @@ pub struct DownCommand<'a> {
     worktrees: &'a dyn WorktreeProvider,
 }
 
+impl<'a> DownCommand<'a> {
+    pub fn new(
+        store: &'a dyn MetadataStore,
+        sessions: &'a dyn SessionProbe,
+        confirmer: &'a dyn Confirmer,
+        runtime: &'a dyn ContainerRuntime,
+        network: &'a dyn NetworkProvider,
+        worktrees: &'a dyn WorktreeProvider,
+    ) -> Self {
+        Self { store, sessions, confirmer, runtime, network, worktrees }
+    }
+}
+
 impl DownCommand<'_> {
     pub fn run(
         &self,

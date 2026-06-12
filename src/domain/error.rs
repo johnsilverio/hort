@@ -55,6 +55,16 @@ pub enum HortError {
     /// detail; the rendered message is not a canonical product string, so callers
     /// match the variant, not the text.
     GitCommandFailed { detail: String },
+    /// The container runtime is not available in this build. The placeholder
+    /// runtime adapter returns this for any operation that would start a real
+    /// container; it disappears once the embedded runtime lands. Its message is
+    /// not a canonical product string.
+    RuntimeUnavailable,
+    /// Preparing the state directory failed: creating or resolving the root hort
+    /// keeps its records under. Carries a human-readable detail; the rendered
+    /// message is not a canonical product string, so callers match the variant,
+    /// not the text.
+    StateIo { detail: String },
 }
 
 impl HortError {
@@ -112,6 +122,10 @@ impl fmt::Display for HortError {
             HortError::InvalidTimestamp { detail } => write!(f, "invalid timestamp: {detail}"),
             HortError::CorruptMetadata { detail } => write!(f, "corrupt metadata: {detail}"),
             HortError::GitCommandFailed { detail } => write!(f, "git command failed: {detail}"),
+            HortError::RuntimeUnavailable => {
+                write!(f, "the container runtime is not available in this build")
+            }
+            HortError::StateIo { detail } => write!(f, "state directory error: {detail}"),
         }
     }
 }

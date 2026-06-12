@@ -21,5 +21,7 @@ pub mod commands;
 pub mod domain;
 pub mod ports;
 
+pub use cli::{Cli, CliCommand, RealDeps, render_ls, run};
+
 #[cfg(test)]
 mod fakes;
