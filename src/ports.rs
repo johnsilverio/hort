@@ -92,6 +92,9 @@ pub trait WorktreeProvider {
     /// Whether this branch is checked out in any worktree, the main checkout
     /// included.
     fn is_checked_out(&self, branch: &BranchName) -> Result<bool, HortError>;
+    /// Whether this sandbox's worktree has uncommitted changes; untracked files
+    /// count. The first behavioral consumer is `prune`.
+    fn is_dirty(&self, name: &SandboxName) -> Result<bool, HortError>;
 }
 
 /// Serializes the build of a single sandbox name so two concurrent `up`

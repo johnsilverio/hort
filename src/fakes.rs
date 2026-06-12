@@ -359,6 +359,10 @@ impl WorktreeProvider for FakeWorktreeProvider {
     fn is_checked_out(&self, branch: &BranchName) -> Result<bool, HortError> {
         Ok(self.checked_out_branches.contains(branch))
     }
+
+    fn is_dirty(&self, _name: &SandboxName) -> Result<bool, HortError> {
+        Ok(false)
+    }
 }
 
 fn fake_worktree_path(name: &SandboxName) -> PathBuf {

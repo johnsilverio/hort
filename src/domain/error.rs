@@ -51,6 +51,10 @@ pub enum HortError {
     /// Carries a human-readable detail; the rendered message is not a canonical
     /// product string, so callers match the variant, not the text.
     CorruptMetadata { detail: String },
+    /// A git invocation in the worktree adapter failed. Carries a human-readable
+    /// detail; the rendered message is not a canonical product string, so callers
+    /// match the variant, not the text.
+    GitCommandFailed { detail: String },
 }
 
 impl HortError {
@@ -107,6 +111,7 @@ impl fmt::Display for HortError {
             HortError::InvalidConfig { detail } => write!(f, "invalid config: {detail}"),
             HortError::InvalidTimestamp { detail } => write!(f, "invalid timestamp: {detail}"),
             HortError::CorruptMetadata { detail } => write!(f, "corrupt metadata: {detail}"),
+            HortError::GitCommandFailed { detail } => write!(f, "git command failed: {detail}"),
         }
     }
 }
