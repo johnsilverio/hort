@@ -43,6 +43,23 @@ pub struct PruneCommand<'a> {
     state_root: PathBuf,
 }
 
+impl<'a> PruneCommand<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        store: &'a dyn MetadataStore,
+        registry: &'a dyn ContainerRegistry,
+        worktrees: &'a dyn WorktreeProvider,
+        sessions: &'a dyn SessionProbe,
+        clock: &'a dyn Clock,
+        confirmer: &'a dyn Confirmer,
+        runtime: &'a dyn ContainerRuntime,
+        network: &'a dyn NetworkProvider,
+        state_root: PathBuf,
+    ) -> Self {
+        Self { store, registry, worktrees, sessions, clock, confirmer, runtime, network, state_root }
+    }
+}
+
 impl PruneCommand<'_> {
     pub fn run(
         &self,

@@ -8,18 +8,25 @@
 //! corrupt timestamp degrades only its own row to an unknown age and idle, and
 //! the listing never mutates anything.
 
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use crate::domain::error::HortError;
 use crate::domain::idle::{IdleState, age, idle, parse_timestamp};
 use crate::domain::model::{BranchName, SandboxName, SandboxRecord};
 use crate::domain::reconcile::{SandboxState, reconcile_all};
-use crate::ports::{Clock, ContainerRegistry, MetadataStore, SessionProbe, WorktreeProvider};
+use crate::ports::{
+    Clock, ContainerRegistry, MetadataStore, SessionProbe, Worktree, WorktreeProvider,
+};
 
 /// One row of `ls` output: a sandbox's reconciled state plus the figures the CLI
 /// renders beside it. `age`, `idle`, and `branch` are `None` when there is no
 /// record to derive them from (a lost-record row) or the record's timestamps are
-/// corrupt; `branch` is also `None` for a no-git record.
+/// corrupt; `branch` is also `None` for a no-git record. `dirty` is probed only
+/// for a git record whose worktree is listed; it is `None` for no record, a
+/// no-git record, an absent worktree, or a failed probe, which `ls` reports as
+/// unknown rather than guessing, where `prune` instead reads a failed probe as
+/// dirty so it never deletes possibly uncommitted work.
 pub struct LsEntry {
     pub name: SandboxName,
     pub state: SandboxState,
@@ -27,6 +34,7 @@ pub struct LsEntry {
     pub age: Option<Duration>,
     pub idle: Option<IdleState>,
     pub branch: Option<BranchName>,
+    pub dirty: Option<bool>,
 }
 
 /// Coordinates `ls` over the read ports it depends on. It carries no
@@ -68,12 +76,30 @@ impl LsCommand<'_> {
                 // whole listing: a single racing sandbox must not blind the rest.
                 let sessions = self.sessions.session_pids(&name).map_or(0, |pids| pids.len());
                 let record = records.iter().find(|record| record.name() == &name);
-                build_entry(name, state, sessions, record, now)
+                let dirty = record.and_then(|record| self.observe_dirty(record, &listed));
+                build_entry(name, state, sessions, record, dirty, now)
             })
             .collect();
 
         Ok(entries)
     }
+
+    /// Whether a sandbox's worktree is dirty, observed only when there is a git
+    /// record whose worktree is still listed. A failed probe degrades to unknown,
+    /// which `ls` reports honestly rather than guessing, unlike `prune`, which
+    /// reads a failed probe as dirty to keep from deleting possibly uncommitted
+    /// work.
+    fn observe_dirty(&self, record: &SandboxRecord, listed: &[Worktree]) -> Option<bool> {
+        record.branch()?;
+        if !path_listed(listed, record.worktree_path()) {
+            return None;
+        }
+        self.worktrees.is_dirty(record.name()).ok()
+    }
+}
+
+fn path_listed(listed: &[Worktree], path: &Path) -> bool {
+    listed.iter().any(|worktree| worktree.path == *path)
 }
 
 fn build_entry(
@@ -81,16 +107,17 @@ fn build_entry(
     state: SandboxState,
     sessions: usize,
     record: Option<&SandboxRecord>,
+    dirty: Option<bool>,
     now: SystemTime,
 ) -> LsEntry {
     let Some(record) = record else {
-        return LsEntry { name, state, sessions, age: None, idle: None, branch: None };
+        return LsEntry { name, state, sessions, age: None, idle: None, branch: None, dirty };
     };
 
     let branch = record.branch().cloned();
     let parsed = (parse_timestamp(record.created_at()), parse_timestamp(record.last_attach_at()));
     let (Ok(created), Ok(attach)) = parsed else {
-        return LsEntry { name, state, sessions, age: None, idle: None, branch };
+        return LsEntry { name, state, sessions, age: None, idle: None, branch, dirty };
     };
 
     LsEntry {
@@ -100,6 +127,7 @@ fn build_entry(
         age: Some(age(created, now)),
         idle: Some(idle(sessions, created, attach, None, now)),
         branch,
+        dirty,
     }
 }
 
@@ -323,5 +351,83 @@ mod tests {
         assert_eq!(entries[0].state, SandboxState::Live);
         assert_eq!(entries[0].age, None);
         assert_eq!(entries[0].idle, None);
+    }
+
+    #[test]
+    fn ls_reports_dirty_worktree() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo").with_token(canned_token())).unwrap();
+        let registry = FakeRegistry::new(vec![(name.clone(), canned_token())]);
+        let worktrees =
+            FakeWorktreeProvider::new().with_listed_worktree(&name).with_dirty_worktree(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock);
+
+        let entries = command.run().unwrap();
+
+        assert_eq!(entries[0].dirty, Some(true));
+    }
+
+    #[test]
+    fn ls_degrades_dirty_to_unknown_when_probe_fails() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo").with_token(canned_token())).unwrap();
+        let registry = FakeRegistry::new(vec![(name.clone(), canned_token())]);
+        let worktrees =
+            FakeWorktreeProvider::new().with_listed_worktree(&name).with_failing_dirty_probe(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock);
+
+        let entries = command.run().unwrap();
+
+        assert_eq!(entries[0].dirty, None);
+    }
+
+    #[test]
+    fn ls_reports_no_dirty_for_no_git_record() {
+        let name = SandboxName::new("demo").unwrap();
+        let record = SandboxRecord::new(
+            name.clone(),
+            None,
+            PathBuf::from("/state/sandboxes/demo/worktree-demo"),
+            PathBuf::from("/state/sandboxes/demo/overlay"),
+            "2026-06-11T12:00:00Z".to_string(),
+            "2026-06-11T12:00:00Z".to_string(),
+            None,
+        )
+        .with_token(canned_token());
+        let store = InMemoryMetadataStore::new();
+        store.put(&record).unwrap();
+        let registry = FakeRegistry::new(vec![(name.clone(), canned_token())]);
+        let worktrees =
+            FakeWorktreeProvider::new().with_listed_worktree(&name).with_dirty_worktree(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock);
+
+        let entries = command.run().unwrap();
+
+        assert_eq!(entries[0].dirty, None);
+    }
+
+    #[test]
+    fn ls_reports_no_dirty_for_vanished_worktree() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo").with_token(canned_token())).unwrap();
+        let registry = FakeRegistry::new(vec![(name.clone(), canned_token())]);
+        let worktrees = FakeWorktreeProvider::new();
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock);
+
+        let entries = command.run().unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].dirty, None);
     }
 }

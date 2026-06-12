@@ -136,3 +136,46 @@ fn cli_down_removes_orphaned_sandbox() {
     assert!(!worktree_path.exists());
     assert!(!state_root.join("sandboxes").join("demo").exists());
 }
+
+#[test]
+fn cli_prune_refuses_without_tty() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let state_root = xdg_root.join("hort");
+    write_orphaned_record(&state_root, "demo");
+    let (_repo, repo_path) = temp_git_repo();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &xdg_root)
+        .current_dir(&repo_path)
+        .arg("prune")
+        .assert()
+        .code(1)
+        .stderr(
+            "refusing to prune without confirmation: stdin is not a TTY (pass --force to proceed)\n",
+        );
+}
+
+#[test]
+fn cli_prune_force_removes_orphaned_sandbox() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let state_root = xdg_root.join("hort");
+    let (_repo, repo_path) = temp_git_repo();
+
+    write_orphaned_record(&state_root, "demo");
+    let worktree_path = state_root.join("sandboxes").join("demo").join("worktree-demo");
+    git(&repo_path, &["worktree", "add", "-b", "demo", worktree_path.to_str().unwrap()]);
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &xdg_root)
+        .current_dir(&repo_path)
+        .args(["prune", "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("demo"));
+
+    assert!(!state_root.join("sandboxes").join("demo").exists());
+}

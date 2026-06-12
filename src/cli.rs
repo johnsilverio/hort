@@ -1,8 +1,8 @@
 //! CLI surface: the clap v4 derive definitions for the subcommands hort exposes,
-//! their dispatch, and the pure `ls` renderer.
+//! their dispatch, and the pure `ls` and `prune` renderers.
 //!
-//! Only subcommands that work end to end ship here. This slice is `ls` and
-//! `down`; `up`, `attach`, `prune`, `config`, and `doctor` arrive with the tasks
+//! Only subcommands that work end to end ship here. This slice is `ls`, `down`,
+//! and `prune`; `up`, `attach`, `config`, and `doctor` arrive with the tasks
 //! that make them real, so the binary never offers a command that cannot run.
 
 use std::fs;
@@ -20,9 +20,11 @@ use crate::adapters::runtime::NullRuntime;
 use crate::adapters::worktree::GitWorktreeProvider;
 use crate::commands::down::DownCommand;
 use crate::commands::ls::{LsCommand, LsEntry};
+use crate::commands::prune::{PruneCommand, PruneReport};
 use crate::domain::error::HortError;
 use crate::domain::idle::IdleState;
 use crate::domain::model::{BranchName, SandboxName};
+use crate::domain::prune::SkipReason;
 use crate::domain::reconcile::SandboxState;
 
 /// The parsed command line: one subcommand and its flags.
@@ -46,6 +48,15 @@ pub enum CliCommand {
         #[arg(short, long)]
         force: bool,
     },
+    /// Remove idle sandboxes and abrupt-death debris after confirming.
+    Prune {
+        /// Skip the confirmation prompt and the dirty exclusion.
+        #[arg(short, long)]
+        force: bool,
+        /// Also remove sandboxes idle at least this long.
+        #[arg(long, value_parser = humantime::parse_duration)]
+        idle: Option<Duration>,
+    },
 }
 
 /// The real adapters the commands run against, assembled once at startup. The
@@ -58,6 +69,9 @@ pub struct RealDeps {
     network: NullNetwork,
     clock: SystemClock,
     confirmer: StdinConfirmer,
+    /// Kept so `prune` can derive a corrupt entry's canonical worktree path,
+    /// which has no record to read it from.
+    state_root: PathBuf,
 }
 
 impl RealDeps {
@@ -85,11 +99,12 @@ impl RealDeps {
 
         Ok(Self {
             store: FileMetadataStore::new(state_root.clone()),
-            worktrees: GitWorktreeProvider::new(repo_dir, state_root),
+            worktrees: GitWorktreeProvider::new(repo_dir, state_root.clone()),
             runtime: NullRuntime,
             network: NullNetwork,
             clock: SystemClock,
             confirmer: StdinConfirmer,
+            state_root,
         })
     }
 }
@@ -138,29 +153,71 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<(), HortError> {
             );
             command.run(name, force, std::io::stdin().is_terminal())
         }
+        CliCommand::Prune { force, idle } => {
+            let command = PruneCommand::new(
+                &deps.store,
+                &deps.runtime,
+                &deps.worktrees,
+                &deps.runtime,
+                &deps.clock,
+                &deps.confirmer,
+                &deps.runtime,
+                &deps.network,
+                deps.state_root.clone(),
+            );
+            let report = command.run(idle, force, std::io::stdin().is_terminal())?;
+            print!("{}", render_prune(&report));
+            Ok(())
+        }
     }
 }
 
 const DASH: &str = "-";
 
 /// Render the `ls` rows for the terminal: one line per sandbox with its name,
-/// lowercase state, session count, age, idle, and branch. A figure with no value
-/// renders as a dash, and a sandbox with a running session renders its idle as
-/// `active`.
+/// lowercase state, session count, age, idle, branch, and worktree dirty state. A
+/// figure with no value renders as a dash, and a sandbox with a running session
+/// renders its idle as `active`.
 pub fn render_ls(entries: &[LsEntry]) -> String {
     entries.iter().map(|entry| format!("{}\n", render_line(entry))).collect()
 }
 
+/// Render the `prune` report for the terminal: the names it removed and the names
+/// it skipped with the reason for each. Layout is free; only the presence of the
+/// names and reasons is a contract.
+pub fn render_prune(report: &PruneReport) -> String {
+    let removed = report.removed.iter().map(|name| format!("removed {name}\n"));
+    let skipped = report.skipped.iter().map(|skip| {
+        format!("skipped {} ({})\n", skip.name, skip_reason_label(&skip.reason))
+    });
+    removed.chain(skipped).collect()
+}
+
 fn render_line(entry: &LsEntry) -> String {
     format!(
-        "{}  {}  {}  {}  {}  {}",
+        "{}  {}  {}  {}  {}  {}  {}",
         entry.name.as_str(),
         state_label(entry.state),
         entry.sessions,
         render_duration(entry.age),
         render_idle(entry.idle.as_ref()),
         render_branch(entry.branch.as_ref()),
+        render_dirty(entry.dirty),
     )
+}
+
+fn skip_reason_label(reason: &SkipReason) -> &'static str {
+    match reason {
+        SkipReason::Dirty => "dirty",
+    }
+}
+
+fn render_dirty(dirty: Option<bool>) -> String {
+    match dirty {
+        Some(true) => "dirty".to_string(),
+        Some(false) => "clean".to_string(),
+        None => DASH.to_string(),
+    }
 }
 
 fn state_label(state: SandboxState) -> &'static str {
@@ -202,6 +259,7 @@ mod tests {
 
     use crate::domain::idle::IdleState;
     use crate::domain::model::{BranchName, SandboxName};
+    use crate::domain::prune::{PruneSkip, SkipReason};
     use crate::domain::reconcile::SandboxState;
 
     #[test]
@@ -213,6 +271,7 @@ mod tests {
             age: Some(Duration::from_secs(3600)),
             idle: Some(IdleState::Idle(Duration::from_secs(300))),
             branch: Some(BranchName::new("demo").unwrap()),
+            dirty: Some(false),
         };
 
         let rendered = render_ls(&[entry]);
@@ -222,6 +281,7 @@ mod tests {
         assert!(rendered.contains("2"));
         assert!(rendered.contains("1h"));
         assert!(rendered.contains("5m"));
+        assert!(rendered.contains("clean"));
     }
 
     #[test]
@@ -233,6 +293,7 @@ mod tests {
             age: None,
             idle: None,
             branch: None,
+            dirty: None,
         };
 
         let rendered = render_ls(&[entry]);
@@ -250,10 +311,42 @@ mod tests {
             age: Some(Duration::from_secs(3600)),
             idle: Some(IdleState::Active),
             branch: Some(BranchName::new("demo").unwrap()),
+            dirty: Some(false),
         };
 
         let rendered = render_ls(&[entry]);
 
         assert!(rendered.contains("active"));
+    }
+
+    #[test]
+    fn render_prune_lists_removed_and_skipped() {
+        let report = PruneReport {
+            removed: vec!["demo".to_string()],
+            skipped: vec![PruneSkip { name: "rotten".to_string(), reason: SkipReason::Dirty }],
+        };
+
+        let rendered = render_prune(&report);
+
+        assert!(rendered.contains("demo"));
+        assert!(rendered.contains("rotten"));
+        assert!(rendered.contains("dirty"));
+    }
+
+    #[test]
+    fn render_ls_renders_dirty_state_for_dirty_entry() {
+        let entry = LsEntry {
+            name: SandboxName::new("demo").unwrap(),
+            state: SandboxState::Live,
+            sessions: 0,
+            age: Some(Duration::from_secs(3600)),
+            idle: Some(IdleState::Idle(Duration::from_secs(300))),
+            branch: Some(BranchName::new("demo").unwrap()),
+            dirty: Some(true),
+        };
+
+        let rendered = render_ls(&[entry]);
+
+        assert!(rendered.contains("dirty"));
     }
 }
