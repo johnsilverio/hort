@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use crate::domain::error::HortError;
 use crate::domain::idle::parse_timestamp;
 use crate::domain::model::{SandboxName, SandboxRecord};
-use crate::ports::MetadataStore;
+use crate::ports::{CorruptEntry, MetadataStore};
 
 const SANDBOXES_DIR: &str = "sandboxes";
 const METADATA_FILE: &str = "metadata.json";
@@ -96,6 +96,42 @@ impl MetadataStore for FileMetadataStore {
                 name.as_str()
             ))),
         }
+    }
+
+    fn list_corrupt(&self) -> Result<Vec<CorruptEntry>, HortError> {
+        let entries = match fs::read_dir(self.sandboxes_dir()) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(corrupt(format!(
+                    "could not list sandboxes at {}: {error}",
+                    self.sandboxes_dir().display()
+                )));
+            }
+        };
+
+        let mut corrupt_entries = Vec::new();
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            // A loadable record (Some) or a half-built dir with no metadata file
+            // (None) is healthy; only a load error is corruption to surface.
+            if let Err(error) = load(&entry.path().join(METADATA_FILE)) {
+                corrupt_entries.push(CorruptEntry {
+                    name: entry.file_name().to_string_lossy().into_owned(),
+                    detail: detail_of(error),
+                });
+            }
+        }
+        Ok(corrupt_entries)
+    }
+}
+
+/// The human-readable reason a record failed to load. A load failure is always a
+/// `CorruptMetadata`, but any other variant's `Display` is an acceptable fallback.
+fn detail_of(error: HortError) -> String {
+    match error {
+        HortError::CorruptMetadata { detail } => detail,
+        other => other.to_string(),
     }
 }
 
@@ -323,5 +359,65 @@ mod tests {
         store.remove(&SandboxName::new("demo").unwrap()).unwrap();
 
         assert!(!sandbox_dir.exists());
+    }
+
+    #[test]
+    fn file_store_lists_corrupt_entry_with_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileMetadataStore::new(dir.path().to_path_buf());
+        write_metadata(
+            dir.path(),
+            "demo",
+            r#"{
+                "schemaVersion": 1,
+                "name": "bad/name",
+                "branch": "demo",
+                "worktreePath": "/state/sandboxes/demo/worktree-demo",
+                "overlayPath": "/state/sandboxes/demo/overlay",
+                "createdAt": "2026-06-11T12:00:00Z",
+                "lastAttachAt": "2026-06-11T12:00:00Z",
+                "notifyChannel": null,
+                "watcherPid": null,
+                "token": null
+            }"#,
+        );
+
+        let corrupt = store.list_corrupt().unwrap();
+
+        assert_eq!(corrupt.len(), 1);
+        assert_eq!(corrupt[0].name, "demo");
+        assert!(!corrupt[0].detail.is_empty());
+    }
+
+    #[test]
+    fn file_store_list_corrupt_skips_valid_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileMetadataStore::new(dir.path().to_path_buf());
+        store.put(&sample_record("demo")).unwrap();
+
+        let corrupt = store.list_corrupt().unwrap();
+
+        assert!(corrupt.is_empty());
+    }
+
+    #[test]
+    fn file_store_list_corrupt_skips_half_built_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileMetadataStore::new(dir.path().to_path_buf());
+        fs::create_dir_all(dir.path().join("sandboxes").join("demo")).unwrap();
+
+        let corrupt = store.list_corrupt().unwrap();
+
+        assert!(corrupt.is_empty());
+    }
+
+    #[test]
+    fn file_store_list_corrupt_is_empty_for_missing_state_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileMetadataStore::new(dir.path().to_path_buf());
+
+        let corrupt = store.list_corrupt().unwrap();
+
+        assert!(corrupt.is_empty());
     }
 }

@@ -111,6 +111,10 @@ impl WorktreeProvider for GitWorktreeProvider {
         let porcelain = run(&self.worktree_path(name), "status", &["status", "--porcelain"])?;
         Ok(!porcelain.trim().is_empty())
     }
+
+    fn prune_stale(&self) -> Result<(), HortError> {
+        run(&self.repo_dir, "worktree prune", &["worktree", "prune"]).map(|_| ())
+    }
 }
 
 /// Run `git -C <dir> <args>`, mapping only a spawn failure to a domain error.
@@ -487,5 +491,21 @@ mod tests {
         fs::write(worktree.path.join("untracked.txt"), "x\n").unwrap();
 
         assert!(provider.is_dirty(&name).unwrap());
+    }
+
+    #[test]
+    fn git_worktree_prune_stale_clears_vanished_registration() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let worktree = provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+        fs::remove_dir_all(&worktree.path).unwrap();
+
+        provider.prune_stale().unwrap();
+
+        let porcelain = git(&repo, &["worktree", "list", "--porcelain"]);
+        assert!(!porcelain.contains("worktree-demo"));
     }
 }

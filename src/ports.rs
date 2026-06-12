@@ -73,6 +73,18 @@ pub trait MetadataStore {
     fn list(&self) -> Result<Vec<SandboxRecord>, HortError>;
     /// Remove the record of this name; removing a missing one is `Ok(())`.
     fn remove(&self, name: &SandboxName) -> Result<(), HortError>;
+    /// The corrupt entries `list` skips, surfaced so `prune` can show and clean
+    /// them. A dir with no metadata file at all is half-built, not corrupt, and
+    /// stays unlisted.
+    fn list_corrupt(&self) -> Result<Vec<CorruptEntry>, HortError>;
+}
+
+/// A corrupt metadata directory `list` could not read as a record: its raw
+/// directory name (an observation, not a validated value) plus why the record
+/// failed to load.
+pub struct CorruptEntry {
+    pub name: String,
+    pub detail: String,
 }
 
 /// The git worktrees that back the sandboxes' `/workdir` mounts. The read side
@@ -95,6 +107,10 @@ pub trait WorktreeProvider {
     /// Whether this sandbox's worktree has uncommitted changes; untracked files
     /// count. The first behavioral consumer is `prune`.
     fn is_dirty(&self, name: &SandboxName) -> Result<bool, HortError>;
+    /// Clear every stale `.git/worktrees` registration whose directory vanished.
+    /// `prune` runs it once per non-refused, non-declined run; the per-name
+    /// `remove` already clears only its own stale entry.
+    fn prune_stale(&self) -> Result<(), HortError>;
 }
 
 /// Serializes the build of a single sandbox name so two concurrent `up`

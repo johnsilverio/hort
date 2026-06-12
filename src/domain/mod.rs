@@ -9,5 +9,6 @@ pub mod idle;
 pub mod model;
 pub mod onboarding;
 pub mod policy;
+pub mod prune;
 pub mod reconcile;
 pub mod teardown;

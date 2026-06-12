@@ -16,9 +16,9 @@ use crate::domain::model::{
     AnchorPid, BranchName, Capabilities, LivenessToken, MountNsInode, SandboxName, SandboxRecord,
 };
 use crate::ports::{
-    Clock, Confirmer, ContainerRegistry, ContainerRuntime, EnvironmentProbe, LivenessProbe,
-    MetadataStore, NetworkProvider, NetworkSpec, Notifier, OciSpec, RegistryEntry, SandboxLock,
-    SessionProbe, Worktree, WorktreeProvider,
+    Clock, Confirmer, ContainerRegistry, ContainerRuntime, CorruptEntry, EnvironmentProbe,
+    LivenessProbe, MetadataStore, NetworkProvider, NetworkSpec, Notifier, OciSpec, RegistryEntry,
+    SandboxLock, SessionProbe, Worktree, WorktreeProvider,
 };
 
 /// The shared teardown-order witness threaded through the fakes that perform a
@@ -33,6 +33,7 @@ type TeardownTrace = Rc<RefCell<Vec<String>>>;
 #[derive(Default)]
 pub struct InMemoryMetadataStore {
     records: RefCell<HashMap<SandboxName, SandboxRecord>>,
+    corrupt: RefCell<Vec<(String, String)>>,
     trace: Option<TeardownTrace>,
 }
 
@@ -44,6 +45,14 @@ impl InMemoryMetadataStore {
     /// Record the `store.remove` step on the shared teardown trace.
     pub fn with_trace(mut self, trace: TeardownTrace) -> Self {
         self.trace = Some(trace);
+        self
+    }
+
+    /// Script a corrupt metadata dir of this name, returned by `list_corrupt`.
+    /// Its same-named entry is cleared by `remove`, the observable witness that
+    /// pruning a corrupt dir took it off disk.
+    pub fn with_corrupt_entry(self, name: &str, detail: &str) -> Self {
+        self.corrupt.borrow_mut().push((name.to_owned(), detail.to_owned()));
         self
     }
 }
@@ -64,10 +73,20 @@ impl MetadataStore for InMemoryMetadataStore {
 
     fn remove(&self, name: &SandboxName) -> Result<(), HortError> {
         self.records.borrow_mut().remove(name);
+        self.corrupt.borrow_mut().retain(|(corrupt_name, _)| corrupt_name != name.as_str());
         if let Some(trace) = &self.trace {
             trace.borrow_mut().push("store.remove".to_string());
         }
         Ok(())
+    }
+
+    fn list_corrupt(&self) -> Result<Vec<CorruptEntry>, HortError> {
+        Ok(self
+            .corrupt
+            .borrow()
+            .iter()
+            .map(|(name, detail)| CorruptEntry { name: name.clone(), detail: detail.clone() })
+            .collect())
     }
 }
 
@@ -269,6 +288,9 @@ pub struct FakeWorktreeProvider {
     is_git_repo: bool,
     existing_branches: Vec<BranchName>,
     checked_out_branches: Vec<BranchName>,
+    dirty_worktrees: Vec<SandboxName>,
+    failing_dirty_probes: Vec<SandboxName>,
+    prune_stale_calls: RefCell<usize>,
     trace: Option<TeardownTrace>,
 }
 
@@ -280,6 +302,9 @@ impl FakeWorktreeProvider {
             is_git_repo: true,
             existing_branches: Vec::new(),
             checked_out_branches: Vec::new(),
+            dirty_worktrees: Vec::new(),
+            failing_dirty_probes: Vec::new(),
+            prune_stale_calls: RefCell::new(0),
             trace: None,
         }
     }
@@ -315,9 +340,27 @@ impl FakeWorktreeProvider {
         self
     }
 
+    /// Script this sandbox's worktree as dirty: `is_dirty` answers `Ok(true)`.
+    pub fn with_dirty_worktree(mut self, name: &SandboxName) -> Self {
+        self.dirty_worktrees.push(name.clone());
+        self
+    }
+
+    /// Script this sandbox's dirty probe as failing: `is_dirty` answers `Err`,
+    /// standing in for a worktree git cannot inspect.
+    pub fn with_failing_dirty_probe(mut self, name: &SandboxName) -> Self {
+        self.failing_dirty_probes.push(name.clone());
+        self
+    }
+
     /// The branch of every `create` call, in order.
     pub fn creates(&self) -> Vec<BranchName> {
         self.creates.borrow().clone()
+    }
+
+    /// How many times `prune_stale` was called.
+    pub fn prune_stale_calls(&self) -> usize {
+        *self.prune_stale_calls.borrow()
     }
 }
 
@@ -360,8 +403,20 @@ impl WorktreeProvider for FakeWorktreeProvider {
         Ok(self.checked_out_branches.contains(branch))
     }
 
-    fn is_dirty(&self, _name: &SandboxName) -> Result<bool, HortError> {
-        Ok(false)
+    fn is_dirty(&self, name: &SandboxName) -> Result<bool, HortError> {
+        if self.failing_dirty_probes.contains(name) {
+            // An unasserted stand-in error: prune reads any probe failure as
+            // dirty, so the variant does not matter, only that it is an `Err`.
+            return Err(HortError::InvalidConfig {
+                detail: "fake worktree: dirty probe scripted to fail".to_string(),
+            });
+        }
+        Ok(self.dirty_worktrees.contains(name))
+    }
+
+    fn prune_stale(&self) -> Result<(), HortError> {
+        *self.prune_stale_calls.borrow_mut() += 1;
+        Ok(())
     }
 }
 
