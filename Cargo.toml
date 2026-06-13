@@ -2,9 +2,9 @@
 name = "hort"
 version = "0.1.0"
 edition = "2024"
-# MSRV tracks the youki `libcontainer` floor (0.6.0 → Rust 1.85 / edition 2024).
-# Bumping the youki crates may raise this (ADR-0001, ADR-0009).
-rust-version = "1.85"
+# MSRV is the max of the youki `libcontainer` floor (0.6.0 needs Rust 1.85 / edition 2024)
+# and the std file-locking floor (`File::try_lock`, stabilized 1.89). Bumping the youki crates may raise it.
+rust-version = "1.89"
 description = "Terminal-operated, agent-agnostic manager of ephemeral sandboxes (a git worktree + an embedded-libcontainer OCI container) for running CLI LLM agents in unrestricted mode without exposing the host"
 license = "AGPL-3.0-only"
 repository = "https://github.com/johnsilverio/hort"

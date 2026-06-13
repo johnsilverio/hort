@@ -75,13 +75,13 @@ impl UpCommand<'_> {
             return Err(error);
         }
 
-        if let Some(target) = &branch {
-            if !self.worktrees.branch_exists(target)? {
-                return Err(HortError::BranchDoesNotExist {
-                    branch: target.as_str().to_string(),
-                    name: name.as_str().to_string(),
-                });
-            }
+        if let Some(target) = &branch
+            && !self.worktrees.branch_exists(target)?
+        {
+            return Err(HortError::BranchDoesNotExist {
+                branch: target.as_str().to_string(),
+                name: name.as_str().to_string(),
+            });
         }
 
         if !worktree_listed {

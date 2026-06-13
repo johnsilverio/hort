@@ -6,6 +6,7 @@ pub mod clock;
 pub mod confirm;
 pub mod environment;
 pub mod liveness;
+pub mod lock;
 pub mod metadata;
 pub mod network;
 pub mod notify;

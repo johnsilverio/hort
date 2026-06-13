@@ -114,10 +114,10 @@ impl RealDeps {
 /// `~/.local/state/hort`. Honoring the variable is the seam the CLI tests use to
 /// keep off the real user state.
 fn resolve_state_root() -> Result<PathBuf, HortError> {
-    if let Some(xdg) = std::env::var_os("XDG_STATE_HOME") {
-        if !xdg.is_empty() {
-            return Ok(PathBuf::from(xdg).join("hort"));
-        }
+    if let Some(xdg) = std::env::var_os("XDG_STATE_HOME")
+        && !xdg.is_empty()
+    {
+        return Ok(PathBuf::from(xdg).join("hort"));
     }
     let home = std::env::home_dir().ok_or_else(|| HortError::StateIo {
         detail: "could not determine the home directory".to_string(),
