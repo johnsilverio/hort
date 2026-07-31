@@ -3,6 +3,7 @@
 //! (architecture.md). Kernel adapters land as `todo!()` stubs gated on spikes.
 
 pub mod clock;
+pub mod config;
 pub mod confirm;
 pub mod environment;
 pub mod liveness;
