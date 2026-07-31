@@ -29,6 +29,7 @@ pub struct UpCommand<'a> {
     network: &'a dyn NetworkProvider,
     clock: &'a dyn Clock,
     state_root: PathBuf,
+    rootfs: PathBuf,
 }
 
 impl UpCommand<'_> {
@@ -98,8 +99,8 @@ impl UpCommand<'_> {
                 let fresh = SandboxRecord::new(
                     name.clone(),
                     Some(branch_to_checkout),
-                    worktree_path,
-                    overlay_path,
+                    worktree_path.clone(),
+                    overlay_path.clone(),
                     timestamp.clone(),
                     timestamp,
                     None,
@@ -109,7 +110,18 @@ impl UpCommand<'_> {
             }
         };
 
-        let token = self.runtime.start_anchor(&OciSpec)?;
+        let worktree_display = worktree_path.display().to_string();
+        let token = self.runtime.start_anchor(&OciSpec {
+            name: name.clone(),
+            rootfs: self.rootfs.clone(),
+            overlay: overlay_path,
+            workdir: worktree_path,
+            env: vec![
+                ("HORT_SANDBOX".to_string(), name.as_str().to_string()),
+                ("HORT_WORKTREE".to_string(), worktree_display),
+            ],
+            resources: None,
+        })?;
         self.store.put(&record.with_token(token))?;
 
         self.network.provision(&NetworkSpec {
@@ -161,6 +173,7 @@ mod tests {
             network,
             clock,
             state_root: PathBuf::from("/state"),
+            rootfs: PathBuf::from("/base/rootfs"),
         }
     }
 
@@ -201,6 +214,31 @@ mod tests {
         assert!(result.is_err());
         let persisted = store.get(&SandboxName::new("demo").unwrap()).unwrap();
         assert_eq!(persisted.unwrap().liveness_token(), None);
+    }
+
+    #[test]
+    fn up_hands_the_runtime_the_sandbox_environment() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let command =
+            up_command(&lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock);
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        assert!(runtime.started_env().contains(&(
+            "HORT_SANDBOX".to_string(),
+            "demo".to_string()
+        )));
+        assert!(runtime.started_env().contains(&(
+            "HORT_WORKTREE".to_string(),
+            "/state/sandboxes/demo/worktree-demo".to_string()
+        )));
     }
 
     #[test]

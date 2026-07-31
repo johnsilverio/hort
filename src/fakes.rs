@@ -97,6 +97,7 @@ impl MetadataStore for InMemoryMetadataStore {
 pub struct FakeRuntime {
     token: LivenessToken,
     start_fails: bool,
+    started_env: RefCell<Vec<(String, String)>>,
     joins: RefCell<Vec<SandboxName>>,
     teardowns: RefCell<Vec<SandboxName>>,
     trace: Option<TeardownTrace>,
@@ -107,6 +108,7 @@ impl FakeRuntime {
         Self {
             token,
             start_fails: false,
+            started_env: RefCell::new(Vec::new()),
             joins: RefCell::new(Vec::new()),
             teardowns: RefCell::new(Vec::new()),
             trace: None,
@@ -126,6 +128,11 @@ impl FakeRuntime {
         self
     }
 
+    /// The environment pairs of the spec the last `start_anchor` was handed.
+    pub fn started_env(&self) -> Vec<(String, String)> {
+        self.started_env.borrow().clone()
+    }
+
     pub fn joins(&self) -> Vec<SandboxName> {
         self.joins.borrow().clone()
     }
@@ -136,7 +143,8 @@ impl FakeRuntime {
 }
 
 impl ContainerRuntime for FakeRuntime {
-    fn start_anchor(&self, _spec: &OciSpec) -> Result<LivenessToken, HortError> {
+    fn start_anchor(&self, spec: &OciSpec) -> Result<LivenessToken, HortError> {
+        self.started_env.borrow_mut().clone_from(&spec.env);
         if self.start_fails {
             return Err(HortError::InvalidConfig {
                 detail: "fake runtime: start_anchor scripted to fail".to_string(),

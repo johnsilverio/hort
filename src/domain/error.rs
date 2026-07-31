@@ -55,6 +55,11 @@ pub enum HortError {
     /// detail; the rendered message is not a canonical product string, so callers
     /// match the variant, not the text.
     GitCommandFailed { detail: String },
+    /// A container-runtime operation failed: starting the anchor, joining a
+    /// session, or tearing the container down. Carries a human-readable detail
+    /// naming the operation; the rendered message is not a canonical product
+    /// string, so callers match the variant, not the text.
+    ContainerRuntimeFailed { detail: String },
     /// The container runtime is not available in this build. The placeholder
     /// runtime adapter returns this for any operation that would start a real
     /// container; it disappears once the embedded runtime lands. Its message is
@@ -122,6 +127,9 @@ impl fmt::Display for HortError {
             HortError::InvalidTimestamp { detail } => write!(f, "invalid timestamp: {detail}"),
             HortError::CorruptMetadata { detail } => write!(f, "corrupt metadata: {detail}"),
             HortError::GitCommandFailed { detail } => write!(f, "git command failed: {detail}"),
+            HortError::ContainerRuntimeFailed { detail } => {
+                write!(f, "container runtime failed: {detail}")
+            }
             HortError::RuntimeUnavailable => {
                 write!(f, "the container runtime is not available in this build")
             }

@@ -169,10 +169,34 @@ pub trait SessionProbe {
     fn session_pids(&self, name: &SandboxName) -> Result<Vec<u32>, HortError>;
 }
 
-/// The OCI runtime spec `start_anchor` builds the anchor container from. An empty
-/// placeholder for now; its fields arrive with the first command that builds a
-/// real container.
-pub struct OciSpec;
+/// Everything `start_anchor` needs to build a sandbox's anchor container. Plain
+/// data: no runtime type leaks in here, the adapter is what turns this into the
+/// OCI runtime spec the container is built from.
+pub struct OciSpec {
+    /// The sandbox identity, which is also the container id.
+    pub name: SandboxName,
+    /// The prepared base rootfs: the overlay's read-only lower layer.
+    pub rootfs: PathBuf,
+    /// The per-sandbox directory holding the ephemeral overlay layers and the
+    /// merged root the container is rooted at.
+    pub overlay: PathBuf,
+    /// The host directory bound at `/workdir`: the worktree in git mode, the
+    /// project folder in no-git mode.
+    pub workdir: PathBuf,
+    /// Environment pairs every process in the sandbox sees, `HORT_SANDBOX` and
+    /// `HORT_WORKTREE` among them.
+    pub env: Vec<(String, String)>,
+    /// The per-sandbox resource ceiling; `None` leaves the sandbox uncapped.
+    pub resources: Option<ResourceLimits>,
+}
+
+/// The per-sandbox resource ceiling. `cpus` is an amount of CPU time (2.0 means
+/// two cores' worth), never a pinning to particular cores: the cpuset controller
+/// is frequently undelegated, the bandwidth one is not.
+pub struct ResourceLimits {
+    pub memory_bytes: Option<u64>,
+    pub cpus: Option<f32>,
+}
 
 /// Everything `provision` needs to wire a sandbox's egress: the sandbox identity,
 /// the host path of the network namespace pasta attaches to, the egress policy

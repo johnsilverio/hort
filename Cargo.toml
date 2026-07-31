@@ -2,8 +2,9 @@
 name = "hort"
 version = "0.1.0"
 edition = "2024"
-# MSRV is the max of the youki `libcontainer` floor (0.6.0 needs Rust 1.85 / edition 2024)
-# and the std file-locking floor (`File::try_lock`, stabilized 1.89). Bumping the youki crates may raise it.
+# MSRV is the max of the youki `libcontainer` floor (Rust 1.85, edition 2024) and the std
+# floors hort's own code needs (`File::try_lock` and `io::pipe`, both stabilized by 1.89).
+# Bumping the youki crates may raise it.
 rust-version = "1.89"
 description = "Terminal-operated, agent-agnostic manager of ephemeral sandboxes (a git worktree + an embedded-libcontainer OCI container) for running CLI LLM agents in unrestricted mode without exposing the host"
 license = "AGPL-3.0-only"
@@ -22,23 +23,22 @@ privileged-tests = []
 clap = { version = "4.6.1", features = ["derive"] }
 humantime = "2.3.0"
 json-strip-comments = "3.1.1"
+libc = "0.2.189"
+libcontainer = "0.7.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 
-# --- Deferred dependencies (kept commented; see backlog S-01 note + specs/dependencies.md) ---
-# Not activated by the scaffold: no compiled code uses them yet, and the kernel/network
-# crates pull system libs that would slow or break the skeleton build. Uncomment each one
-# when its adapter/spike lands, and RE-CONFIRM the live version first (ADR-0009).
+# --- Dependencies the remaining features will bring in ---
+# Each one is kept commented until the code that uses it exists, so the build never
+# carries a crate (or the system libraries some of them need) for nothing. Confirm the
+# live version before uncommenting: these move fast enough that a remembered version is
+# usually the wrong one.
 #
-# libcontainer = "0.6.0"   # in-process OCI runtime: namespaces, pivot_root, tenant (lands in A-S1 / SP)
-# libcgroups = "0.6.0"     # per-sandbox cgroup v2 resource ceiling                 (lands in A-S1)
-# landlock = "0.4.5"       # filesystem LSM + egress Layer 2 connect-port restrict  (lands in A-S2)
-# seccompiler = "0.5.0"    # seccomp-BPF syscall filter                             (lands in A-S1)
-# rustls: CUT by SPEC-2. A no-MITM splice proxy never terminates TLS, so it is not needed;
-#         re-add only if hort ever adopts MITM (forbidden by constraint 2). See dependencies.md.
-# tls-parser = "0.12.2"    # ClientHello SNI peek for the no-MITM proxy             (lands in A-S2 / SP-1)
-# inotify = "0.11.2"       # host-side notify-dir watcher                           (lands in A-07)
-# dialoguer = "0.12.0"     # `hort config` onboarding prompts only                  (lands in C-06)
+# libcgroups = "0.7.0"     # read a sandbox's process list from its cgroup (the session probe)
+# landlock = "0.4.5"       # filesystem restriction, plus the egress connect-port restriction
+# tls-parser = "0.12.2"    # peek the TLS server name in the no-MITM egress proxy
+# inotify = "0.11.2"       # watch the notify directory for agent completion events
+# dialoguer = "0.12.0"     # the first-run configuration prompts, nothing else
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
