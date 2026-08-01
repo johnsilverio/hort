@@ -1,24 +1,29 @@
 //! `up <name>`: build a sandbox, or resume a half-built one of the same name.
 //!
-//! Acquires the per-name build lock, decides admission against the recorded and
-//! live state, creates or reuses the worktree, persists the metadata record
-//! before the container starts, then records the anchor's liveness token and
-//! provisions networking. This slice is git mode and always detached.
+//! Checks the host and rootfs preconditions before it takes anything, acquires
+//! the per-name build lock, decides admission against the recorded and live
+//! state, creates or reuses the worktree, persists the metadata record before the
+//! container starts, then records the anchor's liveness token and provisions
+//! networking. This slice is git mode and always detached.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use crate::domain::config::ResolvedConfig;
 use crate::domain::egress::EgressPolicy;
 use crate::domain::error::HortError;
-use crate::domain::model::{BranchName, SandboxName, SandboxRecord};
+use crate::domain::model::{BranchName, SandboxName, SandboxRecord, Warning};
 use crate::domain::policy::{BranchIntent, up_error};
+use crate::domain::preconditions::up_precondition_error;
 use crate::domain::reconcile::SandboxState;
+use crate::domain::resources::resource_limits;
 use crate::ports::{
-    Clock, ContainerRegistry, ContainerRuntime, LivenessProbe, MetadataStore, NetworkProvider,
-    NetworkSpec, OciSpec, SandboxLock, WorktreeProvider,
+    Clock, ContainerRegistry, ContainerRuntime, DbForward, EnvironmentProbe, LivenessProbe,
+    MetadataStore, NetworkProvider, NetworkSpec, OciSpec, SandboxLock, WorktreeProvider,
 };
 
 /// Coordinates building (or resuming) the sandbox named `<name>` over the ports
-/// it depends on. Per-sandbox paths derive from `state_root`.
+/// it depends on. Per-sandbox paths derive from `state_root`; what the sandbox
+/// is made of comes from the resolved configuration.
 pub struct UpCommand<'a> {
     lock: &'a dyn SandboxLock,
     store: &'a dyn MetadataStore,
@@ -28,12 +33,37 @@ pub struct UpCommand<'a> {
     runtime: &'a dyn ContainerRuntime,
     network: &'a dyn NetworkProvider,
     clock: &'a dyn Clock,
+    env: &'a dyn EnvironmentProbe,
     state_root: PathBuf,
-    rootfs: PathBuf,
+    config: &'a ResolvedConfig,
 }
 
 impl UpCommand<'_> {
-    pub fn run(&self, name: SandboxName, branch: Option<BranchName>) -> Result<(), HortError> {
+    /// Build (or resume) the sandbox, returning the advisories the user has to
+    /// hear: a resource cap the host cannot enforce, and whatever later slices
+    /// degrade rather than fail on.
+    pub fn run(
+        &self,
+        name: SandboxName,
+        branch: Option<BranchName>,
+    ) -> Result<Vec<Warning>, HortError> {
+        let host = self.env.detect();
+        let rootfs_facts = self.config.rootfs.as_deref().map(|configured| {
+            self.env.inspect_rootfs(Path::new(configured), self.config.shell.as_deref())
+        });
+        if let Some(error) = up_precondition_error(&host, rootfs_facts.as_ref()) {
+            return Err(error);
+        }
+        // The selection is handed an Option so its order holds: a host without
+        // user namespaces has to say so rather than blame a missing rootfs. Past
+        // it the facts are always there, and their path is the inspected one.
+        let rootfs = rootfs_facts.ok_or(HortError::NoRootfsConfigured)?.path;
+
+        // Everything the configuration can get wrong is read before the build
+        // lock is taken: failing fast means failing before holding a resource.
+        let (limits, warnings) = resource_limits(self.config.resources.as_ref(), &host.cgroup)?;
+        let egress = EgressPolicy::from_config(self.config.egress.as_ref())?;
+
         if !self.lock.try_acquire(&name)? {
             return Err(HortError::UpInProgress { name: name.as_str().to_string() });
         }
@@ -113,26 +143,31 @@ impl UpCommand<'_> {
         let worktree_display = worktree_path.display().to_string();
         let token = self.runtime.start_anchor(&OciSpec {
             name: name.clone(),
-            rootfs: self.rootfs.clone(),
+            rootfs,
             overlay: overlay_path,
             workdir: worktree_path,
             env: vec![
                 ("HORT_SANDBOX".to_string(), name.as_str().to_string()),
                 ("HORT_WORKTREE".to_string(), worktree_display),
             ],
-            resources: None,
+            resources: limits,
         })?;
         self.store.put(&record.with_token(token))?;
 
         self.network.provision(&NetworkSpec {
             name: name.clone(),
             netns: PathBuf::from(format!("/proc/{}/ns/net", token.pid.0)),
-            egress: EgressPolicy::Open,
-            db_forwards: Vec::new(),
+            egress,
+            db_forwards: self
+                .config
+                .network
+                .iter()
+                .map(|database| DbForward { host: database.host.clone(), port: database.port })
+                .collect(),
         })?;
 
         self.lock.release(&name)?;
-        Ok(())
+        Ok(warnings)
     }
 }
 
@@ -142,14 +177,42 @@ mod tests {
 
     use std::time::SystemTime;
 
-    use crate::domain::model::{AnchorPid, LivenessToken, MountNsInode};
+    use crate::domain::config::{Cache, Egress, Mounts, Network, Resources};
+    use crate::domain::model::{AnchorPid, Capabilities, CgroupCaps, LivenessToken, MountNsInode};
     use crate::fakes::{
-        FakeNetwork, FakeRegistry, FakeRuntime, FakeSandboxLock, FakeWorktreeProvider,
-        InMemoryMetadataStore, ScriptedClock, ScriptedLivenessProbe, sample_record,
+        FakeCapabilities, FakeNetwork, FakeRegistry, FakeRuntime, FakeSandboxLock,
+        FakeWorktreeProvider, InMemoryMetadataStore, ScriptedClock, ScriptedLivenessProbe,
+        sample_record,
     };
 
     fn canned_token() -> LivenessToken {
         LivenessToken { pid: AnchorPid(1234), mnt_ns: MountNsInode(5678) }
+    }
+
+    fn ready_host() -> Capabilities {
+        Capabilities {
+            user_ns: true,
+            pasta: Some(PathBuf::from("/usr/bin/pasta")),
+            cgroup: CgroupCaps { memory: true, pids: true, cpu: true, cpuset: false },
+            landlock_abi: Some(4),
+            overlayfs_rootless: true,
+            notify_send: true,
+            git: true,
+        }
+    }
+
+    fn healthy_config() -> ResolvedConfig {
+        ResolvedConfig {
+            rootfs: Some("/base/rootfs".to_string()),
+            agents: Vec::new(),
+            mounts: Mounts::default(),
+            network: Vec::new(),
+            egress: None,
+            notifications: None,
+            cache: Cache::default(),
+            shell: None,
+            resources: None,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -162,6 +225,8 @@ mod tests {
         runtime: &'a FakeRuntime,
         network: &'a FakeNetwork,
         clock: &'a ScriptedClock,
+        env: &'a FakeCapabilities,
+        config: &'a ResolvedConfig,
     ) -> UpCommand<'a> {
         UpCommand {
             lock,
@@ -172,8 +237,9 @@ mod tests {
             runtime,
             network,
             clock,
+            env,
             state_root: PathBuf::from("/state"),
-            rootfs: PathBuf::from("/base/rootfs"),
+            config,
         }
     }
 
@@ -187,8 +253,11 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command =
-            up_command(&lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
 
@@ -206,8 +275,11 @@ mod tests {
         let runtime = FakeRuntime::failing_start(canned_token());
         let network = FakeNetwork::new();
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command =
-            up_command(&lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
 
@@ -226,8 +298,11 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command =
-            up_command(&lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
 
         command.run(SandboxName::new("demo").unwrap(), None).unwrap();
 
@@ -248,8 +323,11 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command =
-            up_command(&lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
 
@@ -271,8 +349,11 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command =
-            up_command(&lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
 
@@ -294,8 +375,11 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command =
-            up_command(&lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
 
@@ -315,8 +399,11 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command =
-            up_command(&lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
 
@@ -333,8 +420,11 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command =
-            up_command(&lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
 
@@ -353,8 +443,11 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command =
-            up_command(&lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
 
@@ -373,8 +466,11 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command =
-            up_command(&lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
 
@@ -391,8 +487,11 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command =
-            up_command(&lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
 
@@ -409,8 +508,11 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command =
-            up_command(&lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
 
         let result = command
             .run(SandboxName::new("demo").unwrap(), Some(BranchName::new("feature-x").unwrap()));
@@ -431,8 +533,11 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command =
-            up_command(&lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
 
         let result = command
             .run(SandboxName::new("demo").unwrap(), Some(BranchName::new("feature-x").unwrap()));
@@ -450,8 +555,11 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command =
-            up_command(&lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
 
         let result = command
             .run(SandboxName::new("demo").unwrap(), Some(BranchName::new("feature-x").unwrap()));
@@ -475,12 +583,234 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command =
-            up_command(&lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
 
         assert!(result.is_ok());
         assert_eq!(network.provisioned(), vec![SandboxName::new("demo").unwrap()]);
+    }
+
+    #[test]
+    fn up_reports_the_precondition_error_over_a_held_lock() {
+        let lock = FakeSandboxLock::held();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(Capabilities { user_ns: false, ..ready_host() });
+        let config = healthy_config();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
+
+        let result = command.run(SandboxName::new("demo").unwrap(), None);
+
+        assert_eq!(result, Err(HortError::UserNamespacesDisabled));
+    }
+
+    #[test]
+    fn up_rejects_a_rootfs_the_host_reports_missing() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host()).with_missing_rootfs();
+        let config = healthy_config();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
+
+        let result = command.run(SandboxName::new("demo").unwrap(), None);
+
+        assert_eq!(result, Err(HortError::RootfsMissing { path: "/base/rootfs".to_string() }));
+    }
+
+    #[test]
+    fn up_passes_the_configured_shell_to_the_rootfs_inspection() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config =
+            ResolvedConfig { shell: Some("/usr/bin/fish".to_string()), ..healthy_config() };
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        assert_eq!(
+            env.inspections(),
+            vec![(PathBuf::from("/base/rootfs"), Some("/usr/bin/fish".to_string()))]
+        );
+    }
+
+    #[test]
+    fn up_puts_the_configured_rootfs_in_the_container_spec() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        assert_eq!(runtime.started_rootfs(), PathBuf::from("/base/rootfs"));
+    }
+
+    #[test]
+    fn up_puts_the_resource_ceiling_in_the_container_spec() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = ResolvedConfig {
+            resources: Some(Resources { memory: Some("4g".to_string()), cpus: Some(2.0) }),
+            ..healthy_config()
+        };
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        assert_eq!(runtime.started_memory_bytes(), Some(4_294_967_296));
+        assert_eq!(runtime.started_cpus(), Some(2.0));
+    }
+
+    #[test]
+    fn up_returns_the_degradation_warning_when_a_controller_is_missing() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(Capabilities {
+            cgroup: CgroupCaps { memory: false, pids: true, cpu: true, cpuset: false },
+            ..ready_host()
+        });
+        let config = ResolvedConfig {
+            resources: Some(Resources { memory: Some("4g".to_string()), cpus: None }),
+            ..healthy_config()
+        };
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
+
+        let warnings = command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        assert!(warnings.iter().any(|warning| warning.to_string().contains("memory")));
+    }
+
+    #[test]
+    fn up_carries_the_configured_egress_policy_into_the_network_spec() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = ResolvedConfig {
+            egress: Some(Egress::Allowlist { allow: vec!["api.anthropic.com".to_string()] }),
+            ..healthy_config()
+        };
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        let policy = network.provisioned_egress().expect("up provisions the sandbox network");
+        assert!(policy.matches("api.anthropic.com"));
+        assert!(!policy.matches("evil.com"));
+    }
+
+    #[test]
+    fn up_carries_the_declared_database_forwards_into_the_network_spec() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = ResolvedConfig {
+            network: vec![Network {
+                mode: "host".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 5432,
+            }],
+            ..healthy_config()
+        };
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        assert_eq!(network.provisioned_forwards(), vec![("127.0.0.1".to_string(), 5432)]);
+    }
+
+    #[test]
+    fn up_rejects_a_malformed_egress_allowlist_before_starting_the_container() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = ResolvedConfig {
+            egress: Some(Egress::Allowlist { allow: vec!["not a host!".to_string()] }),
+            ..healthy_config()
+        };
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
+
+        let result = command.run(SandboxName::new("demo").unwrap(), None);
+
+        assert!(result.is_err());
+        assert!(runtime.started_env().is_empty());
     }
 }

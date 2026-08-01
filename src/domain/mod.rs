@@ -12,4 +12,5 @@ pub mod policy;
 pub mod preconditions;
 pub mod prune;
 pub mod reconcile;
+pub mod resources;
 pub mod teardown;

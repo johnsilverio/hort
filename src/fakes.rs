@@ -11,15 +11,16 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::SystemTime;
 
+use crate::domain::egress::{EgressPolicy, HostPattern};
 use crate::domain::error::HortError;
 use crate::domain::model::{
     AnchorPid, BranchName, Capabilities, LivenessToken, MountNsInode, SandboxName, SandboxRecord,
 };
 use crate::domain::preconditions::{ConfiguredShell, RootfsFacts};
 use crate::ports::{
-    Clock, Confirmer, ContainerRegistry, ContainerRuntime, CorruptEntry, EnvironmentProbe,
-    LivenessProbe, MetadataStore, NetworkProvider, NetworkSpec, Notifier, OciSpec, RegistryEntry,
-    SandboxLock, SessionProbe, Worktree, WorktreeProvider,
+    Clock, Confirmer, ContainerRegistry, ContainerRuntime, CorruptEntry, DbForward,
+    EnvironmentProbe, LivenessProbe, MetadataStore, NetworkProvider, NetworkSpec, Notifier,
+    OciSpec, RegistryEntry, ResourceLimits, SandboxLock, SessionProbe, Worktree, WorktreeProvider,
 };
 
 /// The shared teardown-order witness threaded through the fakes that perform a
@@ -99,6 +100,8 @@ pub struct FakeRuntime {
     token: LivenessToken,
     start_fails: bool,
     started_env: RefCell<Vec<(String, String)>>,
+    started_rootfs: RefCell<PathBuf>,
+    started_resources: RefCell<Option<ResourceLimits>>,
     joins: RefCell<Vec<SandboxName>>,
     teardowns: RefCell<Vec<SandboxName>>,
     trace: Option<TeardownTrace>,
@@ -110,6 +113,8 @@ impl FakeRuntime {
             token,
             start_fails: false,
             started_env: RefCell::new(Vec::new()),
+            started_rootfs: RefCell::new(PathBuf::new()),
+            started_resources: RefCell::new(None),
             joins: RefCell::new(Vec::new()),
             teardowns: RefCell::new(Vec::new()),
             trace: None,
@@ -134,6 +139,21 @@ impl FakeRuntime {
         self.started_env.borrow().clone()
     }
 
+    /// The base rootfs of the spec the last `start_anchor` was handed.
+    pub fn started_rootfs(&self) -> PathBuf {
+        self.started_rootfs.borrow().clone()
+    }
+
+    /// The memory ceiling of the spec the last `start_anchor` was handed.
+    pub fn started_memory_bytes(&self) -> Option<u64> {
+        self.started_resources.borrow().as_ref().and_then(|limits| limits.memory_bytes)
+    }
+
+    /// The CPU ceiling of the spec the last `start_anchor` was handed.
+    pub fn started_cpus(&self) -> Option<f32> {
+        self.started_resources.borrow().as_ref().and_then(|limits| limits.cpus)
+    }
+
     pub fn joins(&self) -> Vec<SandboxName> {
         self.joins.borrow().clone()
     }
@@ -146,6 +166,11 @@ impl FakeRuntime {
 impl ContainerRuntime for FakeRuntime {
     fn start_anchor(&self, spec: &OciSpec) -> Result<LivenessToken, HortError> {
         self.started_env.borrow_mut().clone_from(&spec.env);
+        self.started_rootfs.borrow_mut().clone_from(&spec.rootfs);
+        *self.started_resources.borrow_mut() = spec
+            .resources
+            .as_ref()
+            .map(|limits| ResourceLimits { memory_bytes: limits.memory_bytes, cpus: limits.cpus });
         if self.start_fails {
             return Err(HortError::InvalidConfig {
                 detail: "fake runtime: start_anchor scripted to fail".to_string(),
@@ -168,11 +193,11 @@ impl ContainerRuntime for FakeRuntime {
     }
 }
 
-/// Remembers which sandboxes it provisioned egress for and tore down, spawning
-/// nothing.
+/// Remembers the spec of every egress it provisioned, and which sandboxes it
+/// tore down, spawning nothing.
 #[derive(Default)]
 pub struct FakeNetwork {
-    provisioned: RefCell<Vec<SandboxName>>,
+    provisioned: RefCell<Vec<NetworkSpec>>,
     teardowns: RefCell<Vec<SandboxName>>,
     trace: Option<TeardownTrace>,
 }
@@ -189,7 +214,27 @@ impl FakeNetwork {
     }
 
     pub fn provisioned(&self) -> Vec<SandboxName> {
-        self.provisioned.borrow().clone()
+        self.provisioned.borrow().iter().map(|spec| spec.name.clone()).collect()
+    }
+
+    /// The egress policy of the spec provisioned last.
+    pub fn provisioned_egress(&self) -> Option<EgressPolicy> {
+        self.provisioned.borrow().last().map(|spec| copy_egress_policy(&spec.egress))
+    }
+
+    /// The `host` and `port` of every database forward of the spec provisioned
+    /// last.
+    pub fn provisioned_forwards(&self) -> Vec<(String, u16)> {
+        self.provisioned
+            .borrow()
+            .last()
+            .map(|spec| {
+                spec.db_forwards
+                    .iter()
+                    .map(|forward| (forward.host.clone(), forward.port))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn teardowns(&self) -> Vec<SandboxName> {
@@ -199,7 +244,16 @@ impl FakeNetwork {
 
 impl NetworkProvider for FakeNetwork {
     fn provision(&self, spec: &NetworkSpec) -> Result<(), HortError> {
-        self.provisioned.borrow_mut().push(spec.name.clone());
+        self.provisioned.borrow_mut().push(NetworkSpec {
+            name: spec.name.clone(),
+            netns: spec.netns.clone(),
+            egress: copy_egress_policy(&spec.egress),
+            db_forwards: spec
+                .db_forwards
+                .iter()
+                .map(|forward| DbForward { host: forward.host.clone(), port: forward.port })
+                .collect(),
+        });
         Ok(())
     }
 
@@ -209,6 +263,25 @@ impl NetworkProvider for FakeNetwork {
             trace.borrow_mut().push("network.teardown".to_string());
         }
         Ok(())
+    }
+}
+
+/// Take an owned copy of a provisioned egress policy. The spec arrives by
+/// reference and the policy is not clonable, so the fake rebuilds it variant by
+/// variant to hand the test a policy it can question.
+fn copy_egress_policy(policy: &EgressPolicy) -> EgressPolicy {
+    match policy {
+        EgressPolicy::Open => EgressPolicy::Open,
+        EgressPolicy::Allowlist(patterns) => {
+            EgressPolicy::Allowlist(patterns.iter().map(copy_host_pattern).collect())
+        }
+    }
+}
+
+fn copy_host_pattern(pattern: &HostPattern) -> HostPattern {
+    match pattern {
+        HostPattern::Exact(domain) => HostPattern::Exact(domain.clone()),
+        HostPattern::Suffix(domain) => HostPattern::Suffix(domain.clone()),
     }
 }
 
@@ -269,14 +342,29 @@ impl Clock for ScriptedClock {
     }
 }
 
-/// Reports scripted host capabilities, detecting nothing real.
+/// Reports scripted host capabilities, detecting nothing real, and remembers
+/// which rootfs it was asked to inspect and with which session shell.
 pub struct FakeCapabilities {
     capabilities: Capabilities,
+    rootfs_present: bool,
+    inspections: RefCell<Vec<(PathBuf, Option<String>)>>,
 }
 
 impl FakeCapabilities {
     pub fn new(capabilities: Capabilities) -> Self {
-        Self { capabilities }
+        Self { capabilities, rootfs_present: true, inspections: RefCell::new(Vec::new()) }
+    }
+
+    /// Script the configured rootfs as absent from the host: a directory that is
+    /// not there provides nothing, so every fact about it reads false.
+    pub fn with_missing_rootfs(mut self) -> Self {
+        self.rootfs_present = false;
+        self
+    }
+
+    /// The path and session shell of every `inspect_rootfs` call, in order.
+    pub fn inspections(&self) -> Vec<(PathBuf, Option<String>)> {
+        self.inspections.borrow().clone()
     }
 }
 
@@ -285,16 +373,19 @@ impl EnvironmentProbe for FakeCapabilities {
         self.capabilities.clone()
     }
 
-    /// A rootfs that satisfies every fact, built from the arguments it was given.
-    /// Scripting arrives with the first test that needs an unusable rootfs.
+    /// Facts built from the arguments it was given, every one satisfied unless
+    /// the rootfs was scripted missing.
     fn inspect_rootfs(&self, path: &Path, shell: Option<&str>) -> RootfsFacts {
+        self.inspections.borrow_mut().push((path.to_path_buf(), shell.map(str::to_owned)));
         RootfsFacts {
             path: path.to_path_buf(),
-            exists: true,
-            has_default_shell: true,
-            configured_shell: shell
-                .map(|shell| ConfiguredShell { path: shell.to_owned(), present: true }),
-            workdir_writable: true,
+            exists: self.rootfs_present,
+            has_default_shell: self.rootfs_present,
+            configured_shell: shell.map(|shell| ConfiguredShell {
+                path: shell.to_owned(),
+                present: self.rootfs_present,
+            }),
+            workdir_writable: self.rootfs_present,
         }
     }
 }
