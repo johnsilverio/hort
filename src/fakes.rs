@@ -7,7 +7,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::SystemTime;
 
@@ -15,6 +15,7 @@ use crate::domain::error::HortError;
 use crate::domain::model::{
     AnchorPid, BranchName, Capabilities, LivenessToken, MountNsInode, SandboxName, SandboxRecord,
 };
+use crate::domain::preconditions::{ConfiguredShell, RootfsFacts};
 use crate::ports::{
     Clock, Confirmer, ContainerRegistry, ContainerRuntime, CorruptEntry, EnvironmentProbe,
     LivenessProbe, MetadataStore, NetworkProvider, NetworkSpec, Notifier, OciSpec, RegistryEntry,
@@ -282,6 +283,19 @@ impl FakeCapabilities {
 impl EnvironmentProbe for FakeCapabilities {
     fn detect(&self) -> Capabilities {
         self.capabilities.clone()
+    }
+
+    /// A rootfs that satisfies every fact, built from the arguments it was given.
+    /// Scripting arrives with the first test that needs an unusable rootfs.
+    fn inspect_rootfs(&self, path: &Path, shell: Option<&str>) -> RootfsFacts {
+        RootfsFacts {
+            path: path.to_path_buf(),
+            exists: true,
+            has_default_shell: true,
+            configured_shell: shell
+                .map(|shell| ConfiguredShell { path: shell.to_owned(), present: true }),
+            workdir_writable: true,
+        }
     }
 }
 

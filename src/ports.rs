@@ -5,12 +5,13 @@
 //! decision logic that drives it can be tested against an in-memory fake. Every
 //! port has exactly one real adapter and one test fake.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::domain::egress::EgressPolicy;
 use crate::domain::error::HortError;
 use crate::domain::model::{BranchName, Capabilities, LivenessToken, SandboxName, SandboxRecord};
+use crate::domain::preconditions::RootfsFacts;
 
 /// Is this recorded anchor still the live one? Alive iff the PID exists **and**
 /// its mount-namespace inode matches the token. The inode guards against PID
@@ -148,10 +149,15 @@ pub trait Clock {
     fn now(&self) -> SystemTime;
 }
 
-/// Host and kernel capability detection. Read-only and infallible: a capability
-/// hort cannot find is recorded absent, never an error.
+/// Host and kernel capability detection, plus the reading of one prepared
+/// rootfs. Read-only and infallible: a capability hort cannot find is recorded
+/// absent and a path it cannot read yields the conservative fact, never an error.
 pub trait EnvironmentProbe {
     fn detect(&self) -> Capabilities;
+    /// Read the facts a build decides over from the rootfs at `path`. `shell` is
+    /// the session shell the configuration declares, `None` when it declares
+    /// none.
+    fn inspect_rootfs(&self, path: &Path, shell: Option<&str>) -> RootfsFacts;
 }
 
 /// Enumerate the live anchors the runtime knows about. The cross-source
