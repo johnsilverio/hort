@@ -90,11 +90,7 @@ pub struct Domain(String);
 impl Domain {
     /// Validate `value` as a bare hostname and wrap it.
     pub fn new(value: &str) -> Result<Self, HortError> {
-        if is_hostname(value) {
-            Ok(Self(value.to_owned()))
-        } else {
-            Err(HortError::InvalidName)
-        }
+        if is_hostname(value) { Ok(Self(value.to_owned())) } else { Err(HortError::InvalidName) }
     }
 
     /// The wrapped hostname.
@@ -295,10 +291,7 @@ mod tests {
 
     #[test]
     fn sandbox_name_rejects_slash() {
-        assert!(matches!(
-            SandboxName::new("feature/x"),
-            Err(HortError::InvalidName)
-        ));
+        assert!(matches!(SandboxName::new("feature/x"), Err(HortError::InvalidName)));
     }
 
     #[test]
@@ -313,10 +306,7 @@ mod tests {
 
     #[test]
     fn domain_rejects_non_hostname() {
-        assert!(matches!(
-            Domain::new("https://api.anthropic.com/v1"),
-            Err(HortError::InvalidName)
-        ));
+        assert!(matches!(Domain::new("https://api.anthropic.com/v1"), Err(HortError::InvalidName)));
     }
 
     #[test]

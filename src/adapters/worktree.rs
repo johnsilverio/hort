@@ -89,8 +89,7 @@ impl WorktreeProvider for GitWorktreeProvider {
     }
 
     fn is_git_repo(&self) -> Result<bool, HortError> {
-        let output =
-            capture(&self.repo_dir, "rev-parse", &["rev-parse", "--is-inside-work-tree"])?;
+        let output = capture(&self.repo_dir, "rev-parse", &["rev-parse", "--is-inside-work-tree"])?;
         Ok(output.status.success())
     }
 
@@ -146,11 +145,7 @@ fn run(dir: &Path, op: &str, args: &[&str]) -> Result<String, HortError> {
 /// in listed order and unfiltered: each record opens with a `worktree <path>`
 /// line, the main checkout included.
 fn parse_worktree_paths(porcelain: &str) -> Vec<PathBuf> {
-    porcelain
-        .lines()
-        .filter_map(|line| line.strip_prefix("worktree "))
-        .map(PathBuf::from)
-        .collect()
+    porcelain.lines().filter_map(|line| line.strip_prefix("worktree ")).map(PathBuf::from).collect()
 }
 
 #[cfg(test)]
@@ -234,10 +229,7 @@ mod tests {
     }
 
     fn canonical_worktree(state_root: &Path, name: &SandboxName) -> PathBuf {
-        state_root
-            .join("sandboxes")
-            .join(name.as_str())
-            .join(format!("worktree-{}", name.as_str()))
+        state_root.join("sandboxes").join(name.as_str()).join(format!("worktree-{}", name.as_str()))
     }
 
     #[test]

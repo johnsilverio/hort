@@ -52,9 +52,8 @@ pub fn reconcile_all(
         let anchor_live = record
             .liveness_token()
             .is_some_and(|token| live_anchors.iter().any(|entry| entry.token == token));
-        let worktree_present = worktrees
-            .iter()
-            .any(|worktree| worktree.path == *record.worktree_path());
+        let worktree_present =
+            worktrees.iter().any(|worktree| worktree.path == *record.worktree_path());
 
         let state = match (anchor_live, worktree_present) {
             (true, true) => SandboxState::Live,

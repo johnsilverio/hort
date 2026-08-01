@@ -38,12 +38,7 @@ impl<'a> DownCommand<'a> {
 }
 
 impl DownCommand<'_> {
-    pub fn run(
-        &self,
-        name: SandboxName,
-        force: bool,
-        stdin_is_tty: bool,
-    ) -> Result<(), HortError> {
+    pub fn run(&self, name: SandboxName, force: bool, stdin_is_tty: bool) -> Result<(), HortError> {
         let record = self
             .store
             .get(&name)?
@@ -144,7 +139,10 @@ mod tests {
 
         let result = command.run(SandboxName::new("demo").unwrap(), false, false);
 
-        assert_eq!(result, Err(HortError::RefusedWithoutConfirmation { command: "down".to_string() }));
+        assert_eq!(
+            result,
+            Err(HortError::RefusedWithoutConfirmation { command: "down".to_string() })
+        );
         assert!(trace.borrow().is_empty());
         assert!(confirmer.prompts().is_empty());
     }

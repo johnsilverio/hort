@@ -28,10 +28,7 @@ pub struct FlockSandboxLock {
 impl FlockSandboxLock {
     /// Build a lock rooted at `state_root`.
     pub fn new(state_root: PathBuf) -> Self {
-        Self {
-            state_root,
-            held: RefCell::new(HashMap::new()),
-        }
+        Self { state_root, held: RefCell::new(HashMap::new()) }
     }
 
     fn lock_path(&self, name: &SandboxName) -> PathBuf {
@@ -47,14 +44,12 @@ impl SandboxLock for FlockSandboxLock {
             detail: format!("could not create {}: {error}", sandbox_dir.display()),
         })?;
 
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|error| HortError::StateIo {
-                detail: format!("could not open {}: {error}", lock_path.display()),
-            })?;
+        let file =
+            OpenOptions::new().create(true).write(true).truncate(false).open(&lock_path).map_err(
+                |error| HortError::StateIo {
+                    detail: format!("could not open {}: {error}", lock_path.display()),
+                },
+            )?;
 
         match file.try_lock() {
             Ok(()) => {
@@ -129,8 +124,7 @@ mod tests {
         holder.try_acquire(&SandboxName::new("demo").unwrap()).unwrap();
         let contender = FlockSandboxLock::new(dir.path().to_path_buf());
 
-        let acquired_other =
-            contender.try_acquire(&SandboxName::new("other").unwrap()).unwrap();
+        let acquired_other = contender.try_acquire(&SandboxName::new("other").unwrap()).unwrap();
 
         assert!(acquired_other);
     }

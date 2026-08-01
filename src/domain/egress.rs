@@ -140,27 +140,24 @@ mod tests {
 
     #[test]
     fn egress_wildcard_does_not_match_apex() {
-        let policy = EgressPolicy::Allowlist(vec![HostPattern::Suffix(
-            Domain::new("example.com").unwrap(),
-        )]);
+        let policy =
+            EgressPolicy::Allowlist(vec![HostPattern::Suffix(Domain::new("example.com").unwrap())]);
 
         assert!(!policy.matches("example.com"));
     }
 
     #[test]
     fn egress_wildcard_does_not_match_host_without_dot_boundary() {
-        let policy = EgressPolicy::Allowlist(vec![HostPattern::Suffix(
-            Domain::new("example.com").unwrap(),
-        )]);
+        let policy =
+            EgressPolicy::Allowlist(vec![HostPattern::Suffix(Domain::new("example.com").unwrap())]);
 
         assert!(!policy.matches("notexample.com"));
     }
 
     #[test]
     fn egress_wildcard_does_not_match_host_with_empty_left_label() {
-        let policy = EgressPolicy::Allowlist(vec![HostPattern::Suffix(
-            Domain::new("example.com").unwrap(),
-        )]);
+        let policy =
+            EgressPolicy::Allowlist(vec![HostPattern::Suffix(Domain::new("example.com").unwrap())]);
 
         assert!(!policy.matches(".example.com"));
     }
@@ -207,10 +204,7 @@ mod tests {
     #[test]
     fn egress_config_allow_entries_resolve_to_allowlist() {
         let egress = Egress::Allowlist {
-            allow: vec![
-                "api.anthropic.com".to_string(),
-                "*.githubusercontent.com".to_string(),
-            ],
+            allow: vec!["api.anthropic.com".to_string(), "*.githubusercontent.com".to_string()],
         };
 
         let policy = EgressPolicy::from_config(Some(&egress)).unwrap();
@@ -221,9 +215,7 @@ mod tests {
 
     #[test]
     fn egress_config_rejects_invalid_hostname_entry() {
-        let egress = Egress::Allowlist {
-            allow: vec!["https://api.anthropic.com/v1".to_string()],
-        };
+        let egress = Egress::Allowlist { allow: vec!["https://api.anthropic.com/v1".to_string()] };
 
         let result = EgressPolicy::from_config(Some(&egress));
 

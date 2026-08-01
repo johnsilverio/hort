@@ -46,16 +46,18 @@ impl FileMetadataStore {
 impl MetadataStore for FileMetadataStore {
     fn put(&self, record: &SandboxRecord) -> Result<(), HortError> {
         let sandbox_dir = self.sandbox_dir(record.name());
-        fs::create_dir_all(&sandbox_dir)
-            .map_err(|error| corrupt(format!("could not create {}: {error}", sandbox_dir.display())))?;
+        fs::create_dir_all(&sandbox_dir).map_err(|error| {
+            corrupt(format!("could not create {}: {error}", sandbox_dir.display()))
+        })?;
 
         let serialized = serde_json::to_vec_pretty(record).map_err(|error| {
             corrupt(format!("could not serialize record for '{}': {error}", record.name().as_str()))
         })?;
 
         let temp_path = sandbox_dir.join(TEMP_FILE);
-        fs::write(&temp_path, &serialized)
-            .map_err(|error| corrupt(format!("could not write {}: {error}", temp_path.display())))?;
+        fs::write(&temp_path, &serialized).map_err(|error| {
+            corrupt(format!("could not write {}: {error}", temp_path.display()))
+        })?;
         fs::rename(&temp_path, sandbox_dir.join(METADATA_FILE)).map_err(|error| {
             corrupt(format!("could not persist metadata for '{}': {error}", record.name().as_str()))
         })
@@ -148,8 +150,9 @@ fn load(path: &Path) -> Result<Option<SandboxRecord>, HortError> {
         }
     };
 
-    let value: serde_json::Value = serde_json::from_str(&contents)
-        .map_err(|error| corrupt(format!("could not parse metadata at {}: {error}", path.display())))?;
+    let value: serde_json::Value = serde_json::from_str(&contents).map_err(|error| {
+        corrupt(format!("could not parse metadata at {}: {error}", path.display()))
+    })?;
 
     match value.get("schemaVersion").and_then(serde_json::Value::as_u64) {
         Some(SCHEMA_VERSION) => {}
@@ -160,12 +163,16 @@ fn load(path: &Path) -> Result<Option<SandboxRecord>, HortError> {
             )));
         }
         None => {
-            return Err(corrupt(format!("missing schemaVersion in metadata at {}", path.display())));
+            return Err(corrupt(format!(
+                "missing schemaVersion in metadata at {}",
+                path.display()
+            )));
         }
     }
 
-    let record: SandboxRecord = serde_json::from_value(value)
-        .map_err(|error| corrupt(format!("invalid metadata record at {}: {error}", path.display())))?;
+    let record: SandboxRecord = serde_json::from_value(value).map_err(|error| {
+        corrupt(format!("invalid metadata record at {}: {error}", path.display()))
+    })?;
 
     parse_timestamp(record.created_at())
         .map_err(|error| corrupt(format!("invalid createdAt at {}: {error}", path.display())))?;
@@ -208,13 +215,17 @@ mod tests {
     #[test]
     fn file_store_returns_none_for_missing_name() {
         let dir = tempfile::tempdir().unwrap();
-        metadata_store_returns_none_for_missing_name(FileMetadataStore::new(dir.path().to_path_buf()));
+        metadata_store_returns_none_for_missing_name(FileMetadataStore::new(
+            dir.path().to_path_buf(),
+        ));
     }
 
     #[test]
     fn file_store_put_overwrites_existing_record() {
         let dir = tempfile::tempdir().unwrap();
-        metadata_store_put_overwrites_existing_record(FileMetadataStore::new(dir.path().to_path_buf()));
+        metadata_store_put_overwrites_existing_record(FileMetadataStore::new(
+            dir.path().to_path_buf(),
+        ));
     }
 
     #[test]
@@ -226,7 +237,9 @@ mod tests {
     #[test]
     fn file_store_remove_makes_record_missing() {
         let dir = tempfile::tempdir().unwrap();
-        metadata_store_remove_makes_record_missing(FileMetadataStore::new(dir.path().to_path_buf()));
+        metadata_store_remove_makes_record_missing(FileMetadataStore::new(
+            dir.path().to_path_buf(),
+        ));
     }
 
     #[test]

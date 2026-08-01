@@ -187,9 +187,10 @@ pub fn render_ls(entries: &[LsEntry]) -> String {
 /// names and reasons is a contract.
 pub fn render_prune(report: &PruneReport) -> String {
     let removed = report.removed.iter().map(|name| format!("removed {name}\n"));
-    let skipped = report.skipped.iter().map(|skip| {
-        format!("skipped {} ({})\n", skip.name, skip_reason_label(&skip.reason))
-    });
+    let skipped = report
+        .skipped
+        .iter()
+        .map(|skip| format!("skipped {} ({})\n", skip.name, skip_reason_label(&skip.reason)));
     removed.chain(skipped).collect()
 }
 

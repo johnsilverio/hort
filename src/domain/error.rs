@@ -92,10 +92,9 @@ impl fmt::Display for HortError {
                 f,
                 "branch '{name}' already exists; choose another name or use --branch to target an existing branch"
             ),
-            HortError::BranchCheckedOut { branch } => write!(
-                f,
-                "branch '{branch}' is already checked out in another worktree"
-            ),
+            HortError::BranchCheckedOut { branch } => {
+                write!(f, "branch '{branch}' is already checked out in another worktree")
+            }
             HortError::BranchDoesNotExist { branch, name } => write!(
                 f,
                 "branch '{branch}' does not exist; create it first or omit --branch to create a new branch named '{name}'"
@@ -103,22 +102,19 @@ impl fmt::Display for HortError {
             HortError::UpInProgress { name } => {
                 write!(f, "another 'hort up {name}' is already in progress")
             }
-            HortError::BranchRequiresGit => write!(
-                f,
-                "--branch requires a git repository, but this project is not one"
-            ),
+            HortError::BranchRequiresGit => {
+                write!(f, "--branch requires a git repository, but this project is not one")
+            }
             HortError::SandboxNotRunning { name } => write!(
                 f,
                 "sandbox '{name}' is not running (run 'hort up {name}' to start it, or 'hort prune' to clean up the stale record)"
             ),
-            HortError::UnknownSandboxOnAttach { name } => write!(
-                f,
-                "no sandbox named '{name}' (run 'hort ls' to see what's alive)"
-            ),
-            HortError::UnknownSandboxOnDown { name } => write!(
-                f,
-                "no sandbox named '{name}' (run 'hort ls' to see what exists)"
-            ),
+            HortError::UnknownSandboxOnAttach { name } => {
+                write!(f, "no sandbox named '{name}' (run 'hort ls' to see what's alive)")
+            }
+            HortError::UnknownSandboxOnDown { name } => {
+                write!(f, "no sandbox named '{name}' (run 'hort ls' to see what exists)")
+            }
             HortError::RefusedWithoutConfirmation { command } => write!(
                 f,
                 "refusing to {command} without confirmation: stdin is not a TTY (pass --force to proceed)"
@@ -172,10 +168,7 @@ mod tests {
         let down = HortError::UnknownSandboxOnDown { name: "demo".to_string() };
         let attach = HortError::UnknownSandboxOnAttach { name: "demo".to_string() };
 
-        assert_eq!(
-            down.to_string(),
-            "no sandbox named 'demo' (run 'hort ls' to see what exists)"
-        );
+        assert_eq!(down.to_string(), "no sandbox named 'demo' (run 'hort ls' to see what exists)");
         assert_ne!(down.to_string(), attach.to_string());
     }
 
@@ -216,10 +209,7 @@ mod tests {
     fn up_in_progress_error_renders_canonical_string() {
         let error = HortError::UpInProgress { name: "demo".to_string() };
 
-        assert_eq!(
-            error.to_string(),
-            "another 'hort up demo' is already in progress"
-        );
+        assert_eq!(error.to_string(), "another 'hort up demo' is already in progress");
     }
 
     #[test]

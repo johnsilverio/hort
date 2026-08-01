@@ -144,10 +144,9 @@ impl ContainerRuntime for LibcontainerRuntime {
         let (report_reader, report_writer) = channel()?;
 
         match unsafe { libc::fork() } {
-            -1 => Err(runtime_failure(format!(
-                "start_anchor: fork: {}",
-                io::Error::last_os_error()
-            ))),
+            -1 => {
+                Err(runtime_failure(format!("start_anchor: fork: {}", io::Error::last_os_error())))
+            }
             0 => {
                 drop(ready_reader);
                 drop(released_writer);
@@ -206,28 +205,20 @@ struct HostOwner {
 
 fn host_owner(workdir: &Path) -> Result<HostOwner, HortError> {
     let metadata = fs::metadata(workdir).map_err(|err| {
-        runtime_failure(format!(
-            "start_anchor: reading the owner of {}: {err}",
-            workdir.display()
-        ))
+        runtime_failure(format!("start_anchor: reading the owner of {}: {err}", workdir.display()))
     })?;
     Ok(HostOwner { uid: metadata.uid(), gid: metadata.gid() })
 }
 
 fn channel() -> Result<(PipeReader, PipeWriter), HortError> {
-    io::pipe()
-        .map_err(|err| runtime_failure(format!("start_anchor: creating a pipe: {err}")))
+    io::pipe().map_err(|err| runtime_failure(format!("start_anchor: creating a pipe: {err}")))
 }
 
 fn unshare_sandbox_namespaces() -> Result<(), String> {
-    let unshared = unsafe {
-        libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWNET)
-    };
+    let unshared =
+        unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWNET) };
     if unshared == -1 {
-        return Err(format!(
-            "creating the sandbox namespaces: {}",
-            io::Error::last_os_error()
-        ));
+        return Err(format!("creating the sandbox namespaces: {}", io::Error::last_os_error()));
     }
     Ok(())
 }
@@ -280,10 +271,7 @@ fn detach_mount_propagation() -> Result<(), String> {
         )
     };
     if detached == -1 {
-        return Err(format!(
-            "detaching the sandbox mounts: {}",
-            io::Error::last_os_error()
-        ));
+        return Err(format!("detaching the sandbox mounts: {}", io::Error::last_os_error()));
     }
     Ok(())
 }
@@ -293,8 +281,7 @@ fn mount_merged_root(spec: &OciSpec) -> Result<(), String> {
     let work = spec.overlay.join(WORK_LAYER);
     let merged = spec.overlay.join(MERGED_ROOT);
     for layer in [&upper, &work, &merged] {
-        fs::create_dir_all(layer)
-            .map_err(|err| format!("creating {}: {err}", layer.display()))?;
+        fs::create_dir_all(layer).map_err(|err| format!("creating {}: {err}", layer.display()))?;
     }
 
     let target = c_path(&merged)?;
@@ -334,21 +321,15 @@ fn c_string(value: &str) -> Result<CString, String> {
 }
 
 fn write_bundle_config(bundle: &Path, spec: &Spec) -> Result<(), String> {
-    fs::create_dir_all(bundle)
-        .map_err(|err| format!("creating {}: {err}", bundle.display()))?;
+    fs::create_dir_all(bundle).map_err(|err| format!("creating {}: {err}", bundle.display()))?;
     let config = bundle.join(CONFIG_FILE);
-    spec.save(&config)
-        .map_err(|err| format!("writing {}: {err}", config.display()))
+    spec.save(&config).map_err(|err| format!("writing {}: {err}", config.display()))
 }
 
 /// Build the container from the bundle and start its anchor, returning the pid
 /// the anchor runs under on the host. The build only creates the container; the
 /// anchor is not running until `start`.
-fn start_container(
-    name: &SandboxName,
-    bundle: &Path,
-    youki_root: &Path,
-) -> Result<u32, String> {
+fn start_container(name: &SandboxName, bundle: &Path, youki_root: &Path) -> Result<u32, String> {
     fs::create_dir_all(youki_root)
         .map_err(|err| format!("creating {}: {err}", youki_root.display()))?;
 
@@ -401,14 +382,9 @@ fn read_report(mut report: PipeReader) -> Result<u32, HortError> {
         return Ok(u32::from_le_bytes(pid));
     }
     if let [ANCHOR_FAILED, detail @ ..] = message.as_slice() {
-        return Err(runtime_failure(format!(
-            "start_anchor: {}",
-            String::from_utf8_lossy(detail)
-        )));
+        return Err(runtime_failure(format!("start_anchor: {}", String::from_utf8_lossy(detail))));
     }
-    Err(runtime_failure(
-        "start_anchor: the sandbox process exited without reporting an anchor",
-    ))
+    Err(runtime_failure("start_anchor: the sandbox process exited without reporting an anchor"))
 }
 
 fn reap(child: libc::pid_t) {
@@ -562,7 +538,9 @@ fn ceiling(limits: &ResourceLimits) -> LinuxResources {
 mod tests {
     use super::*;
 
-    use libcontainer::oci_spec::runtime::{Capabilities, LinuxIdMappingBuilder, LinuxNamespaceType};
+    use libcontainer::oci_spec::runtime::{
+        Capabilities, LinuxIdMappingBuilder, LinuxNamespaceType,
+    };
 
     use crate::ports::ResourceLimits;
 
@@ -574,10 +552,7 @@ mod tests {
             workdir: PathBuf::from("/state/sandboxes/demo/worktree-demo"),
             env: vec![
                 ("HORT_SANDBOX".to_string(), "demo".to_string()),
-                (
-                    "HORT_WORKTREE".to_string(),
-                    "/state/sandboxes/demo/worktree-demo".to_string(),
-                ),
+                ("HORT_WORKTREE".to_string(), "/state/sandboxes/demo/worktree-demo".to_string()),
             ],
             resources: None,
         }
@@ -638,13 +613,8 @@ mod tests {
         // either egress posture. A namespace of its own would hand the agent the
         // one it can reconfigure.
         let linux = assembled.linux().as_ref().unwrap();
-        let declared: Vec<LinuxNamespaceType> = linux
-            .namespaces()
-            .as_ref()
-            .unwrap()
-            .iter()
-            .map(|namespace| namespace.typ())
-            .collect();
+        let declared: Vec<LinuxNamespaceType> =
+            linux.namespaces().as_ref().unwrap().iter().map(|namespace| namespace.typ()).collect();
         assert!(!declared.contains(&LinuxNamespaceType::Network));
     }
 
@@ -653,13 +623,8 @@ mod tests {
         let assembled = anchor_spec(&sandbox_spec());
 
         let linux = assembled.linux().as_ref().unwrap();
-        let declared: Vec<LinuxNamespaceType> = linux
-            .namespaces()
-            .as_ref()
-            .unwrap()
-            .iter()
-            .map(|namespace| namespace.typ())
-            .collect();
+        let declared: Vec<LinuxNamespaceType> =
+            linux.namespaces().as_ref().unwrap().iter().map(|namespace| namespace.typ()).collect();
         assert!(declared.contains(&LinuxNamespaceType::User));
         assert!(declared.contains(&LinuxNamespaceType::Mount));
         assert!(declared.contains(&LinuxNamespaceType::Pid));
@@ -672,10 +637,7 @@ mod tests {
         let assembled = anchor_spec(&sandbox_spec());
 
         let process = assembled.process().as_ref().unwrap();
-        assert_eq!(
-            process.args(),
-            &Some(vec!["sleep".to_string(), "infinity".to_string()])
-        );
+        assert_eq!(process.args(), &Some(vec!["sleep".to_string(), "infinity".to_string()]));
     }
 
     #[test]
@@ -701,10 +663,7 @@ mod tests {
         let assembled = anchor_spec(&sandbox_spec());
 
         let root = assembled.root().as_ref().unwrap();
-        assert_eq!(
-            root.path(),
-            &PathBuf::from("/state/sandboxes/demo/overlay/merged")
-        );
+        assert_eq!(root.path(), &PathBuf::from("/state/sandboxes/demo/overlay/merged"));
     }
 
     #[test]
@@ -753,10 +712,7 @@ mod tests {
     #[test]
     fn spec_maps_memory_to_the_memory_limit() {
         let limited = OciSpec {
-            resources: Some(ResourceLimits {
-                memory_bytes: Some(2_147_483_648),
-                cpus: None,
-            }),
+            resources: Some(ResourceLimits { memory_bytes: Some(2_147_483_648), cpus: None }),
             ..sandbox_spec()
         };
 
@@ -837,10 +793,7 @@ mod privileged_tests {
     }
 
     fn runtime_under(youki_root: &TempDir, state_root: &TempDir) -> LibcontainerRuntime {
-        LibcontainerRuntime::new(
-            youki_root.path().to_path_buf(),
-            state_root.path().to_path_buf(),
-        )
+        LibcontainerRuntime::new(youki_root.path().to_path_buf(), state_root.path().to_path_buf())
     }
 
     /// The anchor execs a moment after the container starts, so anything read off
@@ -924,8 +877,8 @@ mod privileged_tests {
         let token = runtime.start_anchor(&spec).unwrap();
 
         wait_for_anchor(token.pid.0);
-        let seen =
-            fs::read_to_string(format!("/proc/{}/root/workdir/from-the-host", token.pid.0)).unwrap();
+        let seen = fs::read_to_string(format!("/proc/{}/root/workdir/from-the-host", token.pid.0))
+            .unwrap();
         assert_eq!(seen, "worktree");
         runtime.teardown(&spec.name).unwrap();
     }

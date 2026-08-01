@@ -36,7 +36,9 @@ pub fn up_error(
         return Some(HortError::UpInProgress { name: name.as_str().to_string() });
     }
 
-    if let Some(SandboxState::Live | SandboxState::LostRecord | SandboxState::Inconsistent) = existing {
+    if let Some(SandboxState::Live | SandboxState::LostRecord | SandboxState::Inconsistent) =
+        existing
+    {
         return Some(HortError::DuplicateName { name: name.as_str().to_string() });
     }
 
@@ -117,12 +119,7 @@ mod tests {
     fn up_selects_no_error_when_name_and_branch_are_free() {
         let name = SandboxName::new("demo").unwrap();
 
-        let error = up_error(
-            &name,
-            false,
-            None,
-            BranchIntent::CreateNew { branch_taken: false },
-        );
+        let error = up_error(&name, false, None, BranchIntent::CreateNew { branch_taken: false });
 
         assert_eq!(error, None);
     }
@@ -131,12 +128,7 @@ mod tests {
     fn up_selects_branch_exists_for_new_branch_collision() {
         let name = SandboxName::new("demo").unwrap();
 
-        let error = up_error(
-            &name,
-            false,
-            None,
-            BranchIntent::CreateNew { branch_taken: true },
-        );
+        let error = up_error(&name, false, None, BranchIntent::CreateNew { branch_taken: true });
 
         assert_eq!(error, Some(HortError::BranchExists { name: "demo".to_string() }));
     }

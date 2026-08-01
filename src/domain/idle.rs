@@ -21,9 +21,8 @@ pub enum IdleState {
 /// though it is otherwise valid RFC 3339. A failure carries a human-readable
 /// detail and is matched by variant, not by its rendered text.
 pub fn parse_timestamp(value: &str) -> Result<SystemTime, HortError> {
-    humantime::parse_rfc3339(value).map_err(|err| HortError::InvalidTimestamp {
-        detail: format!("'{value}': {err}"),
-    })
+    humantime::parse_rfc3339(value)
+        .map_err(|err| HortError::InvalidTimestamp { detail: format!("'{value}': {err}") })
 }
 
 /// How long the sandbox has existed: `now` minus its creation time, saturating

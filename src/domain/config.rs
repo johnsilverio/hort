@@ -172,15 +172,11 @@ pub fn merge(global: Config, local: Config) -> ResolvedConfig {
     ResolvedConfig {
         rootfs: local.rootfs.or(global.rootfs),
         agents: merge_agents(global.agents, local.agents),
-        mounts: Mounts {
-            read_only: union_dedupe(global.mounts.read_only, local.mounts.read_only),
-        },
+        mounts: Mounts { read_only: union_dedupe(global.mounts.read_only, local.mounts.read_only) },
         network: merge_network(global.network, local.network),
         egress: local.egress.or(global.egress),
         notifications: merge_notifications(global.notifications, local.notifications),
-        cache: Cache {
-            dirs: union_dedupe(global.cache.dirs, local.cache.dirs),
-        },
+        cache: Cache { dirs: union_dedupe(global.cache.dirs, local.cache.dirs) },
         shell: local.shell.or(global.shell),
         resources: merge_resources(global.resources, local.resources),
     }
@@ -222,10 +218,7 @@ fn merge_agent(global: Agent, local: Agent) -> Agent {
 
 fn merge_network(mut global: Vec<Network>, local: Vec<Network>) -> Vec<Network> {
     for incoming in local {
-        match global
-            .iter()
-            .position(|net| net.host == incoming.host && net.port == incoming.port)
-        {
+        match global.iter().position(|net| net.host == incoming.host && net.port == incoming.port) {
             Some(index) => global[index] = incoming,
             None => global.push(incoming),
         }
@@ -290,10 +283,7 @@ pub fn map_devcontainer(jsonc: &str) -> Result<(Config, Vec<Warning>), HortError
         }
     }
 
-    let config = Config {
-        mounts: Mounts { read_only },
-        ..Config::default()
-    };
+    let config = Config { mounts: Mounts { read_only }, ..Config::default() };
     Ok((config, warnings))
 }
 

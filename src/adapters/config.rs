@@ -148,11 +148,7 @@ fn expand_home(value: &str, home: &Path) -> String {
 /// resolves to the subproject. With no marker anywhere up the chain, `start`
 /// itself is the project.
 pub fn find_project_dir(start: &Path) -> PathBuf {
-    start
-        .ancestors()
-        .find(|dir| holds_project_marker(dir))
-        .unwrap_or(start)
-        .to_path_buf()
+    start.ancestors().find(|dir| holds_project_marker(dir)).unwrap_or(start).to_path_buf()
 }
 
 /// Whether a directory looks like a project root. Each marker is tested for mere
@@ -218,10 +214,7 @@ mod tests {
             &config_root.join("config.json"),
             r#"{ "rootfs": "/opt/hort/rootfs/global" }"#,
         );
-        write_config(
-            &project_dir.join(".hort.json"),
-            r#"{ "rootfs": "/opt/hort/rootfs/local" }"#,
-        );
+        write_config(&project_dir.join(".hort.json"), r#"{ "rootfs": "/opt/hort/rootfs/local" }"#);
         let resolver = ConfigResolver::new(config_root, project_dir, PathBuf::from(HOME));
 
         let (resolved, _warnings) = resolver.resolve().expect("both layers resolve");
@@ -342,10 +335,7 @@ mod tests {
     fn config_resolver_expands_the_bare_home_shorthand() {
         let (_config, config_root) = temp_dir();
         let (_project, project_dir) = temp_dir();
-        write_config(
-            &project_dir.join(".hort.json"),
-            r#"{ "mounts": { "readOnly": ["~"] } }"#,
-        );
+        write_config(&project_dir.join(".hort.json"), r#"{ "mounts": { "readOnly": ["~"] } }"#);
         let resolver = ConfigResolver::new(config_root, project_dir, PathBuf::from(HOME));
 
         let (resolved, _warnings) = resolver.resolve().expect("the local layer resolves");
@@ -365,10 +355,7 @@ mod tests {
 
         let (resolved, _warnings) = resolver.resolve().expect("the local layer resolves");
 
-        assert_eq!(
-            resolved.mounts.read_only,
-            vec!["~someoneelse/.config/nvim".to_string()]
-        );
+        assert_eq!(resolved.mounts.read_only, vec!["~someoneelse/.config/nvim".to_string()]);
     }
 
     #[test]
@@ -404,10 +391,7 @@ mod tests {
 
         assert_eq!(
             resolved.cache.dirs,
-            vec![CacheDir::Named {
-                name: "pip".to_string(),
-                target: "~/.cache/pip".to_string(),
-            }]
+            vec![CacheDir::Named { name: "pip".to_string(), target: "~/.cache/pip".to_string() }]
         );
     }
 

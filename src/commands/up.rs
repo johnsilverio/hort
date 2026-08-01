@@ -231,10 +231,7 @@ mod tests {
 
         command.run(SandboxName::new("demo").unwrap(), None).unwrap();
 
-        assert!(runtime.started_env().contains(&(
-            "HORT_SANDBOX".to_string(),
-            "demo".to_string()
-        )));
+        assert!(runtime.started_env().contains(&("HORT_SANDBOX".to_string(), "demo".to_string())));
         assert!(runtime.started_env().contains(&(
             "HORT_WORKTREE".to_string(),
             "/state/sandboxes/demo/worktree-demo".to_string()
@@ -415,10 +412,8 @@ mod tests {
         let command =
             up_command(&lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock);
 
-        let result = command.run(
-            SandboxName::new("demo").unwrap(),
-            Some(BranchName::new("feature-x").unwrap()),
-        );
+        let result = command
+            .run(SandboxName::new("demo").unwrap(), Some(BranchName::new("feature-x").unwrap()));
 
         assert!(result.is_ok());
         assert_eq!(worktrees.creates(), vec![BranchName::new("feature-x").unwrap()]);
@@ -439,10 +434,8 @@ mod tests {
         let command =
             up_command(&lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock);
 
-        let result = command.run(
-            SandboxName::new("demo").unwrap(),
-            Some(BranchName::new("feature-x").unwrap()),
-        );
+        let result = command
+            .run(SandboxName::new("demo").unwrap(), Some(BranchName::new("feature-x").unwrap()));
 
         assert_eq!(result, Err(HortError::BranchCheckedOut { branch: "feature-x".to_string() }));
     }
@@ -460,10 +453,8 @@ mod tests {
         let command =
             up_command(&lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock);
 
-        let result = command.run(
-            SandboxName::new("demo").unwrap(),
-            Some(BranchName::new("feature-x").unwrap()),
-        );
+        let result = command
+            .run(SandboxName::new("demo").unwrap(), Some(BranchName::new("feature-x").unwrap()));
 
         assert_eq!(
             result,

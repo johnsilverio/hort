@@ -56,7 +56,17 @@ impl<'a> PruneCommand<'a> {
         network: &'a dyn NetworkProvider,
         state_root: PathBuf,
     ) -> Self {
-        Self { store, registry, worktrees, sessions, clock, confirmer, runtime, network, state_root }
+        Self {
+            store,
+            registry,
+            worktrees,
+            sessions,
+            clock,
+            confirmer,
+            runtime,
+            network,
+            state_root,
+        }
     }
 }
 
@@ -203,7 +213,9 @@ mod tests {
     use std::rc::Rc;
     use std::time::Duration;
 
-    use crate::domain::model::{AnchorPid, BranchName, LivenessToken, MountNsInode, SandboxName, SandboxRecord};
+    use crate::domain::model::{
+        AnchorPid, BranchName, LivenessToken, MountNsInode, SandboxName, SandboxRecord,
+    };
     use crate::domain::prune::SkipReason;
     use crate::fakes::{
         FakeConfirmer, FakeNetwork, FakeRegistry, FakeRuntime, FakeSessionProbe,
@@ -249,14 +261,16 @@ mod tests {
         let store = InMemoryMetadataStore::new().with_trace(trace.clone());
         store.put(&sample_record("demo")).unwrap();
         let registry = FakeRegistry::new(vec![]);
-        let worktrees = FakeWorktreeProvider::new().with_listed_worktree(&name).with_trace(trace.clone());
+        let worktrees =
+            FakeWorktreeProvider::new().with_listed_worktree(&name).with_trace(trace.clone());
         let sessions = FakeSessionProbe::new(vec![]);
         let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token()).with_trace(trace.clone());
         let network = FakeNetwork::new().with_trace(trace.clone());
-        let command =
-            prune_command(&store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network);
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+        );
 
         command.run(None, true, false).unwrap();
 
@@ -284,8 +298,9 @@ mod tests {
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token()).with_trace(trace.clone());
         let network = FakeNetwork::new().with_trace(trace.clone());
-        let command =
-            prune_command(&store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network);
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+        );
 
         command.run(None, true, false).unwrap();
 
@@ -308,8 +323,9 @@ mod tests {
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
-        let command =
-            prune_command(&store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network);
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+        );
 
         let report = command.run(None, true, false).unwrap();
 
@@ -329,8 +345,9 @@ mod tests {
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
-        let command =
-            prune_command(&store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network);
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+        );
 
         let report = command.run(None, false, false).unwrap();
 
@@ -353,8 +370,9 @@ mod tests {
         let confirmer = FakeConfirmer::yes();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
-        let command =
-            prune_command(&store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network);
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+        );
 
         command.run(None, false, true).unwrap();
 
@@ -376,8 +394,9 @@ mod tests {
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
-        let command =
-            prune_command(&store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network);
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+        );
 
         let result = command.run(None, false, false);
 
@@ -400,8 +419,9 @@ mod tests {
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
-        let command =
-            prune_command(&store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network);
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+        );
 
         command.run(None, true, false).unwrap();
 
@@ -416,14 +436,16 @@ mod tests {
         let store = InMemoryMetadataStore::new().with_trace(trace.clone());
         store.put(&sample_record("demo")).unwrap();
         let registry = FakeRegistry::new(vec![]);
-        let worktrees = FakeWorktreeProvider::new().with_listed_worktree(&name).with_trace(trace.clone());
+        let worktrees =
+            FakeWorktreeProvider::new().with_listed_worktree(&name).with_trace(trace.clone());
         let sessions = FakeSessionProbe::new(vec![]);
         let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token()).with_trace(trace.clone());
         let network = FakeNetwork::new().with_trace(trace.clone());
-        let command =
-            prune_command(&store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network);
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+        );
 
         let report = command.run(None, false, true).unwrap();
 
@@ -443,8 +465,9 @@ mod tests {
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
-        let command =
-            prune_command(&store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network);
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+        );
 
         let report = command.run(None, false, false).unwrap();
 
@@ -466,8 +489,9 @@ mod tests {
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
-        let command =
-            prune_command(&store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network);
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+        );
 
         let report = command.run(None, false, false).unwrap();
 
@@ -491,8 +515,9 @@ mod tests {
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
-        let command =
-            prune_command(&store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network);
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+        );
 
         let report = command.run(None, false, false).unwrap();
 
@@ -512,8 +537,9 @@ mod tests {
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
-        let command =
-            prune_command(&store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network);
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+        );
 
         command.run(None, false, false).unwrap();
 
@@ -543,8 +569,9 @@ mod tests {
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
-        let command =
-            prune_command(&store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network);
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+        );
 
         command.run(Some(Duration::from_secs(1800)), true, false).unwrap();
 
