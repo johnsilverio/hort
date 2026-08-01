@@ -16,6 +16,22 @@ pub enum HortError {
     /// A validated domain newtype rejected its input. Matched as a **unit**
     /// variant (`HortError::InvalidName`), never `HortError::InvalidName { .. }`.
     InvalidName,
+    /// `up`/`attach`: the kernel has unprivileged user namespaces disabled, so no
+    /// sandbox can be built at all.
+    UserNamespacesDisabled,
+    /// `up`/`attach`: the pasta binary is not on `PATH`.
+    PastaMissing,
+    /// `up`: no rootfs directory is resolvable from the merged config.
+    NoRootfsConfigured,
+    /// `up`: the configured rootfs directory does not exist on the host.
+    RootfsMissing { path: String },
+    /// `up`: the rootfs provides no default shell to run the anchor and sessions.
+    RootfsWithoutShell { path: String },
+    /// `up`: the `shell` the config declares is absent from the rootfs.
+    ShellNotInRootfs { shell: String, path: String },
+    /// `up`: `/workdir` in the rootfs is not writable by the uid the sandbox maps
+    /// the in-container user to.
+    WorkdirNotWritable { path: String },
     /// `up`: a fully built sandbox of this name already exists.
     DuplicateName { name: String },
     /// `up`: the new branch named after the sandbox already exists.
@@ -84,6 +100,33 @@ impl fmt::Display for HortError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HortError::InvalidName => write!(f, "invalid name"),
+            HortError::UserNamespacesDisabled => write!(
+                f,
+                "unprivileged user namespaces are disabled in this kernel — hort cannot create a sandbox"
+            ),
+            HortError::PastaMissing => {
+                write!(f, "pasta not found on PATH — hort needs it for sandbox networking")
+            }
+            HortError::NoRootfsConfigured => write!(
+                f,
+                "no rootfs configured — set \"rootfs\" to a prepared rootfs directory in .hort.json or ~/.config/hort/config.json"
+            ),
+            HortError::RootfsMissing { path } => write!(
+                f,
+                "rootfs directory '{path}' does not exist — prepare it first with podman export, debootstrap or umoci unpack"
+            ),
+            HortError::RootfsWithoutShell { path } => write!(
+                f,
+                "rootfs '{path}' has no usable shell (expected /bin/sh) — the rootfs must provide one"
+            ),
+            HortError::ShellNotInRootfs { shell, path } => write!(
+                f,
+                "shell '{shell}' not found in rootfs '{path}' — set \"shell\" to one the rootfs provides, or omit it"
+            ),
+            HortError::WorkdirNotWritable { path } => write!(
+                f,
+                "rootfs '{path}': /workdir is not writable by the mapped uid — make it world-writable"
+            ),
             HortError::DuplicateName { name } => write!(
                 f,
                 "a sandbox named '{name}' already exists (run 'hort attach {name}' to join it, or 'hort down {name}' first)"
@@ -229,6 +272,79 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "refusing to down without confirmation: stdin is not a TTY (pass --force to proceed)"
+        );
+    }
+
+    #[test]
+    fn user_namespaces_disabled_error_renders_canonical_string() {
+        let error = HortError::UserNamespacesDisabled;
+
+        assert_eq!(
+            error.to_string(),
+            "unprivileged user namespaces are disabled in this kernel — hort cannot create a sandbox"
+        );
+    }
+
+    #[test]
+    fn pasta_missing_error_renders_canonical_string() {
+        let error = HortError::PastaMissing;
+
+        assert_eq!(
+            error.to_string(),
+            "pasta not found on PATH — hort needs it for sandbox networking"
+        );
+    }
+
+    #[test]
+    fn no_rootfs_configured_error_renders_canonical_string() {
+        let error = HortError::NoRootfsConfigured;
+
+        assert_eq!(
+            error.to_string(),
+            "no rootfs configured — set \"rootfs\" to a prepared rootfs directory in .hort.json or ~/.config/hort/config.json"
+        );
+    }
+
+    #[test]
+    fn missing_rootfs_directory_error_renders_canonical_string() {
+        let error = HortError::RootfsMissing { path: "/opt/hort/rootfs".to_string() };
+
+        assert_eq!(
+            error.to_string(),
+            "rootfs directory '/opt/hort/rootfs' does not exist — prepare it first with podman export, debootstrap or umoci unpack"
+        );
+    }
+
+    #[test]
+    fn rootfs_without_shell_error_renders_canonical_string() {
+        let error = HortError::RootfsWithoutShell { path: "/opt/hort/rootfs".to_string() };
+
+        assert_eq!(
+            error.to_string(),
+            "rootfs '/opt/hort/rootfs' has no usable shell (expected /bin/sh) — the rootfs must provide one"
+        );
+    }
+
+    #[test]
+    fn configured_shell_missing_error_renders_canonical_string() {
+        let error = HortError::ShellNotInRootfs {
+            shell: "/bin/zsh".to_string(),
+            path: "/opt/hort/rootfs".to_string(),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "shell '/bin/zsh' not found in rootfs '/opt/hort/rootfs' — set \"shell\" to one the rootfs provides, or omit it"
+        );
+    }
+
+    #[test]
+    fn workdir_not_writable_error_renders_canonical_string() {
+        let error = HortError::WorkdirNotWritable { path: "/opt/hort/rootfs".to_string() };
+
+        assert_eq!(
+            error.to_string(),
+            "rootfs '/opt/hort/rootfs': /workdir is not writable by the mapped uid — make it world-writable"
         );
     }
 
