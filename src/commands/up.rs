@@ -51,7 +51,11 @@ impl UpCommand<'_> {
         let rootfs_facts = self.config.rootfs.as_deref().map(|configured| {
             self.env.inspect_rootfs(Path::new(configured), self.config.shell.as_deref())
         });
-        if let Some(error) = up_precondition_error(&host, rootfs_facts.as_ref()) {
+        // The posture is resolved first because it decides what the host has to
+        // provide: only an allowlist needs the tooling that empties the sandbox's
+        // route tables.
+        let egress = EgressPolicy::from_config(self.config.egress.as_ref())?;
+        if let Some(error) = up_precondition_error(&host, &egress, rootfs_facts.as_ref()) {
             return Err(error);
         }
         // The selection is handed an Option so its order holds: a host without
@@ -62,7 +66,6 @@ impl UpCommand<'_> {
         // Everything the configuration can get wrong is read before the build
         // lock is taken: failing fast means failing before holding a resource.
         let (limits, warnings) = resource_limits(self.config.resources.as_ref(), &host.cgroup)?;
-        let egress = EgressPolicy::from_config(self.config.egress.as_ref())?;
 
         if !self.lock.try_acquire(&name)? {
             return Err(HortError::UpInProgress { name: name.as_str().to_string() });
@@ -193,6 +196,7 @@ mod tests {
         Capabilities {
             user_ns: true,
             pasta: Some(PathBuf::from("/usr/bin/pasta")),
+            ip: Some(PathBuf::from("/usr/bin/ip")),
             cgroup: CgroupCaps { memory: true, pids: true, cpu: true, cpuset: false },
             landlock_abi: Some(4),
             overlayfs_rootless: true,
@@ -614,6 +618,30 @@ mod tests {
         let result = command.run(SandboxName::new("demo").unwrap(), None);
 
         assert_eq!(result, Err(HortError::UserNamespacesDisabled));
+    }
+
+    #[test]
+    fn up_errors_when_an_allowlist_needs_ip_and_the_host_lacks_it() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(Capabilities { ip: None, ..ready_host() });
+        let config = ResolvedConfig {
+            egress: Some(Egress::Allowlist { allow: vec!["api.anthropic.com".to_string()] }),
+            ..healthy_config()
+        };
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
+
+        let result = command.run(SandboxName::new("demo").unwrap(), None);
+
+        assert_eq!(result, Err(HortError::IpMissing));
     }
 
     #[test]

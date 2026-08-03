@@ -54,6 +54,7 @@ impl EnvironmentProbe for HostEnvironmentProbe {
         Capabilities {
             user_ns,
             pasta: find_on_path("pasta", &path_var),
+            ip: find_on_path("ip", &path_var),
             cgroup: delegated_controllers(&read_cgroup_controllers()),
             landlock_abi: landlock_abi(),
             overlayfs_rootless: overlayfs_rootless(&read_or_empty(PROC_FILESYSTEMS), user_ns),
@@ -472,5 +473,12 @@ mod tests {
         let capabilities = HostEnvironmentProbe.detect();
 
         assert!(capabilities.git);
+    }
+
+    #[test]
+    fn detect_reports_ip_on_a_host_that_can_run_this_suite() {
+        let capabilities = HostEnvironmentProbe.detect();
+
+        assert!(capabilities.ip.is_some());
     }
 }

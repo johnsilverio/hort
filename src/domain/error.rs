@@ -21,6 +21,9 @@ pub enum HortError {
     UserNamespacesDisabled,
     /// `up`/`attach`: the pasta binary is not on `PATH`.
     PastaMissing,
+    /// `up`: the `ip` binary is not on `PATH`, and an allowlist sandbox cannot be
+    /// closed without it.
+    IpMissing,
     /// `up`: no rootfs directory is resolvable from the merged config.
     NoRootfsConfigured,
     /// `up`: the configured rootfs directory does not exist on the host.
@@ -76,6 +79,12 @@ pub enum HortError {
     /// naming the operation; the rendered message is not a canonical product
     /// string, so callers match the variant, not the text.
     ContainerRuntimeFailed { detail: String },
+    /// Wiring a sandbox's host-side egress failed: reaching the sandbox's network
+    /// namespace, spawning pasta, shaping the routes, or stopping any of it.
+    /// Carries a human-readable detail naming the operation; the rendered message
+    /// is not a canonical product string, so callers match the variant, not the
+    /// text.
+    NetworkProviderFailed { detail: String },
     /// The container runtime is not available in this build. The placeholder
     /// runtime adapter returns this for any operation that would start a real
     /// container; it disappears once the embedded runtime lands. Its message is
@@ -106,6 +115,9 @@ impl fmt::Display for HortError {
             ),
             HortError::PastaMissing => {
                 write!(f, "pasta not found on PATH — hort needs it for sandbox networking")
+            }
+            HortError::IpMissing => {
+                write!(f, "ip not found on PATH — hort needs iproute2 for allowlist egress")
             }
             HortError::NoRootfsConfigured => write!(
                 f,
@@ -168,6 +180,9 @@ impl fmt::Display for HortError {
             HortError::GitCommandFailed { detail } => write!(f, "git command failed: {detail}"),
             HortError::ContainerRuntimeFailed { detail } => {
                 write!(f, "container runtime failed: {detail}")
+            }
+            HortError::NetworkProviderFailed { detail } => {
+                write!(f, "sandbox networking failed: {detail}")
             }
             HortError::RuntimeUnavailable => {
                 write!(f, "the container runtime is not available in this build")
@@ -292,6 +307,16 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "pasta not found on PATH — hort needs it for sandbox networking"
+        );
+    }
+
+    #[test]
+    fn ip_missing_error_renders_canonical_string() {
+        let error = HortError::IpMissing;
+
+        assert_eq!(
+            error.to_string(),
+            "ip not found on PATH — hort needs iproute2 for allowlist egress"
         );
     }
 

@@ -259,6 +259,9 @@ impl SandboxRecord {
 pub struct Capabilities {
     pub user_ns: bool,
     pub pasta: Option<PathBuf>,
+    /// The `ip` binary. An allowlist sandbox reaches nothing until its route
+    /// tables are emptied, and iproute2 is what empties them.
+    pub ip: Option<PathBuf>,
     pub cgroup: CgroupCaps,
     pub landlock_abi: Option<u8>,
     pub overlayfs_rootless: bool,
