@@ -20,7 +20,8 @@ use crate::domain::preconditions::{ConfiguredShell, RootfsFacts};
 use crate::ports::{
     Clock, Confirmer, ContainerRegistry, ContainerRuntime, CorruptEntry, DbForward,
     EnvironmentProbe, LivenessProbe, MetadataStore, NetworkProvider, NetworkSpec, Notifier,
-    OciSpec, RegistryEntry, ResourceLimits, SandboxLock, SessionProbe, Worktree, WorktreeProvider,
+    OciSpec, RegistryEntry, ResourceLimits, SandboxLock, SessionProbe, SessionSpec, Worktree,
+    WorktreeProvider,
 };
 
 /// The shared teardown-order witness threaded through the fakes that perform a
@@ -92,22 +93,25 @@ impl MetadataStore for InMemoryMetadataStore {
     }
 }
 
-/// Returns a canned liveness token from `start_anchor` and remembers which
-/// sandboxes it joined and tore down. Can also be scripted to fail its
-/// `start_anchor`, so a test can witness that `up` persists the metadata record
-/// before it ever starts the container.
+/// Returns a canned liveness token from `start_anchor` and remembers the
+/// sessions it opened and the sandboxes it tore down, starting no process at
+/// all. Can also be scripted to fail its `start_anchor`, so a test can witness
+/// that `up` persists the metadata record before it ever starts the container.
 pub struct FakeRuntime {
     token: LivenessToken,
     start_fails: bool,
     started_env: RefCell<Vec<(String, String)>>,
     started_rootfs: RefCell<PathBuf>,
     started_resources: RefCell<Option<ResourceLimits>>,
-    joins: RefCell<Vec<SandboxName>>,
+    sessions: RefCell<Vec<SessionSpec>>,
     teardowns: RefCell<Vec<SandboxName>>,
     trace: Option<TeardownTrace>,
 }
 
 impl FakeRuntime {
+    /// The host pid every session this fake opens reports running under.
+    pub const SESSION_PID: u32 = 4321;
+
     pub fn new(token: LivenessToken) -> Self {
         Self {
             token,
@@ -115,7 +119,7 @@ impl FakeRuntime {
             started_env: RefCell::new(Vec::new()),
             started_rootfs: RefCell::new(PathBuf::new()),
             started_resources: RefCell::new(None),
-            joins: RefCell::new(Vec::new()),
+            sessions: RefCell::new(Vec::new()),
             teardowns: RefCell::new(Vec::new()),
             trace: None,
         }
@@ -154,8 +158,24 @@ impl FakeRuntime {
         self.started_resources.borrow().as_ref().and_then(|limits| limits.cpus)
     }
 
+    /// The sandbox of every session it was asked to open, in order.
     pub fn joins(&self) -> Vec<SandboxName> {
-        self.joins.borrow().clone()
+        self.sessions.borrow().iter().map(|spec| spec.name.clone()).collect()
+    }
+
+    /// The program and arguments of the session opened last.
+    pub fn session_command(&self) -> Vec<String> {
+        self.sessions.borrow().last().map(|spec| spec.command.clone()).unwrap_or_default()
+    }
+
+    /// The working directory of the session opened last.
+    pub fn session_cwd(&self) -> PathBuf {
+        self.sessions.borrow().last().map(|spec| spec.cwd.clone()).unwrap_or_default()
+    }
+
+    /// The environment pairs of the session opened last.
+    pub fn session_env(&self) -> Vec<(String, String)> {
+        self.sessions.borrow().last().map(|spec| spec.env.clone()).unwrap_or_default()
     }
 
     pub fn teardowns(&self) -> Vec<SandboxName> {
@@ -179,9 +199,14 @@ impl ContainerRuntime for FakeRuntime {
         Ok(self.token)
     }
 
-    fn join_session(&self, name: &SandboxName) -> Result<(), HortError> {
-        self.joins.borrow_mut().push(name.clone());
-        Ok(())
+    fn join_session(&self, spec: &SessionSpec) -> Result<u32, HortError> {
+        self.sessions.borrow_mut().push(SessionSpec {
+            name: spec.name.clone(),
+            command: spec.command.clone(),
+            cwd: spec.cwd.clone(),
+            env: spec.env.clone(),
+        });
+        Ok(Self::SESSION_PID)
     }
 
     fn teardown(&self, name: &SandboxName) -> Result<(), HortError> {

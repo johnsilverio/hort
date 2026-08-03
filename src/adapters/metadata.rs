@@ -19,7 +19,7 @@ use crate::ports::{CorruptEntry, MetadataStore};
 
 const SANDBOXES_DIR: &str = "sandboxes";
 const METADATA_FILE: &str = "metadata.json";
-const TEMP_FILE: &str = "metadata.json.tmp";
+const TEMP_FILE_SUFFIX: &str = "tmp";
 const SCHEMA_VERSION: u64 = 1;
 
 /// A `MetadataStore` backed by one JSON file per sandbox under `state_root` (the
@@ -54,7 +54,7 @@ impl MetadataStore for FileMetadataStore {
             corrupt(format!("could not serialize record for '{}': {error}", record.name().as_str()))
         })?;
 
-        let temp_path = sandbox_dir.join(TEMP_FILE);
+        let temp_path = sandbox_dir.join(temp_file_name());
         fs::write(&temp_path, &serialized).map_err(|error| {
             corrupt(format!("could not write {}: {error}", temp_path.display()))
         })?;
@@ -126,6 +126,16 @@ impl MetadataStore for FileMetadataStore {
         }
         Ok(corrupt_entries)
     }
+}
+
+/// The scratch file one write lands in before the rename that publishes it. It
+/// carries the writing process's id because a record has more than one writer and
+/// only the build takes a lock: an attach timestamps a record while a build may be
+/// rewriting the same one. Sharing a single scratch name lets the two interleave
+/// inside it and rename a spliced file into place, whereas a name each leaves the
+/// rename to pick a winner, so the worst case is a lost attach timestamp.
+fn temp_file_name() -> String {
+    format!("{METADATA_FILE}.{}.{TEMP_FILE_SUFFIX}", std::process::id())
 }
 
 /// The human-readable reason a record failed to load. A load failure is always a

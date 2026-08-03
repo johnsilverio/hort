@@ -10,14 +10,21 @@
 //! and the child prepares the merged root and starts the anchor before exiting.
 //! The anchor holds the namespaces and the mounts, so they outlive their creator.
 //!
+//! Joining a session is a fork for the same reason, and it climbs on purpose. The
+//! tenant API joins only the namespaces the anchor's spec declared, and that spec
+//! declares no network namespace, so a session ends up wherever its caller was
+//! unless the caller enters the sandbox's network namespace first.
+//!
 //! The spec the container is built from is assembled by a pure function over
 //! plain data, which is what keeps the interesting decisions (empty capability
 //! sets, the id mapping, the namespace set, the resource ceiling) testable
 //! without a kernel.
 
+use std::collections::HashMap;
 use std::ffi::CString;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, PipeReader, PipeWriter, Read, Write};
+use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -32,10 +39,12 @@ use libcontainer::oci_spec::runtime::{
 };
 use libcontainer::syscall::syscall::SyscallType;
 
+use crate::adapters::namespaces::{enter, owning_user_namespace};
 use crate::domain::error::HortError;
 use crate::domain::model::{AnchorPid, LivenessToken, MountNsInode, SandboxName};
 use crate::ports::{
     ContainerRegistry, ContainerRuntime, OciSpec, RegistryEntry, ResourceLimits, SessionProbe,
+    SessionSpec,
 };
 
 const SANDBOXES_DIR: &str = "sandboxes";
@@ -50,8 +59,8 @@ const CPU_PERIOD_USEC: u64 = 100_000;
 /// The byte both handshakes send; only its arrival, never its value, carries
 /// meaning, and the closed pipe that yields none is the abort signal.
 const HANDSHAKE: [u8; 1] = [1];
-const ANCHOR_FAILED: u8 = 0;
-const ANCHOR_STARTED: u8 = 1;
+const PROCESS_FAILED: u8 = 0;
+const PROCESS_STARTED: u8 = 1;
 
 /// A `ContainerRuntime` (and the read ports the embedded runtime will also serve)
 /// for builds without the in-process container runtime.
@@ -62,7 +71,7 @@ impl ContainerRuntime for NullRuntime {
         Err(HortError::RuntimeUnavailable)
     }
 
-    fn join_session(&self, _name: &SandboxName) -> Result<(), HortError> {
+    fn join_session(&self, _spec: &SessionSpec) -> Result<u32, HortError> {
         Err(HortError::RuntimeUnavailable)
     }
 
@@ -134,6 +143,27 @@ impl LibcontainerRuntime {
         write_bundle_config(&bundle, &anchor_spec(spec))?;
         start_container(&spec.name, &bundle, &self.youki_root)
     }
+
+    /// The pid of a running sandbox's anchor, taken from the container state the
+    /// runtime keeps. It is the anchor's namespaces a session climbs into, and
+    /// naming it here is what spares the caller from carrying it around.
+    fn anchor_pid(&self, name: &SandboxName) -> Result<u32, HortError> {
+        let container = Container::load(self.container_dir(name)).map_err(|err| {
+            runtime_failure(format!(
+                "join_session: loading the container state of '{}': {err}",
+                name.as_str()
+            ))
+        })?;
+        let pid = container.pid().ok_or_else(|| {
+            runtime_failure(format!("join_session: sandbox '{}' has no anchor", name.as_str()))
+        })?;
+        u32::try_from(pid.as_raw()).map_err(|_| {
+            runtime_failure(format!(
+                "join_session: the runtime reported {} as the anchor pid",
+                pid.as_raw()
+            ))
+        })
+    }
 }
 
 impl ContainerRuntime for LibcontainerRuntime {
@@ -159,7 +189,7 @@ impl ContainerRuntime for LibcontainerRuntime {
                 drop(released_reader);
                 drop(report_writer);
                 let mapping = install_id_mapping(child, owner, ready_reader, released_writer);
-                let report = read_report(report_reader);
+                let report = read_report(report_reader, "start_anchor");
                 reap(child);
                 mapping?;
                 liveness_token(report?)
@@ -167,11 +197,27 @@ impl ContainerRuntime for LibcontainerRuntime {
         }
     }
 
-    fn join_session(&self, _name: &SandboxName) -> Result<(), HortError> {
-        // Sessions arrive with attach, which is where what a session runs (its
-        // shell, its environment, its working directory) is decided; there is
-        // nothing to join a process into before that.
-        Err(HortError::RuntimeUnavailable)
+    fn join_session(&self, spec: &SessionSpec) -> Result<u32, HortError> {
+        let anchor = self.anchor_pid(&spec.name)?;
+        let (report_reader, report_writer) = channel()?;
+
+        // The climb crosses a user namespace, which only a single-threaded
+        // process may do, and hort's own process has to stay on the host anyway.
+        match unsafe { libc::fork() } {
+            -1 => {
+                Err(runtime_failure(format!("join_session: fork: {}", io::Error::last_os_error())))
+            }
+            0 => {
+                drop(report_reader);
+                report_and_exit(report_writer, open_session(spec, anchor, &self.youki_root));
+            }
+            child => {
+                drop(report_writer);
+                let report = read_report(report_reader, "join_session");
+                reap(child);
+                report
+            }
+        }
     }
 
     fn teardown(&self, name: &SandboxName) -> Result<(), HortError> {
@@ -211,7 +257,7 @@ fn host_owner(workdir: &Path) -> Result<HostOwner, HortError> {
 }
 
 fn channel() -> Result<(PipeReader, PipeWriter), HortError> {
-    io::pipe().map_err(|err| runtime_failure(format!("start_anchor: creating a pipe: {err}")))
+    io::pipe().map_err(|err| runtime_failure(format!("creating a pipe: {err}")))
 }
 
 fn unshare_sandbox_namespaces() -> Result<(), String> {
@@ -349,18 +395,63 @@ fn start_container(name: &SandboxName, bundle: &Path, youki_root: &Path) -> Resu
         .map_err(|_| format!("the runtime reported {} as the anchor pid", pid.as_raw()))
 }
 
+/// Climb into the sandbox and start the session there, from the forked child.
+/// Every rung is only reachable with the privilege the one below it grants, so
+/// the order is not a preference: the owning user namespace first, then the
+/// network namespace it owns, then the container's own user namespace, which is
+/// what joining the rest of the sandbox demands.
+///
+/// The network namespace is the rung nothing supplies on its own. The tenant API
+/// joins only the namespaces the anchor's spec declared, and that spec declares
+/// no network namespace by design, so a session started without this climb runs
+/// on the host network while every other thing about it looks right.
+fn open_session(spec: &SessionSpec, anchor: u32, youki_root: &Path) -> Result<u32, String> {
+    let netns = anchor_namespace(anchor, "net")?;
+    let container_user = anchor_namespace(anchor, "user")?;
+    let owner = owning_user_namespace(netns.as_fd())?;
+
+    enter(&[owner.as_fd(), netns.as_fd(), container_user.as_fd()])?;
+    start_session(spec, youki_root)
+}
+
+fn anchor_namespace(anchor: u32, namespace: &str) -> Result<File, String> {
+    let path = format!("/proc/{anchor}/ns/{namespace}");
+    File::open(&path).map_err(|err| format!("opening {path}: {err}"))
+}
+
+/// Join one session to the sandbox, returning the host pid it runs under. The
+/// tenant is detached because a session outlives the call that opened it; the
+/// namespaces it is missing are the ones the climb already entered, which it
+/// inherits from this process.
+fn start_session(spec: &SessionSpec, youki_root: &Path) -> Result<u32, String> {
+    let environment: HashMap<String, String> = spec.env.iter().cloned().collect();
+    let pid = ContainerBuilder::new(spec.name.as_str().to_string(), SyscallType::default())
+        .with_root_path(youki_root)
+        .map_err(|err| format!("rooting the container state at {}: {err}", youki_root.display()))?
+        .as_tenant()
+        .with_container_args(spec.command.clone())
+        .with_cwd(Some(spec.cwd.clone()))
+        .with_env(environment)
+        .with_detach(true)
+        .build()
+        .map_err(|err| format!("joining a session to '{}': {err}", spec.name.as_str()))?;
+
+    u32::try_from(pid.as_raw())
+        .map_err(|_| format!("the runtime reported {} as the session pid", pid.as_raw()))
+}
+
 /// Hand the outcome to the parent and leave at once, without unwinding and
 /// without at-exit handlers: everything they would clean up is still owned by
 /// the process on the other side of the fork.
 fn report_and_exit(mut report: PipeWriter, outcome: Result<u32, String>) -> ! {
     let (message, code) = match outcome {
         Ok(pid) => {
-            let mut message = vec![ANCHOR_STARTED];
+            let mut message = vec![PROCESS_STARTED];
             message.extend_from_slice(&pid.to_le_bytes());
             (message, 0)
         }
         Err(detail) => {
-            let mut message = vec![ANCHOR_FAILED];
+            let mut message = vec![PROCESS_FAILED];
             message.extend_from_slice(detail.as_bytes());
             (message, 1)
         }
@@ -370,21 +461,21 @@ fn report_and_exit(mut report: PipeWriter, outcome: Result<u32, String>) -> ! {
     unsafe { libc::_exit(code) }
 }
 
-fn read_report(mut report: PipeReader) -> Result<u32, HortError> {
+fn read_report(mut report: PipeReader, operation: &str) -> Result<u32, HortError> {
     let mut message = Vec::new();
     report.read_to_end(&mut message).map_err(|err| {
-        runtime_failure(format!("start_anchor: reading the sandbox report: {err}"))
+        runtime_failure(format!("{operation}: reading the sandbox report: {err}"))
     })?;
 
-    if let [ANCHOR_STARTED, pid @ ..] = message.as_slice()
+    if let [PROCESS_STARTED, pid @ ..] = message.as_slice()
         && let Ok(pid) = <[u8; 4]>::try_from(pid)
     {
         return Ok(u32::from_le_bytes(pid));
     }
-    if let [ANCHOR_FAILED, detail @ ..] = message.as_slice() {
-        return Err(runtime_failure(format!("start_anchor: {}", String::from_utf8_lossy(detail))));
+    if let [PROCESS_FAILED, detail @ ..] = message.as_slice() {
+        return Err(runtime_failure(format!("{operation}: {}", String::from_utf8_lossy(detail))));
     }
-    Err(runtime_failure("start_anchor: the sandbox process exited without reporting an anchor"))
+    Err(runtime_failure(format!("{operation}: the sandbox process reported no pid")))
 }
 
 fn reap(child: libc::pid_t) {
@@ -410,6 +501,7 @@ fn runtime_failure(detail: impl Into<String>) -> HortError {
 fn anchor_spec(spec: &OciSpec) -> Spec {
     let mut assembled = Spec::default();
     assembled
+        .set_hostname(Some(spec.name.as_str().to_string()))
         .set_root(Some(merged_root(&spec.overlay)))
         .set_mounts(Some(sandbox_mounts(&spec.workdir)))
         .set_process(Some(anchor_process(&spec.env)))
@@ -633,6 +725,16 @@ mod tests {
     }
 
     #[test]
+    fn spec_names_the_sandbox_as_the_container_hostname() {
+        let assembled = anchor_spec(&sandbox_spec());
+
+        // A spec that leaves the hostname out keeps the runtime's own default,
+        // which is the first thing a user reads in the prompt of a session: the
+        // name of the tool that built the box instead of the name of the box.
+        assert_eq!(assembled.hostname(), &Some("demo".to_string()));
+    }
+
+    #[test]
     fn spec_runs_sleep_infinity_as_init() {
         let assembled = anchor_spec(&sandbox_spec());
 
@@ -796,6 +898,23 @@ mod privileged_tests {
         LibcontainerRuntime::new(youki_root.path().to_path_buf(), state_root.path().to_path_buf())
     }
 
+    /// A session that stays alive long enough to be read from the host, which is
+    /// the only way a test can ask where a session ended up.
+    fn session_spec(name: &SandboxName) -> SessionSpec {
+        SessionSpec {
+            name: name.clone(),
+            command: vec!["sleep".to_string(), "infinity".to_string()],
+            cwd: PathBuf::from(WORKDIR),
+            env: Vec::new(),
+        }
+    }
+
+    fn namespace_inode(pid: u32, namespace: &str) -> u64 {
+        fs::metadata(format!("/proc/{pid}/ns/{namespace}"))
+            .expect("the namespace of a live process")
+            .ino()
+    }
+
     /// The anchor execs a moment after the container starts, so anything read off
     /// the running anchor has to wait for it or it races the exec.
     fn wait_for_anchor(pid: u32) {
@@ -942,6 +1061,47 @@ mod privileged_tests {
         wait_for_anchor(token.pid.0);
         let anchor_user = fs::metadata(format!("/proc/{}", token.pid.0)).unwrap().uid();
         assert_eq!(anchor_user, fs::metadata(&spec.workdir).unwrap().uid());
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn session_joins_the_sandbox_mount_namespace() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = runtime_under(&youki_root, &state_root);
+        let spec = sandbox_spec(rootfs, state_root.path());
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+
+        let session = runtime.join_session(&session_spec(&spec.name)).unwrap();
+
+        assert_eq!(namespace_inode(session, "mnt"), namespace_inode(token.pid.0, "mnt"));
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn session_runs_in_the_sandbox_network_namespace() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = runtime_under(&youki_root, &state_root);
+        let spec = sandbox_spec(rootfs, state_root.path());
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+
+        let session = runtime.join_session(&session_spec(&spec.name)).unwrap();
+
+        // A session inherits the network namespace of the process that opened
+        // it, and the sandbox's spec declares none for the tenant API to find,
+        // so a session opened straight from hort lands on the host network. It
+        // sees the same worktree, runs the same shell and answers every other
+        // question here correctly, while the egress allowlist restricts nothing.
+        assert_eq!(namespace_inode(session, "net"), namespace_inode(token.pid.0, "net"));
         runtime.teardown(&spec.name).unwrap();
     }
 

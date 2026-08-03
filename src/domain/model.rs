@@ -205,6 +205,12 @@ impl SandboxRecord {
         Self { token: Some(token), ..self }
     }
 
+    /// Record the moment of the most recent attach, returning the updated record
+    /// to persist. Everything else the record holds is carried over.
+    pub fn with_last_attach_at(self, at: String) -> Self {
+        Self { last_attach_at: at, ..self }
+    }
+
     /// Record the PID of the host-side notify watcher `up` spawned, returning the
     /// updated record to persist. A record carries one only when a notify channel
     /// is configured, so its presence is what later marks a watcher to stop.

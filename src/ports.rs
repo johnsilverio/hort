@@ -46,8 +46,14 @@ pub trait ContainerRuntime {
     /// Start the sandbox's anchor process and return the kernel liveness token it
     /// runs under.
     fn start_anchor(&self, spec: &OciSpec) -> Result<LivenessToken, HortError>;
-    /// Join a new session into the running sandbox's namespaces.
-    fn join_session(&self, name: &SandboxName) -> Result<(), HortError>;
+    /// Join a new session into the running sandbox's namespaces, returning the
+    /// host pid the session process runs under, which is what a caller waits on.
+    /// The sandbox's network namespace is one of the namespaces the session has
+    /// to end up in, and it is the one nothing hands over on its own: a session
+    /// is born in the network namespace of the process that opened it, so an
+    /// implementation that leaves that to the runtime puts the session on the
+    /// host network, where an egress allowlist restricts nothing.
+    fn join_session(&self, spec: &SessionSpec) -> Result<u32, HortError>;
     /// Stop every session and the anchor, and tear the container down. Releases
     /// the worktree mount, so it runs before the worktree is removed.
     fn teardown(&self, name: &SandboxName) -> Result<(), HortError>;
@@ -194,6 +200,20 @@ pub struct OciSpec {
     pub env: Vec<(String, String)>,
     /// The per-sandbox resource ceiling; `None` leaves the sandbox uncapped.
     pub resources: Option<ResourceLimits>,
+}
+
+/// Everything `join_session` needs to open one session inside a running
+/// sandbox. Plain data, like the anchor's spec: which sandbox to enter, what the
+/// session runs, where it runs it, and what it sees in its environment.
+pub struct SessionSpec {
+    /// The sandbox to join, which is also the container id.
+    pub name: SandboxName,
+    /// The program and arguments the session execs, the login shell among them.
+    pub command: Vec<String>,
+    /// The in-container directory the session starts in.
+    pub cwd: PathBuf,
+    /// Environment pairs this session sees on top of what the sandbox exports.
+    pub env: Vec<(String, String)>,
 }
 
 /// The per-sandbox resource ceiling. `cpus` is an amount of CPU time (2.0 means
