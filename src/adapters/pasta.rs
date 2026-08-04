@@ -30,8 +30,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::adapters::namespaces::{enter, in_namespaces, owning_user_namespace};
-use crate::adapters::proxy;
 use crate::adapters::streams::open_sandbox_log;
+use crate::adapters::{forwarder, proxy};
 use crate::domain::egress::EgressPolicy;
 use crate::domain::error::HortError;
 use crate::domain::model::SandboxName;
@@ -87,6 +87,10 @@ impl PastaNetworkProvider {
             EgressPolicy::Open => None,
             EgressPolicy::Allowlist(_) => Some(proxy::start(&sandbox_dir, &spec.egress)?),
         };
+        // A declared database is reachable in both postures: what an allowlist
+        // decides is what the sandbox may reach on its way out, not which
+        // databases the project declared.
+        forwarder::start(&sandbox_dir, &spec.db_forwards)?;
 
         let holder = OwningUserNamespaceHolder::spawn(owner.as_fd())?;
         let started = start_pasta(
@@ -102,13 +106,15 @@ impl PastaNetworkProvider {
         Ok(())
     }
 
-    /// Stop both of the host-side processes a sandbox leaves behind. Each is
-    /// stopped whatever the other did: one that stayed behind because the other
-    /// failed is one nothing ever comes back for.
+    /// Stop every host-side process a sandbox leaves behind. Each is stopped
+    /// whatever the others did: one that stayed behind because another failed is
+    /// one nothing ever comes back for.
     fn stop(&self, name: &SandboxName) -> Result<(), String> {
+        let sandbox_dir = self.sandbox_dir(name);
         let stopped_pasta = self.stop_pasta_of(name);
-        let stopped_proxy = proxy::stop(&self.sandbox_dir(name));
-        stopped_pasta.and(stopped_proxy)
+        let stopped_proxy = proxy::stop(&sandbox_dir);
+        let stopped_forwarding = forwarder::stop(&sandbox_dir);
+        stopped_pasta.and(stopped_proxy).and(stopped_forwarding)
     }
 
     fn stop_pasta_of(&self, name: &SandboxName) -> Result<(), String> {
@@ -338,7 +344,8 @@ mod tests {
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
-    use crate::adapters::proxy;
+    use crate::adapters::helper::a_declared_port;
+    use crate::adapters::{forwarder, proxy};
     use crate::domain::egress::{EgressPolicy, HostPattern};
     use crate::domain::model::Domain;
     use crate::ports::DbForward;
@@ -347,6 +354,9 @@ mod tests {
     const PID_FILE: &str = "/state/sandboxes/demo/pasta.pid";
     /// A port the kernel could have handed the sandbox's proxy.
     const PROXY_PORT: u16 = 44001;
+    /// A destination reserved for documentation, so nothing ever answers there:
+    /// enough for a database that needs a forwarder, and no traffic to anyone.
+    const UNANSWERED_ADDRESS: &str = "192.0.2.1";
 
     fn network_spec(egress: EgressPolicy, db_forwards: Vec<DbForward>) -> NetworkSpec {
         NetworkSpec {
@@ -363,6 +373,12 @@ mod tests {
 
     fn database_on(port: u16) -> DbForward {
         DbForward { host: "127.0.0.1".to_string(), port }
+    }
+
+    /// A database somewhere the host's own loopback does not answer for, which is
+    /// the case a sandbox needs a forwarder for.
+    fn remote_database_on(port: u16) -> DbForward {
+        DbForward { host: UNANSWERED_ADDRESS.to_string(), port }
     }
 
     /// Whether the port stops answering, waiting for it: a signalled process takes
@@ -586,6 +602,23 @@ mod tests {
         // only one of the two leaks the other for every sandbox that ever ran.
         assert!(stopped_answering_within_deadline(port));
     }
+
+    #[test]
+    fn tearing_a_sandbox_down_stops_its_database_forwarding() {
+        let state_root = tempfile::tempdir().unwrap();
+        let sandbox_dir = state_root.path().join("sandboxes").join("demo");
+        fs::create_dir_all(&sandbox_dir).unwrap();
+        let port = a_declared_port();
+        forwarder::start(&sandbox_dir, &[remote_database_on(port)]).unwrap();
+        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+
+        provider.teardown(&SandboxName::new("demo").unwrap()).unwrap();
+
+        // The forwarding is the third host-side process a sandbox leaves behind.
+        // Left running, it holds the port of a database the next sandbox declares
+        // just as much as it holds the one it was started for.
+        assert!(stopped_answering_within_deadline(port));
+    }
 }
 
 #[cfg(all(test, feature = "privileged-tests"))]
@@ -599,6 +632,7 @@ mod privileged_tests {
 
     use serial_test::serial;
 
+    use crate::adapters::helper::a_declared_port;
     use crate::adapters::proxy;
     use crate::adapters::runtime::LibcontainerRuntime;
     use crate::adapters::streams::sandbox_log_path;
@@ -668,6 +702,17 @@ mod privileged_tests {
                 Domain::new("api.anthropic.com").unwrap(),
             )]),
             db_forwards: Vec::new(),
+        }
+    }
+
+    /// A sandbox network in the open posture with one declared database, at an
+    /// address the host's own loopback does not answer for.
+    fn open_network_with_a_database(name: &SandboxName, anchor: u32, port: u16) -> NetworkSpec {
+        NetworkSpec {
+            name: name.clone(),
+            netns: PathBuf::from(format!("/proc/{anchor}/ns/net")),
+            egress: EgressPolicy::Open,
+            db_forwards: vec![DbForward { host: "192.0.2.1".to_string(), port }],
         }
     }
 
@@ -885,6 +930,34 @@ mod privileged_tests {
         // sandbox would be a chokepoint nobody asked for and a second thing to
         // stop for no gain.
         assert_eq!(proxy::recorded_port(&sandbox_dir(state_root.path())), None);
+        provider.teardown(&spec.name).unwrap();
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+    #[serial]
+    fn open_provisioning_forwards_the_declared_databases() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = LibcontainerRuntime::new(
+            youki_root.path().to_path_buf(),
+            state_root.path().to_path_buf(),
+        );
+        let spec = sandbox_spec(rootfs, state_root.path());
+        let token = runtime.start_anchor(&spec).unwrap();
+        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let port = a_declared_port();
+
+        provider.provision(&open_network_with_a_database(&spec.name, token.pid.0, port)).unwrap();
+
+        // What an allowlist decides is what a sandbox may reach on its way out,
+        // not which databases the project declared, so a declared database is
+        // reachable in both postures and at the same address in both. Started
+        // alongside the proxy, the forwarding would exist only in the posture
+        // that has one, and an open sandbox would reach nothing it declared.
+        assert!(TcpStream::connect(("127.0.0.1", port)).is_ok());
         provider.teardown(&spec.name).unwrap();
         runtime.teardown(&spec.name).unwrap();
     }

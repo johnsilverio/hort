@@ -21,9 +21,9 @@
 //! signalled: a pid outlives the process it named.
 
 use std::fs::{self, File};
-use std::io::{self, PipeWriter, Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
-use std::os::fd::{AsRawFd, RawFd};
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -33,18 +33,13 @@ use tls_parser::{
     parse_tls_client_hello_extensions, parse_tls_plaintext,
 };
 
+use crate::adapters::helper::{HostHelper, splice};
 use crate::adapters::streams::open_sandbox_log;
 use crate::domain::egress::EgressPolicy;
 
-const PID_FILE: &str = "proxy.pid";
 const PORT_FILE: &str = "proxy.port";
 const LOOPBACK: &str = "127.0.0.1";
-const DEV_NULL: &str = "/dev/null";
-/// What the proxy calls itself in the process table, and the whole of what tells
-/// a teardown that the pid it recorded still names the process it recorded.
-const PROXY_NAME: &str = "hort-proxy";
-/// The longest name the kernel keeps for a process, counting the terminator.
-const PROCESS_NAME_LIMIT: usize = 16;
+const PROXY: HostHelper = HostHelper::new("hort-proxy", "proxy.pid");
 const CONNECT: &str = "CONNECT";
 const ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 const REFUSAL: &[u8] = b"HTTP/1.1 403 Forbidden\r\n\r\n";
@@ -56,9 +51,6 @@ const HELLO_LIMIT: usize = 64 * 1024;
 /// connection that will never say anything.
 const NAMING_DEADLINE: Duration = Duration::from_secs(10);
 const READ_CHUNK: usize = 4096;
-/// The byte the started proxy announces itself with; only its arrival, never its
-/// value, carries meaning, and the closed pipe that yields none is the failure.
-const HANDSHAKE: [u8; 1] = [1];
 
 /// A sandbox's proxy, bound to the loopback port it will answer on.
 pub struct SniProxy<'a> {
@@ -104,79 +96,27 @@ impl<'a> SniProxy<'a> {
 /// Start this sandbox's proxy in a process that outlives this call, record where
 /// it listens and what it is, and answer with the port pasta has to splice.
 pub fn start(sandbox_dir: &Path, policy: &EgressPolicy) -> Result<u16, String> {
-    let streams = proxy_streams(sandbox_dir)?;
     let proxy = SniProxy::bind(policy, open_sandbox_log(sandbox_dir)?)?;
     let port = proxy.port();
-    let (mut announcement, announce) =
-        io::pipe().map_err(|err| format!("creating a pipe: {err}"))?;
+    let kept = [proxy.listener.as_raw_fd(), proxy.log.as_raw_fd()];
 
-    match unsafe { libc::fork() } {
-        -1 => Err(format!("forking the sandbox proxy: {}", io::Error::last_os_error())),
-        0 => {
-            drop(announcement);
-            serve_detached(proxy, streams, announce);
-        }
-        child => {
-            drop(announce);
-            // Whatever this side keeps of the listener keeps the port bound, so a
-            // proxy stopped later would leave something still answering for it.
-            drop(proxy);
-            drop(streams);
-            let mut signal = [0u8; 1];
-            match announcement.read(&mut signal) {
-                Ok(0) | Err(_) => {
-                    discard(child);
-                    Err("the sandbox proxy never started".to_string())
-                }
-                Ok(_) => match record_proxy(sandbox_dir, child, port) {
-                    Ok(()) => Ok(port),
-                    Err(failure) => {
-                        // Nothing else knows this process exists, so a proxy left
-                        // running here is one nothing can ever stop.
-                        discard(child);
-                        Err(failure)
-                    }
-                },
-            }
-        }
-    }
+    PROXY.start(sandbox_dir, &kept, || proxy.serve())?;
+    record_port(sandbox_dir, port)?;
+    Ok(port)
 }
 
 /// Stop this sandbox's proxy, if the recorded process is still it. Stopping a
 /// sandbox that never had one is not a failure.
 pub fn stop(sandbox_dir: &Path) -> Result<(), String> {
-    let pid_file = sandbox_dir.join(PID_FILE);
-    let recorded = fs::read_to_string(&pid_file).ok().and_then(|pid| pid.trim().parse().ok());
-    let outcome = match recorded {
-        // A pid outlives the process it named, so the recorded one is only acted
-        // on while it still names the proxy that was recorded.
-        Some(pid) if is_proxy(pid) => stop_proxy(pid),
-        _ => Ok(()),
-    };
-    let _ = fs::remove_file(&pid_file);
+    let stopped = PROXY.stop(sandbox_dir);
     let _ = fs::remove_file(sandbox_dir.join(PORT_FILE));
-    outcome
+    stopped
 }
 
 /// The loopback port this sandbox's proxy answers on, as recorded when it
 /// started, or `None` when the sandbox has no proxy.
 pub fn recorded_port(sandbox_dir: &Path) -> Option<u16> {
     fs::read_to_string(sandbox_dir.join(PORT_FILE)).ok()?.trim().parse().ok()
-}
-
-/// Serve this sandbox's proxy from the forked child, after making it into
-/// something the host can recognize and something that holds nothing of the
-/// command that forked it. Leaving without unwinding matters as much as in any
-/// forked child: what the unwinding would clean up belongs to the process on the
-/// other side of the fork.
-fn serve_detached(proxy: SniProxy<'_>, streams: ProxyStreams, announce: PipeWriter) -> ! {
-    let mut serving_with = [proxy.listener.as_raw_fd(), proxy.log.as_raw_fd()];
-    if name_process().is_err() || redirect(streams).is_err() || announced(announce).is_err() {
-        unsafe { libc::_exit(1) }
-    }
-    close_inherited_descriptors(&mut serving_with);
-    proxy.serve();
-    unsafe { libc::_exit(0) }
 }
 
 /// Answer one connection: read what it asks for, hold both the request and the
@@ -334,22 +274,6 @@ fn hello_server_name(messages: &[TlsMessage<'_>]) -> Option<String> {
     None
 }
 
-/// Copy both directions until either side is done with the other. A tunnel that
-/// carried one direction would deliver a request and never its reply.
-fn splice(client: &TcpStream, upstream: &TcpStream) {
-    thread::scope(|directions| {
-        directions.spawn(|| {
-            let _ = io::copy(&mut &*client, &mut &*upstream);
-            let _ = upstream.shutdown(Shutdown::Write);
-        });
-        let _ = io::copy(&mut &*upstream, &mut &*client);
-        // Ending both sides is what releases the direction still being copied:
-        // one side reaching its end leaves nothing for the other to carry.
-        let _ = client.shutdown(Shutdown::Both);
-        let _ = upstream.shutdown(Shutdown::Both);
-    });
-}
-
 /// Read whatever the client has to say next, within what is left of the time it
 /// was given to name a host. `None` is a client that said nothing more.
 fn read_more(client: &mut TcpStream, into: &mut Vec<u8>, deadline: Instant) -> Option<()> {
@@ -379,111 +303,12 @@ fn record(log: &File, decision: &str) {
     let _ = log.write_all(format!("{decision}\n").as_bytes());
 }
 
-/// The streams the proxy is given: the sandbox's log for both outputs, and
-/// nothing to read.
-struct ProxyStreams {
-    input: File,
-    output: File,
-    errors: File,
-}
-
-/// Open them from hort's own process, before the fork. A proxy keeps whatever it
-/// is started with for as long as the sandbox lives, so one started with hort's
-/// streams holds a redirected or piped invocation open forever, and holds the
-/// writing end of whatever feeds hort open just as long.
-fn proxy_streams(sandbox_dir: &Path) -> Result<ProxyStreams, String> {
-    Ok(ProxyStreams {
-        input: File::open(DEV_NULL).map_err(|err| format!("opening {DEV_NULL}: {err}"))?,
-        output: open_sandbox_log(sandbox_dir)?,
-        errors: open_sandbox_log(sandbox_dir)?,
-    })
-}
-
-/// Put the streams in place of the ones the fork was inherited with. Taking them
-/// by value is what closes the originals here, before anything else is closed:
-/// a descriptor closed later could already have been handed to a connection.
-fn redirect(streams: ProxyStreams) -> Result<(), ()> {
-    let placed = [
-        (streams.input.as_raw_fd(), 0),
-        (streams.output.as_raw_fd(), 1),
-        (streams.errors.as_raw_fd(), 2),
-    ];
-    for (stream, standard) in placed {
-        if unsafe { libc::dup2(stream, standard) } == -1 {
-            return Err(());
-        }
-    }
-    Ok(())
-}
-
-/// Say in the process table what this process is, so a teardown can tell that
-/// the pid it holds is still the proxy and not whatever inherited the number.
-fn name_process() -> Result<(), ()> {
-    let mut name = [0u8; PROCESS_NAME_LIMIT];
-    name[..PROXY_NAME.len()].copy_from_slice(PROXY_NAME.as_bytes());
-    if unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()) } == -1 {
-        return Err(());
-    }
-    Ok(())
-}
-
-fn announced(mut announce: PipeWriter) -> io::Result<()> {
-    announce.write_all(&HANDSHAKE)
-}
-
-/// Close everything this process inherited except the descriptors it was left
-/// to serve with. A forked child keeps every open file of the process that
-/// forked it, and one of those is the lock hort holds while it builds a sandbox:
-/// held by a process that never exits, it would make the name look like it is
-/// still being built for as long as the sandbox lives.
-fn close_inherited_descriptors(kept: &mut [RawFd]) {
-    kept.sort_unstable();
-    let mut first = 3;
-    for descriptor in kept.iter() {
-        if *descriptor < first {
-            continue;
-        }
-        close_descriptors(first, *descriptor - 1);
-        first = *descriptor + 1;
-    }
-    close_descriptors(first, RawFd::MAX);
-}
-
-fn close_descriptors(first: RawFd, last: RawFd) {
-    unsafe { libc::close_range(first as libc::c_uint, last as libc::c_uint, 0) };
-}
-
-fn record_proxy(sandbox_dir: &Path, pid: libc::pid_t, port: u16) -> Result<(), String> {
-    write_line(&sandbox_dir.join(PID_FILE), &pid.to_string())?;
-    write_line(&sandbox_dir.join(PORT_FILE), &port.to_string())
-}
-
-fn write_line(path: &Path, value: &str) -> Result<(), String> {
-    fs::write(path, format!("{value}\n"))
-        .map_err(|err| format!("writing {}: {err}", path.display()))
-}
-
-fn is_proxy(pid: libc::pid_t) -> bool {
-    fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|name| name.trim() == PROXY_NAME)
-}
-
-fn stop_proxy(pid: libc::pid_t) -> Result<(), String> {
-    if unsafe { libc::kill(pid, libc::SIGTERM) } == -1 {
-        let failure = io::Error::last_os_error();
-        // The process leaving between being recognized and being signalled is
-        // the outcome this asked for, not a failure to produce it.
-        if failure.raw_os_error() != Some(libc::ESRCH) {
-            return Err(format!("stopping the sandbox proxy ({pid}): {failure}"));
-        }
-    }
-    Ok(())
-}
-
-/// Take back a proxy that was started but could not be handed over.
-fn discard(pid: libc::pid_t) {
-    unsafe { libc::kill(pid, libc::SIGKILL) };
-    let mut status = 0;
-    unsafe { libc::waitpid(pid, &mut status, 0) };
+/// Publish where the sandbox reaches its proxy, which is where a session fills
+/// its proxy variables from.
+fn record_port(sandbox_dir: &Path, port: u16) -> Result<(), String> {
+    let port_file = sandbox_dir.join(PORT_FILE);
+    fs::write(&port_file, format!("{port}\n"))
+        .map_err(|err| format!("writing {}: {err}", port_file.display()))
 }
 
 #[cfg(test)]
