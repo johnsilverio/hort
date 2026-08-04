@@ -422,6 +422,7 @@ impl EnvironmentProbe for FakeCapabilities {
 /// worktrees; the builder methods layer scripted state on top.
 pub struct FakeWorktreeProvider {
     paths: RefCell<Vec<PathBuf>>,
+    present: RefCell<Vec<PathBuf>>,
     creates: RefCell<Vec<BranchName>>,
     is_git_repo: bool,
     existing_branches: Vec<BranchName>,
@@ -436,6 +437,7 @@ impl FakeWorktreeProvider {
     pub fn new() -> Self {
         Self {
             paths: RefCell::new(Vec::new()),
+            present: RefCell::new(Vec::new()),
             creates: RefCell::new(Vec::new()),
             is_git_repo: true,
             existing_branches: Vec::new(),
@@ -472,9 +474,20 @@ impl FakeWorktreeProvider {
     }
 
     /// Seed the canonical worktree of `name` as already listed, without recording
-    /// a `create`, simulating a worktree left by a prior crashed build.
+    /// a `create`, simulating a worktree left by a prior crashed build. A listed
+    /// worktree is also on disk: the real provider lists only the directories
+    /// that are still there.
     pub fn with_listed_worktree(self, name: &SandboxName) -> Self {
         self.paths.borrow_mut().push(fake_worktree_path(name));
+        self.present.borrow_mut().push(fake_worktree_path(name));
+        self
+    }
+
+    /// Seed the canonical worktree of `name` as on disk but absent from this
+    /// repository's list, which is what a live sandbox of another project looks
+    /// like from here.
+    pub fn with_present_worktree(self, name: &SandboxName) -> Self {
+        self.present.borrow_mut().push(fake_worktree_path(name));
         self
     }
 
@@ -513,12 +526,14 @@ impl WorktreeProvider for FakeWorktreeProvider {
         let path = fake_worktree_path(name);
         self.creates.borrow_mut().push(branch.clone());
         self.paths.borrow_mut().push(path.clone());
+        self.present.borrow_mut().push(path.clone());
         Ok(Worktree { path })
     }
 
     fn remove(&self, name: &SandboxName) -> Result<(), HortError> {
         let path = fake_worktree_path(name);
-        self.paths.borrow_mut().retain(|present| present != &path);
+        self.paths.borrow_mut().retain(|listed| listed != &path);
+        self.present.borrow_mut().retain(|on_disk| on_disk != &path);
         if let Some(trace) = &self.trace {
             trace.borrow_mut().push("worktrees.remove".to_string());
         }
@@ -527,6 +542,10 @@ impl WorktreeProvider for FakeWorktreeProvider {
 
     fn list(&self) -> Result<Vec<Worktree>, HortError> {
         Ok(self.paths.borrow().iter().cloned().map(|path| Worktree { path }).collect())
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        self.present.borrow().iter().any(|on_disk| on_disk == path)
     }
 
     fn is_git_repo(&self) -> Result<bool, HortError> {

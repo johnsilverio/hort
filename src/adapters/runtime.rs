@@ -15,6 +15,11 @@
 //! declares no network namespace, so a session ends up wherever its caller was
 //! unless the caller enters the sandbox's network namespace first.
 //!
+//! Enumerating the live anchors reads the same state back. Loading a container
+//! refreshes its status against the `/proc` entry of the pid it recorded, so
+//! walking the state root and loading each entry answers which anchors are up
+//! without a daemon and without hort ever parsing the runtime's file format.
+//!
 //! The spec the container is built from is assembled by a pure function over
 //! plain data, which is what keeps the interesting decisions (empty capability
 //! sets, the id mapping, the namespace set, the resource ceiling) testable
@@ -30,8 +35,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
-use libcontainer::container::Container;
 use libcontainer::container::builder::ContainerBuilder;
+use libcontainer::container::{Container, ContainerStatus};
 use libcontainer::oci_spec::runtime::{
     Capabilities, Linux, LinuxCapabilities, LinuxCpu, LinuxIdMapping, LinuxIdMappingBuilder,
     LinuxMemory, LinuxNamespace, LinuxNamespaceType, LinuxResources, Mount, Process, Root, Spec,
@@ -203,7 +208,10 @@ impl ContainerRuntime for LibcontainerRuntime {
                 let report = read_report(report_reader, "start_anchor");
                 reap(child);
                 mapping?;
-                liveness_token(report?)
+                let anchor = report?;
+                liveness_token(anchor).map_err(|err| {
+                    runtime_failure(format!("start_anchor: reading /proc/{anchor}/ns/mnt: {err}"))
+                })
             }
         }
     }
@@ -259,6 +267,46 @@ impl ContainerRuntime for LibcontainerRuntime {
         })?;
         Ok(())
     }
+}
+
+impl ContainerRegistry for LibcontainerRuntime {
+    fn list_live(&self) -> Result<Vec<RegistryEntry>, HortError> {
+        let container_dirs = match fs::read_dir(&self.youki_root) {
+            Ok(entries) => entries,
+            // Nothing has been built on this boot, so no anchor is alive. Every
+            // command that reconciles asks this before the first sandbox exists.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            // A root that cannot be read is not an empty root: answering "no
+            // anchor is alive" without knowing would hand every running sandbox
+            // to `prune` as debris.
+            Err(err) => {
+                return Err(runtime_failure(format!(
+                    "list_live: reading {}: {err}",
+                    self.youki_root.display()
+                )));
+            }
+        };
+
+        Ok(container_dirs.flatten().filter_map(|entry| live_anchor(&entry.path())).collect())
+    }
+}
+
+/// The live anchor a container directory describes, or `None` when it describes
+/// none.
+///
+/// Every way of failing to make sense of one directory yields that same `None`.
+/// The state is written by another process and the kernel is free to have
+/// outlived it, so a half-written build or a container removed mid-walk is an
+/// ordinary finding here; erroring on one would take down every command that
+/// reconciles, leaving no way out but deleting files by hand.
+fn live_anchor(container_dir: &Path) -> Option<RegistryEntry> {
+    let container = Container::load(container_dir.to_path_buf()).ok()?;
+    if container.status() != ContainerStatus::Running {
+        return None;
+    }
+    let id = SandboxName::new(container.id()).ok()?;
+    let pid = u32::try_from(container.pid()?.as_raw()).ok()?;
+    Some(RegistryEntry { id, token: liveness_token(pid).ok()? })
 }
 
 /// The host user a sandbox's writes must land as: the owner of the directory
@@ -569,11 +617,12 @@ fn reap(child: libc::pid_t) {
     unsafe { libc::waitpid(child, &mut status, 0) };
 }
 
-fn liveness_token(pid: u32) -> Result<LivenessToken, HortError> {
-    let mount_namespace = format!("/proc/{pid}/ns/mnt");
-    let inode = fs::metadata(&mount_namespace)
-        .map_err(|err| runtime_failure(format!("start_anchor: reading {mount_namespace}: {err}")))?
-        .ino();
+/// The kernel liveness token of a running process: its pid paired with the inode
+/// of its mount namespace, which is what tells the anchor apart from whatever
+/// later reuses its pid. Both the sandbox that records a token and the
+/// enumeration that reports one read it here, so the two always agree.
+fn liveness_token(pid: u32) -> io::Result<LivenessToken> {
+    let inode = fs::metadata(format!("/proc/{pid}/ns/mnt"))?.ino();
     Ok(LivenessToken { pid: AnchorPid(pid), mnt_ns: MountNsInode(inode) })
 }
 
@@ -716,11 +765,13 @@ fn ceiling(limits: &ResourceLimits) -> LinuxResources {
 mod tests {
     use super::*;
 
+    use libcontainer::container::ContainerStatus;
     use libcontainer::oci_spec::runtime::{
         Capabilities, LinuxIdMappingBuilder, LinuxNamespaceType,
     };
 
-    use crate::ports::ResourceLimits;
+    use crate::adapters::liveness::ProcLivenessProbe;
+    use crate::ports::{LivenessProbe, ResourceLimits};
 
     fn sandbox_spec() -> OciSpec {
         OciSpec {
@@ -931,6 +982,124 @@ mod tests {
         let result = runtime.teardown(&SandboxName::new("ghost").unwrap());
 
         assert!(result.is_ok());
+    }
+
+    /// Write the container state a build leaves behind, through the runtime's own
+    /// public writer rather than by hand, so what these tests hand the registry is
+    /// what a real sandbox writes and no test knows the file format.
+    fn record_container(youki_root: &Path, id: &str, status: ContainerStatus, pid: Option<i32>) {
+        let container_dir = youki_root.join(id);
+        let bundle = container_dir.join(BUNDLE_DIR);
+        fs::create_dir_all(&bundle).unwrap();
+        Container::new(id, status, pid, &bundle, &container_dir).unwrap().save().unwrap();
+    }
+
+    fn registry_over(youki_root: &Path) -> LibcontainerRuntime {
+        LibcontainerRuntime::new(youki_root.to_path_buf(), youki_root.join("state"))
+    }
+
+    /// A pid that is certainly alive and certainly readable: this process. What a
+    /// live anchor and the test process have in common is the only thing the
+    /// registry reads about either.
+    fn a_live_pid() -> i32 {
+        std::process::id() as i32
+    }
+
+    #[test]
+    fn registry_reports_a_running_container_as_a_live_anchor() {
+        let youki_root = tempfile::tempdir().unwrap();
+        record_container(youki_root.path(), "demo", ContainerStatus::Running, Some(a_live_pid()));
+        let registry = registry_over(youki_root.path());
+
+        let live = registry.list_live().unwrap();
+
+        // Nothing else in hort answers "which anchors are up". A registry that
+        // finds none reports every sandbox in `ls` as orphaned while its anchor
+        // runs, and hands `prune` a live box as debris to remove.
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, SandboxName::new("demo").unwrap());
+    }
+
+    #[test]
+    fn registry_reports_a_token_the_liveness_probe_recognizes() {
+        let youki_root = tempfile::tempdir().unwrap();
+        record_container(youki_root.path(), "demo", ContainerStatus::Running, Some(a_live_pid()));
+        let registry = registry_over(youki_root.path());
+
+        let live = registry.list_live().unwrap();
+
+        // Reconciliation matches this token against the one the record carries,
+        // and that one was read the way this probe reads it. A registry that
+        // reports the right sandbox under a token nobody recognizes is the same
+        // outcome as reporting nothing, and looks correct from every other angle.
+        assert!(ProcLivenessProbe.is_alive(&live[0].token));
+    }
+
+    #[test]
+    fn registry_skips_a_container_directory_it_cannot_read() {
+        let youki_root = tempfile::tempdir().unwrap();
+        record_container(youki_root.path(), "demo", ContainerStatus::Running, Some(a_live_pid()));
+        fs::create_dir_all(youki_root.path().join("half-written")).unwrap();
+
+        let live = registry_over(youki_root.path()).list_live().unwrap();
+
+        // The registry reads state another process wrote and the kernel may have
+        // outlived, so a directory it cannot make sense of is an ordinary state,
+        // one an interrupted build or a container removed mid-walk leaves behind.
+        // Failing on it would take down every command that reconciles, and the
+        // only way out would be deleting files by hand.
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, SandboxName::new("demo").unwrap());
+    }
+
+    #[test]
+    fn registry_omits_a_container_whose_anchor_is_not_running() {
+        let youki_root = tempfile::tempdir().unwrap();
+        // A live pid with a status short of running: the runtime keeps that
+        // status rather than promoting it, so nothing but the status itself
+        // stands between this entry and being read as a live anchor. Recording
+        // it with a dead pid instead would prove nothing, because a pid nobody
+        // can read is dropped a step later anyway.
+        record_container(youki_root.path(), "demo", ContainerStatus::Created, Some(a_live_pid()));
+
+        let live = registry_over(youki_root.path()).list_live().unwrap();
+
+        // The container state outlives the anchor it describes, so the directory
+        // alone means nothing. Reading it as alive makes `ls` report a dead
+        // sandbox as live and keeps `prune` from ever offering to clean it.
+        assert!(live.is_empty());
+    }
+
+    #[test]
+    fn registry_refuses_a_root_it_cannot_read_rather_than_reporting_an_empty_one() {
+        let state_root = tempfile::tempdir().unwrap();
+        let youki_root = state_root.path().join("containers");
+        // Anything but a directory where the root belongs: reading it fails with
+        // a kind that is not "nothing here yet", which is the whole distinction.
+        fs::write(&youki_root, b"not a directory\n").unwrap();
+        let registry = LibcontainerRuntime::new(youki_root, state_root.path().to_path_buf());
+
+        let live = registry.list_live();
+
+        // An unreadable root answered as an empty one is how every running
+        // sandbox on the machine is handed to `prune` as debris at once. Absent
+        // is knowledge; unreadable is not.
+        assert!(live.is_err());
+    }
+
+    #[test]
+    fn registry_reports_nothing_when_no_container_was_ever_built() {
+        let state_root = tempfile::tempdir().unwrap();
+        let registry = LibcontainerRuntime::new(
+            state_root.path().join("containers"),
+            state_root.path().to_path_buf(),
+        );
+
+        let live = registry.list_live().unwrap();
+
+        // Nothing has run yet: the root is created by the first build, and every
+        // command that reconciles asks this before then.
+        assert!(live.is_empty());
     }
 }
 
@@ -1156,6 +1325,55 @@ mod privileged_tests {
 
         let anchor_mnt_ns = fs::metadata(format!("/proc/{}/ns/mnt", token.pid.0)).unwrap();
         assert_eq!(token.mnt_ns.0, anchor_mnt_ns.ino());
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn registry_reports_the_token_the_anchor_was_started_under() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = runtime_under(&youki_root, &state_root);
+        let spec = sandbox_spec(rootfs, state_root.path());
+        let started = runtime.start_anchor(&spec).unwrap();
+
+        let live = runtime.list_live().unwrap();
+
+        // The two halves of reconciliation are written by different code at
+        // different times: `up` records this token, and this read produces the
+        // one it is matched against. Only a real anchor can say they agree, since
+        // only here does the pid come from the runtime's own state file rather
+        // than from the test. Whole-token equality is the contract: same pid
+        // under an inode read another way still reads as a dead sandbox.
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, spec.name);
+        assert_eq!(live[0].token, started);
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn registry_stops_reporting_a_sandbox_whose_anchor_was_killed() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = runtime_under(&youki_root, &state_root);
+        let spec = sandbox_spec(rootfs, state_root.path());
+        let started = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(started.pid.0);
+        unsafe { libc::kill(started.pid.0 as libc::pid_t, libc::SIGKILL) };
+        assert!(stopped_within_deadline(started.pid.0), "the anchor outlived the kill");
+
+        let live = runtime.list_live().unwrap();
+
+        // The container state survives the anchor, and hort is built to reconcile
+        // against the kernel rather than to prevent the kill. A registry reading
+        // the leftover state as a live anchor is what would make `ls` insist a
+        // killed sandbox is running and keep `prune` from clearing the debris.
+        assert!(live.is_empty());
         runtime.teardown(&spec.name).unwrap();
     }
 

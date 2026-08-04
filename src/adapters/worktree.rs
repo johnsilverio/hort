@@ -88,6 +88,10 @@ impl WorktreeProvider for GitWorktreeProvider {
             .collect())
     }
 
+    fn exists(&self, path: &Path) -> bool {
+        path.is_dir()
+    }
+
     fn is_git_repo(&self) -> Result<bool, HortError> {
         let output = capture(&self.repo_dir, "rev-parse", &["rev-parse", "--is-inside-work-tree"])?;
         Ok(output.status.success())
@@ -326,6 +330,35 @@ mod tests {
 
         let canonical = canonical_worktree(&state_root, &name);
         assert!(!listed.iter().any(|entry| entry.path == canonical));
+    }
+
+    #[test]
+    fn git_worktree_exists_reports_a_directory_this_repository_does_not_list() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let elsewhere = canonical_worktree(&state_root, &SandboxName::new("other").unwrap());
+        fs::create_dir_all(&elsewhere).unwrap();
+
+        // A worktree belonging to another project is on disk and absent from
+        // this repository's list. Answering from the list is what would make a
+        // running sandbox read as one whose worktree vanished, from any
+        // directory but its own.
+        assert!(provider.exists(&elsewhere));
+    }
+
+    #[test]
+    fn git_worktree_exists_reports_false_for_a_directory_that_is_gone() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let worktree = provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+        fs::remove_dir_all(&worktree.path).unwrap();
+
+        assert!(!provider.exists(&worktree.path));
     }
 
     #[test]

@@ -1,16 +1,20 @@
 //! `ls`: list every sandbox with its reconciled state and the figures a caller
 //! needs to judge a forgotten box: session count, age, idle, and branch.
 //!
-//! It cross-checks the on-disk records against the live anchors and the worktree
-//! list, joins each verdict back to its record, and derives age and idle from the
-//! recorded timestamps. Liveness comes from matching the record tokens against
-//! the registry entries, so there is no liveness probe here. A record with a
-//! corrupt timestamp degrades only its own row to an unknown age and idle, and
-//! the listing never mutates anything.
+//! It cross-checks the on-disk records against the live anchors and the
+//! worktrees still on disk, joins each verdict back to its record, and derives
+//! age and idle from the recorded timestamps. Liveness comes from matching the
+//! record tokens against the registry entries, so there is no liveness probe
+//! here. The dirty column is the one question still answered by the current
+//! repository's worktree list, which is why a sandbox of another project shows
+//! its dirty state as unknown. A record with a corrupt timestamp degrades only
+//! its own row to an unknown age and idle, and the listing never mutates
+//! anything.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
+use crate::commands::present_worktrees;
 use crate::domain::error::HortError;
 use crate::domain::idle::{IdleState, age, idle, parse_timestamp};
 use crate::domain::model::{BranchName, SandboxName, SandboxRecord};
@@ -65,9 +69,10 @@ impl LsCommand<'_> {
         let records = self.store.list()?;
         let live = self.registry.list_live()?;
         let listed = self.worktrees.list()?;
+        let present = present_worktrees(self.worktrees, &records);
         let now = self.clock.now();
 
-        let verdicts = reconcile_all(&records, &live, &listed);
+        let verdicts = reconcile_all(&records, &live, &present);
 
         let entries: Vec<LsEntry> = verdicts
             .into_iter()
@@ -229,6 +234,27 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].state, SandboxState::Inconsistent);
+    }
+
+    #[test]
+    fn ls_reports_live_for_a_worktree_this_repository_does_not_list() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo").with_token(canned_token())).unwrap();
+        let registry = FakeRegistry::new(vec![(name.clone(), canned_token())]);
+        let worktrees = FakeWorktreeProvider::new().with_present_worktree(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock);
+
+        let entries = command.run().unwrap();
+
+        // A sandbox's worktree lives under a path hort owns, not under the
+        // project the user happens to be standing in, so what answers "is it
+        // still there" is the disk. Asking the current repository's list instead
+        // makes every sandbox of every other project read as one whose worktree
+        // vanished, from anywhere but its own directory.
+        assert_eq!(entries[0].state, SandboxState::Live);
     }
 
     #[test]

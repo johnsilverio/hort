@@ -104,6 +104,16 @@ pub trait WorktreeProvider {
     fn remove(&self, name: &SandboxName) -> Result<(), HortError>;
     /// Every worktree currently registered.
     fn list(&self) -> Result<Vec<Worktree>, HortError>;
+    /// Whether a worktree is still on disk at `path`.
+    ///
+    /// This is what "the worktree is present" means when reconciling, and it is
+    /// deliberately not "this repository lists it": a sandbox's worktree lives
+    /// under a path hort owns, so a run from another project must not read a
+    /// live sandbox as one whose worktree vanished. It takes the path rather
+    /// than the name because a record is the authority on where its worktree
+    /// is, which in no-git mode is the user's own project folder. An
+    /// unanswerable read is absence, never an error.
+    fn exists(&self, path: &Path) -> bool;
     /// Whether the project directory is a git repository at all.
     fn is_git_repo(&self) -> Result<bool, HortError>;
     /// Whether a branch of this name already exists in the repository.

@@ -1,8 +1,11 @@
 //! `prune`: explicit, confirmed cleanup of idle sandboxes and abrupt-death
 //! debris (orphaned and inconsistent sandboxes, plus corrupt metadata dirs).
 //!
-//! It reconciles the records against the live anchors and worktrees, gathers the
-//! corrupt dirs, observes idle and dirty state, and runs the pure selection. An
+//! It reconciles the records against the live anchors and the worktrees still on
+//! disk, gathers the corrupt dirs, observes idle and dirty state, and runs the
+//! pure selection. The dirty guard is the one question still answered by the
+//! current repository's worktree list, so a sandbox of another project carries
+//! no dirty state to protect it. An
 //! empty removal set never prompts; otherwise, without `--force`, a non-TTY stdin
 //! refuses and a TTY prompts with every candidate name listed first. Each chosen
 //! removal follows the mandatory teardown order, and a single stale-registration
@@ -11,6 +14,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use crate::commands::present_worktrees;
 use crate::domain::error::HortError;
 use crate::domain::idle::{IdleState, idle, parse_timestamp};
 use crate::domain::model::{SandboxName, SandboxRecord};
@@ -83,7 +87,9 @@ impl PruneCommand<'_> {
         let corrupt = self.store.list_corrupt()?;
         let now = self.clock.now();
 
-        let inputs: Vec<PruneInput> = reconcile_all(&records, &live, &listed)
+        let present = present_worktrees(self.worktrees, &records);
+
+        let inputs: Vec<PruneInput> = reconcile_all(&records, &live, &present)
             .into_iter()
             .filter_map(|(name, state)| {
                 let record = records.iter().find(|record| record.name() == &name)?;
@@ -252,6 +258,32 @@ mod tests {
             network,
             state_root: state_root(),
         }
+    }
+
+    #[test]
+    fn prune_spares_a_live_sandbox_whose_worktree_this_repository_does_not_list() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo").with_token(canned_token())).unwrap();
+        let registry = FakeRegistry::new(vec![(name.clone(), canned_token())]);
+        let worktrees = FakeWorktreeProvider::new().with_present_worktree(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+        );
+
+        let report = command.run(None, true, false).unwrap();
+
+        // Debris is what prune exists to remove, and a sandbox reads as debris
+        // the moment its worktree looks gone. Answering that from the current
+        // repository's list turns `prune` run in one project into a teardown of
+        // another project's running sandbox, worktree and uncommitted work
+        // included, with nothing in the way once `--force` skips the prompt.
+        assert!(report.removed.is_empty());
     }
 
     #[test]
