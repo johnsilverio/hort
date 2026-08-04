@@ -31,7 +31,7 @@ use std::process::{Command, Stdio};
 
 use crate::adapters::namespaces::{enter, in_namespaces, owning_user_namespace};
 use crate::adapters::streams::open_sandbox_log;
-use crate::adapters::{forwarder, proxy};
+use crate::adapters::{forwarder, landlock, proxy};
 use crate::domain::egress::EgressPolicy;
 use crate::domain::error::HortError;
 use crate::domain::model::SandboxName;
@@ -91,6 +91,12 @@ impl PastaNetworkProvider {
         // decides is what the sandbox may reach on its way out, not which
         // databases the project declared.
         forwarder::start(&sandbox_dir, &spec.db_forwards)?;
+
+        // The same list the namespace is about to be shaped around, written down
+        // where a session reads it, so what a session is held to and what the
+        // sandbox can reach cannot drift apart.
+        let reachable = reachable_ports(proxy_port, &spec.db_forwards);
+        landlock::record_connect_ports(&sandbox_dir, reachable.as_deref())?;
 
         let holder = OwningUserNamespaceHolder::spawn(owner.as_fd())?;
         let started = start_pasta(
@@ -181,17 +187,21 @@ fn pasta_arguments(
 }
 
 /// The whole of what an allowlisted sandbox can reach: its own proxy, and the
-/// databases the project declared.
+/// databases the project declared. `None` where there is no proxy to reach,
+/// which is the posture that holds the sandbox to no list at all.
+///
+/// One list serves both the splice and the restriction a session runs under, so
+/// the two cannot come to disagree about what this sandbox is wired for.
+fn reachable_ports(proxy_port: Option<u16>, forwards: &[DbForward]) -> Option<Vec<u16>> {
+    let proxy = proxy_port?;
+    Some(std::iter::once(proxy).chain(forwards.iter().map(|forward| forward.port)).collect())
+}
+
 fn forwarded_ports(proxy_port: Option<u16>, forwards: &[DbForward]) -> String {
-    let ports: Vec<String> = proxy_port
-        .iter()
-        .map(u16::to_string)
-        .chain(forwards.iter().map(|forward| forward.port.to_string()))
-        .collect();
-    if ports.is_empty() {
+    let Some(ports) = reachable_ports(proxy_port, forwards) else {
         return NO_PORTS.to_string();
-    }
-    ports.join(",")
+    };
+    ports.iter().map(u16::to_string).collect::<Vec<_>>().join(",")
 }
 
 /// The `ip` invocations that empty a sandbox's route tables, one per address
@@ -705,6 +715,24 @@ mod privileged_tests {
         }
     }
 
+    /// A sandbox network in the allowlist posture with one declared database on
+    /// the host's own loopback, which the splice reaches without a forwarder of
+    /// hort's own, so the port is spliced and free for the test to listen on.
+    fn allowlist_network_with_a_database(
+        name: &SandboxName,
+        anchor: u32,
+        port: u16,
+    ) -> NetworkSpec {
+        NetworkSpec {
+            name: name.clone(),
+            netns: PathBuf::from(format!("/proc/{anchor}/ns/net")),
+            egress: EgressPolicy::Allowlist(vec![HostPattern::Exact(
+                Domain::new("api.anthropic.com").unwrap(),
+            )]),
+            db_forwards: vec![DbForward { host: "127.0.0.1".to_string(), port }],
+        }
+    }
+
     /// A sandbox network in the open posture with one declared database, at an
     /// address the host's own loopback does not answer for.
     fn open_network_with_a_database(name: &SandboxName, anchor: u32, port: u16) -> NetworkSpec {
@@ -724,6 +752,14 @@ mod privileged_tests {
     /// the header line and nothing else.
     fn sandbox_ipv4_routes(anchor: u32) -> String {
         fs::read_to_string(format!("/proc/{anchor}/net/route")).expect("the sandbox route table")
+    }
+
+    /// The ports the sandbox recorded its sessions as being allowed to connect
+    /// to, one per line, as a session reads them.
+    fn recorded_connect_ports(sandbox_dir: &Path) -> Vec<u16> {
+        let recorded = fs::read_to_string(sandbox_dir.join("connect.ports"))
+            .expect("the ports a session may connect to");
+        recorded.lines().map(|port| port.trim().parse().expect("a port")).collect()
     }
 
     /// The pid pasta recorded for this sandbox.
@@ -905,6 +941,40 @@ mod privileged_tests {
         let pasta = recorded_pasta_pid(state_root.path());
         let cmdline = fs::read(format!("/proc/{pasta}/cmdline")).unwrap();
         assert!(String::from_utf8_lossy(&cmdline).contains(&port.to_string()));
+        provider.teardown(&spec.name).unwrap();
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+    #[serial]
+    fn allowlist_provisioning_records_the_ports_a_session_may_connect_to() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = LibcontainerRuntime::new(
+            youki_root.path().to_path_buf(),
+            state_root.path().to_path_buf(),
+        );
+        let spec = sandbox_spec(rootfs, state_root.path());
+        let token = runtime.start_anchor(&spec).unwrap();
+        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let declared = a_declared_port();
+
+        provider
+            .provision(&allowlist_network_with_a_database(&spec.name, token.pid.0, declared))
+            .unwrap();
+
+        // What a session is locked into has to be what this sandbox is actually
+        // wired for, so it is written down here, by the run that wired it, and
+        // not derived again from a configuration file that may have been edited
+        // since. These two ports are the whole of what the sandbox can reach.
+        let sandbox_dir = sandbox_dir(state_root.path());
+        let proxy = proxy::recorded_port(&sandbox_dir).expect("a proxy port");
+        let recorded = recorded_connect_ports(&sandbox_dir);
+        assert!(recorded.contains(&proxy));
+        assert!(recorded.contains(&declared));
+        assert_eq!(recorded.len(), 2);
         provider.teardown(&spec.name).unwrap();
         runtime.teardown(&spec.name).unwrap();
     }

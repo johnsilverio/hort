@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::domain::config::ResolvedConfig;
-use crate::domain::egress::EgressPolicy;
+use crate::domain::egress::{EgressPolicy, egress_degradation_warning};
 use crate::domain::error::HortError;
 use crate::domain::model::{BranchName, SandboxName, SandboxRecord, Warning};
 use crate::domain::policy::{BranchIntent, up_error};
@@ -65,7 +65,10 @@ impl UpCommand<'_> {
 
         // Everything the configuration can get wrong is read before the build
         // lock is taken: failing fast means failing before holding a resource.
-        let (limits, warnings) = resource_limits(self.config.resources.as_ref(), &host.cgroup)?;
+        let (limits, mut warnings) = resource_limits(self.config.resources.as_ref(), &host.cgroup)?;
+        // Said here rather than by the sessions that run degraded, because by the
+        // time one of those starts the sandbox exists and the user is inside it.
+        warnings.extend(egress_degradation_warning(&egress, host.landlock_abi));
 
         if !self.lock.try_acquire(&name)? {
             return Err(HortError::UpInProgress { name: name.as_str().to_string() });
@@ -761,6 +764,61 @@ mod tests {
         let warnings = command.run(SandboxName::new("demo").unwrap(), None).unwrap();
 
         assert!(warnings.iter().any(|warning| warning.to_string().contains("memory")));
+    }
+
+    #[test]
+    fn up_warns_when_the_host_cannot_enforce_the_allowlist_in_the_kernel() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(Capabilities { landlock_abi: None, ..ready_host() });
+        let config = ResolvedConfig {
+            egress: Some(Egress::Allowlist { allow: vec!["api.anthropic.com".to_string()] }),
+            ..healthy_config()
+        };
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
+
+        let warnings = command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // The kernel drops what it cannot enforce and reports success, so a
+        // sandbox built here runs one layer thinner than the one that was asked
+        // for. Said once per sandbox, here, because a session cannot say it: by
+        // then the box exists and the user is inside it.
+        assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn up_is_silent_when_the_host_can_enforce_the_allowlist_in_the_kernel() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(Capabilities { landlock_abi: Some(4), ..ready_host() });
+        let config = ResolvedConfig {
+            egress: Some(Egress::Allowlist { allow: vec!["api.anthropic.com".to_string()] }),
+            ..healthy_config()
+        };
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
+
+        let warnings = command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // An advisory raised whatever the host reports is one the user learns to
+        // scroll past, and the next one that matters scrolls past with it. This
+        // is what keeps the one above tied to the kernel it is about.
+        assert!(warnings.is_empty());
     }
 
     #[test]

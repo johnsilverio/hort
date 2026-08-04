@@ -8,7 +8,7 @@
 
 use super::config::Egress;
 use super::error::HortError;
-use super::model::Domain;
+use super::model::{Domain, Warning};
 
 /// The outbound-egress decision for a sandbox.
 ///
@@ -71,6 +71,31 @@ impl EgressPolicy {
                 patterns.iter().any(|pattern| pattern.permits(&host))
             }
         }
+    }
+}
+
+/// The Landlock ABI that carries the right to restrict which ports a process may
+/// connect to. Anything below it takes the rules and applies none of them.
+const CONNECT_RESTRICTION_ABI: u8 = 4;
+
+/// The advisory a build owes the user when this host cannot enforce the
+/// connect-port restriction an allowlisted sandbox is supposed to run under.
+///
+/// The kernel silently drops what it cannot do, so a sandbox built here is one
+/// layer thinner than the one that was asked for and nothing would say so.
+/// `landlock_abi` is what the host reports; an open sandbox restricts no port in
+/// the first place and has nothing to lose.
+pub fn egress_degradation_warning(
+    egress: &EgressPolicy,
+    landlock_abi: Option<u8>,
+) -> Option<Warning> {
+    let enforceable = matches!(landlock_abi, Some(abi) if abi >= CONNECT_RESTRICTION_ABI);
+    match egress {
+        EgressPolicy::Open => None,
+        EgressPolicy::Allowlist(_) if enforceable => None,
+        EgressPolicy::Allowlist(_) => Some(Warning::new(
+            "this kernel cannot restrict which ports a process connects to, so the egress allowlist of this sandbox runs without its kernel layer (Linux 6.7 or newer enforces it)",
+        )),
     }
 }
 
@@ -211,6 +236,53 @@ mod tests {
 
         assert!(policy.matches("api.anthropic.com"));
         assert!(policy.matches("raw.githubusercontent.com"));
+    }
+
+    #[test]
+    fn an_allowlist_warns_when_the_kernel_is_too_old_to_restrict_connections() {
+        let policy = EgressPolicy::Allowlist(vec![HostPattern::Exact(
+            Domain::new("api.anthropic.com").unwrap(),
+        )]);
+
+        // Landlock has existed since long before it could restrict a port, and
+        // asking a kernel of that age for the network rules costs nothing and
+        // does nothing: it drops them and reports success.
+        let warning = egress_degradation_warning(&policy, Some(3));
+
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn an_allowlist_warns_when_the_kernel_has_no_landlock_at_all() {
+        let policy = EgressPolicy::Allowlist(vec![HostPattern::Exact(
+            Domain::new("api.anthropic.com").unwrap(),
+        )]);
+
+        let warning = egress_degradation_warning(&policy, None);
+
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn an_allowlist_is_silent_on_a_kernel_that_restricts_connections() {
+        let policy = EgressPolicy::Allowlist(vec![HostPattern::Exact(
+            Domain::new("api.anthropic.com").unwrap(),
+        )]);
+
+        let warning = egress_degradation_warning(&policy, Some(4));
+
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn open_egress_is_silent_on_a_kernel_that_cannot_restrict_connections() {
+        // Open egress is unfiltered by contract, so there is no restriction for
+        // this kernel to be missing. Warning here would put a security advisory
+        // on every sandbox of every user whose kernel is old, about a layer none
+        // of those sandboxes ever asked for.
+        let warning = egress_degradation_warning(&EgressPolicy::Open, None);
+
+        assert!(warning.is_none());
     }
 
     #[test]

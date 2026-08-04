@@ -38,7 +38,10 @@ use libcontainer::oci_spec::runtime::{
     get_rootless_mounts,
 };
 use libcontainer::syscall::syscall::SyscallType;
+use libcontainer::workload::default::DefaultExecutor;
+use libcontainer::workload::{Executor, ExecutorError, ExecutorValidationError};
 
+use crate::adapters::landlock;
 use crate::adapters::namespaces::{enter, owning_user_namespace};
 use crate::adapters::streams::open_sandbox_log;
 use crate::domain::error::HortError;
@@ -207,6 +210,10 @@ impl ContainerRuntime for LibcontainerRuntime {
 
     fn join_session(&self, spec: &SessionSpec) -> Result<u32, HortError> {
         let anchor = self.anchor_pid(&spec.name)?;
+        // Read here, and not where it is applied: by then the session is inside
+        // the sandbox, whose root holds no host state directory to read from.
+        let reachable = landlock::recorded_connect_ports(&self.sandbox_dir(&spec.name))
+            .map_err(|detail| runtime_failure(format!("join_session: {detail}")))?;
         let (report_reader, report_writer) = channel()?;
 
         // The climb crosses a user namespace, which only a single-threaded
@@ -217,7 +224,11 @@ impl ContainerRuntime for LibcontainerRuntime {
             }
             0 => {
                 drop(report_reader);
-                report_and_exit(report_writer, open_session(spec, anchor, &self.youki_root));
+                let session = ConfinedSession { connect_ports: reachable };
+                report_and_exit(
+                    report_writer,
+                    open_session(spec, anchor, &self.youki_root, session),
+                );
             }
             child => {
                 drop(report_writer);
@@ -447,13 +458,18 @@ fn anchor_streams(sandbox_dir: &Path) -> Result<AnchorStreams, String> {
 /// joins only the namespaces the anchor's spec declared, and that spec declares
 /// no network namespace by design, so a session started without this climb runs
 /// on the host network while every other thing about it looks right.
-fn open_session(spec: &SessionSpec, anchor: u32, youki_root: &Path) -> Result<u32, String> {
+fn open_session(
+    spec: &SessionSpec,
+    anchor: u32,
+    youki_root: &Path,
+    session: ConfinedSession,
+) -> Result<u32, String> {
     let netns = anchor_namespace(anchor, "net")?;
     let container_user = anchor_namespace(anchor, "user")?;
     let owner = owning_user_namespace(netns.as_fd())?;
 
     enter(&[owner.as_fd(), netns.as_fd(), container_user.as_fd()])?;
-    start_session(spec, youki_root)
+    start_session(spec, youki_root, session)
 }
 
 fn anchor_namespace(anchor: u32, namespace: &str) -> Result<File, String> {
@@ -461,15 +477,43 @@ fn anchor_namespace(anchor: u32, namespace: &str) -> Result<File, String> {
     File::open(&path).map_err(|err| format!("opening {path}: {err}"))
 }
 
+/// The program a session runs, put under the sandbox's restrictions first.
+///
+/// The runtime calls this from the session's own process at the last step before
+/// the exec, after the namespaces are joined and the root is the sandbox's. That
+/// is what the restrictions need: they are inherited by whatever is exec'd next,
+/// and applied any earlier they would fall on the code still building the
+/// session and name a root that is not the one the session will have.
+#[derive(Clone)]
+struct ConfinedSession {
+    connect_ports: Option<Vec<u16>>,
+}
+
+impl Executor for ConfinedSession {
+    fn exec(&self, spec: &Spec) -> Result<(), ExecutorError> {
+        landlock::restrict_session(self.connect_ports.as_deref()).map_err(ExecutorError::Other)?;
+        DefaultExecutor {}.exec(spec)
+    }
+
+    fn validate(&self, spec: &Spec) -> Result<(), ExecutorValidationError> {
+        DefaultExecutor {}.validate(spec)
+    }
+}
+
 /// Join one session to the sandbox, returning the host pid it runs under. The
 /// tenant is detached because a session outlives the call that opened it; the
 /// namespaces it is missing are the ones the climb already entered, which it
 /// inherits from this process.
-fn start_session(spec: &SessionSpec, youki_root: &Path) -> Result<u32, String> {
+fn start_session(
+    spec: &SessionSpec,
+    youki_root: &Path,
+    session: ConfinedSession,
+) -> Result<u32, String> {
     let environment: HashMap<String, String> = spec.env.iter().cloned().collect();
     let pid = ContainerBuilder::new(spec.name.as_str().to_string(), SyscallType::default())
         .with_root_path(youki_root)
         .map_err(|err| format!("rooting the container state at {}: {err}", youki_root.display()))?
+        .with_executor(session)
         .as_tenant()
         .with_container_args(spec.command.clone())
         .with_cwd(Some(spec.cwd.clone()))
@@ -895,6 +939,7 @@ mod privileged_tests {
     use super::*;
 
     use std::fs;
+    use std::net::TcpListener;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
@@ -904,9 +949,26 @@ mod privileged_tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
+    use crate::adapters::environment::HostEnvironmentProbe;
+    use crate::adapters::helper::a_declared_port;
+    use crate::adapters::pasta::PastaNetworkProvider;
+    use crate::adapters::proxy;
     use crate::adapters::streams::sandbox_log_path;
+    use crate::domain::egress::{EgressPolicy, HostPattern};
+    use crate::domain::model::Domain;
+    use crate::ports::{DbForward, EnvironmentProbe, NetworkProvider, NetworkSpec};
 
     const ANCHOR_DEADLINE: Duration = Duration::from_secs(5);
+    /// How long a session is given to exec and dial, and therefore also how long
+    /// a connection is waited for before its absence counts as absence.
+    const SESSION_DEADLINE: Duration = Duration::from_secs(5);
+    const POLL: Duration = Duration::from_millis(50);
+    /// The file a sandbox records the ports its sessions may connect to in.
+    const CONNECT_PORTS_FILE: &str = "connect.ports";
+    /// The Landlock ABI that carries the network access rights. Below it the
+    /// kernel drops the connect rules and reports success, so a test of them
+    /// there would be measuring the kernel rather than hort.
+    const CONNECT_RESTRICTION_ABI: u8 = 4;
 
     /// The prepared rootfs these tests boot, or `None` after reporting what is
     /// missing, so a host without one says why it skipped instead of failing.
@@ -952,6 +1014,83 @@ mod privileged_tests {
             cwd: PathBuf::from(WORKDIR),
             env: Vec::new(),
         }
+    }
+
+    fn sandbox_dir(state_root: &Path) -> PathBuf {
+        state_root.join("sandboxes/demo")
+    }
+
+    /// An allowlisted sandbox declaring one database on the host's own loopback.
+    /// pasta splices that port into the sandbox and hort starts no forwarder of
+    /// its own for it, so the port is reachable from inside the sandbox and free
+    /// for the test to answer on.
+    fn allowlist_network_with_a_database(
+        name: &SandboxName,
+        anchor: u32,
+        port: u16,
+    ) -> NetworkSpec {
+        NetworkSpec {
+            name: name.clone(),
+            netns: PathBuf::from(format!("/proc/{anchor}/ns/net")),
+            egress: EgressPolicy::Allowlist(vec![HostPattern::Exact(
+                Domain::new("api.anthropic.com").unwrap(),
+            )]),
+            db_forwards: vec![DbForward { host: "127.0.0.1".to_string(), port }],
+        }
+    }
+
+    fn open_network(name: &SandboxName, anchor: u32) -> NetworkSpec {
+        NetworkSpec {
+            name: name.clone(),
+            netns: PathBuf::from(format!("/proc/{anchor}/ns/net")),
+            egress: EgressPolicy::Open,
+            db_forwards: Vec::new(),
+        }
+    }
+
+    /// A session that dials one port on the sandbox's loopback and leaves. It
+    /// reads from nothing, so what the test process was invoked with is not
+    /// consumed by a process inside the sandbox.
+    fn dialling_session(name: &SandboxName, port: u16) -> SessionSpec {
+        SessionSpec {
+            name: name.clone(),
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("/usr/bin/nc 127.0.0.1 {port} < /dev/null"),
+            ],
+            cwd: PathBuf::from(WORKDIR),
+            env: Vec::new(),
+        }
+    }
+
+    /// Whether this kernel can enforce a connect-port restriction at all, saying
+    /// why it skipped when it cannot, the way a missing rootfs does.
+    fn connect_restriction_enforceable() -> bool {
+        match HostEnvironmentProbe.detect().landlock_abi {
+            Some(abi) if abi >= CONNECT_RESTRICTION_ABI => true,
+            _ => {
+                eprintln!(
+                    "skipped: this kernel reports no Landlock ABI {CONNECT_RESTRICTION_ABI}, so it cannot restrict which ports a session connects to"
+                );
+                false
+            }
+        }
+    }
+
+    /// Whether anything from the sandbox reached this listener, waiting for it: a
+    /// session execs a moment after it is started, so an answer taken right away
+    /// is an answer about nothing.
+    fn reached_within_deadline(listener: &TcpListener) -> bool {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + SESSION_DEADLINE;
+        while Instant::now() < deadline {
+            if listener.accept().is_ok() {
+                return true;
+            }
+            sleep(POLL);
+        }
+        false
     }
 
     fn namespace_inode(pid: u32, namespace: &str) -> u64 {
@@ -1212,6 +1351,98 @@ mod privileged_tests {
         // sees the same worktree, runs the same shell and answers every other
         // question here correctly, while the egress allowlist restricts nothing.
         assert_eq!(namespace_inode(session, "net"), namespace_inode(token.pid.0, "net"));
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS), pasta and Landlock ABI 4"]
+    #[serial]
+    fn a_session_cannot_connect_to_a_port_the_sandbox_did_not_record() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        if !connect_restriction_enforceable() {
+            return;
+        }
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = runtime_under(&youki_root, &state_root);
+        let spec = sandbox_spec(rootfs, state_root.path());
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let declared = a_declared_port();
+        let database = TcpListener::bind(("127.0.0.1", declared)).unwrap();
+        provider
+            .provision(&allowlist_network_with_a_database(&spec.name, token.pid.0, declared))
+            .unwrap();
+        // The sandbox stays exactly as it was wired, with that port spliced into
+        // it and answered on the host; only what it recorded changes. So a
+        // refusal here can come from nothing but the ruleset, which is the whole
+        // point: a port the sandbox cannot reach anyway refuses itself, and a
+        // test of that would report this layer as working while it was gone.
+        let sandbox_dir = sandbox_dir(state_root.path());
+        let proxy = proxy::recorded_port(&sandbox_dir).expect("a proxy port");
+        fs::write(sandbox_dir.join(CONNECT_PORTS_FILE), format!("{proxy}\n")).unwrap();
+
+        runtime.join_session(&dialling_session(&spec.name, declared)).unwrap();
+
+        assert!(!reached_within_deadline(&database));
+        provider.teardown(&spec.name).unwrap();
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+    #[serial]
+    fn a_session_reaches_the_declared_database_on_the_sandbox_loopback() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = runtime_under(&youki_root, &state_root);
+        let spec = sandbox_spec(rootfs, state_root.path());
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let declared = a_declared_port();
+        let database = TcpListener::bind(("127.0.0.1", declared)).unwrap();
+        provider
+            .provision(&allowlist_network_with_a_database(&spec.name, token.pid.0, declared))
+            .unwrap();
+
+        runtime.join_session(&dialling_session(&spec.name, declared)).unwrap();
+
+        // A declared database is one loopback port inside the sandbox, and this
+        // is the only place that is asserted from inside. It is also what keeps
+        // the refusal above honest: the same command dialling the same port,
+        // failing only where the record does not name it.
+        assert!(reached_within_deadline(&database));
+        provider.teardown(&spec.name).unwrap();
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+    #[serial]
+    fn an_open_sandbox_leaves_its_sessions_free_to_connect() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = runtime_under(&youki_root, &state_root);
+        let spec = sandbox_spec(rootfs, state_root.path());
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let port = a_declared_port();
+        let listening = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        provider.provision(&open_network(&spec.name, token.pid.0)).unwrap();
+
+        runtime.join_session(&dialling_session(&spec.name, port)).unwrap();
+
+        // Open egress is unfiltered by contract, and an open sandbox records no
+        // ports at all. Reading that silence as an empty set would lock every
+        // open sandbox out of the network it is entitled to, which is the shape
+        // a fail-closed default takes when it is applied where nothing failed.
+        assert!(reached_within_deadline(&listening));
+        provider.teardown(&spec.name).unwrap();
         runtime.teardown(&spec.name).unwrap();
     }
 
