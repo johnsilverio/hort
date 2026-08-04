@@ -27,9 +27,11 @@ use std::io::{self, PipeWriter, Read, Write};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::adapters::namespaces::{enter, in_namespaces, owning_user_namespace};
+use crate::adapters::proxy;
+use crate::adapters::streams::open_sandbox_log;
 use crate::domain::egress::EgressPolicy;
 use crate::domain::error::HortError;
 use crate::domain::model::SandboxName;
@@ -59,8 +61,12 @@ impl PastaNetworkProvider {
         Self { state_root }
     }
 
+    fn sandbox_dir(&self, name: &SandboxName) -> PathBuf {
+        self.state_root.join(SANDBOXES_DIR).join(name.as_str())
+    }
+
     fn pid_file(&self, name: &SandboxName) -> PathBuf {
-        self.state_root.join(SANDBOXES_DIR).join(name.as_str()).join(PID_FILE)
+        self.sandbox_dir(name).join(PID_FILE)
     }
 
     fn wire(&self, spec: &NetworkSpec) -> Result<(), String> {
@@ -69,14 +75,24 @@ impl PastaNetworkProvider {
         })?;
         let owner = owning_user_namespace(netns.as_fd())?;
 
-        let pid_file = self.pid_file(&spec.name);
-        if let Some(directory) = pid_file.parent() {
-            fs::create_dir_all(directory)
-                .map_err(|err| format!("creating {}: {err}", directory.display()))?;
-        }
+        let sandbox_dir = self.sandbox_dir(&spec.name);
+        fs::create_dir_all(&sandbox_dir)
+            .map_err(|err| format!("creating {}: {err}", sandbox_dir.display()))?;
+        let pid_file = sandbox_dir.join(PID_FILE);
+
+        // The proxy goes up first because the port it lands on is one of the
+        // ports pasta is told to splice: started afterwards, it would be a way
+        // out that nothing inside the sandbox can reach.
+        let proxy_port = match spec.egress {
+            EgressPolicy::Open => None,
+            EgressPolicy::Allowlist(_) => Some(proxy::start(&sandbox_dir, &spec.egress)?),
+        };
 
         let holder = OwningUserNamespaceHolder::spawn(owner.as_fd())?;
-        let started = start_pasta(&pasta_arguments(spec, &holder.namespace_path(), &pid_file));
+        let started = start_pasta(
+            &pasta_arguments(spec, &holder.namespace_path(), &pid_file, proxy_port),
+            &sandbox_dir,
+        );
         drop(holder);
         started?;
 
@@ -86,7 +102,16 @@ impl PastaNetworkProvider {
         Ok(())
     }
 
+    /// Stop both of the host-side processes a sandbox leaves behind. Each is
+    /// stopped whatever the other did: one that stayed behind because the other
+    /// failed is one nothing ever comes back for.
     fn stop(&self, name: &SandboxName) -> Result<(), String> {
+        let stopped_pasta = self.stop_pasta_of(name);
+        let stopped_proxy = proxy::stop(&self.sandbox_dir(name));
+        stopped_pasta.and(stopped_proxy)
+    }
+
+    fn stop_pasta_of(&self, name: &SandboxName) -> Result<(), String> {
         let pid_file = self.pid_file(name);
         let Ok(recorded) = fs::read_to_string(&pid_file) else {
             // Nothing recorded the sandbox's pasta, so there is nothing this can
@@ -116,9 +141,15 @@ impl NetworkProvider for PastaNetworkProvider {
 }
 
 /// The arguments pasta is spawned with for this sandbox: the namespaces it
-/// attaches to, the posture's mapping and forwarding flags, and the file it
-/// records its pid in.
-fn pasta_arguments(spec: &NetworkSpec, userns: &Path, pid_file: &Path) -> Vec<String> {
+/// attaches to, the posture's mapping and forwarding flags (including the port
+/// the sandbox's own proxy answers on, when it has one), and the file it records
+/// its pid in.
+fn pasta_arguments(
+    spec: &NetworkSpec,
+    userns: &Path,
+    pid_file: &Path,
+    proxy_port: Option<u16>,
+) -> Vec<String> {
     let mut arguments = vec![
         "--userns".to_string(),
         argument(userns),
@@ -135,7 +166,7 @@ fn pasta_arguments(spec: &NetworkSpec, userns: &Path, pid_file: &Path) -> Vec<St
             "--map-guest-addr".to_string(),
             NO_PORTS.to_string(),
             "-T".to_string(),
-            forwarded_ports(&spec.db_forwards),
+            forwarded_ports(proxy_port, &spec.db_forwards),
         ]);
     }
 
@@ -143,11 +174,18 @@ fn pasta_arguments(spec: &NetworkSpec, userns: &Path, pid_file: &Path) -> Vec<St
     arguments
 }
 
-fn forwarded_ports(forwards: &[DbForward]) -> String {
-    if forwards.is_empty() {
+/// The whole of what an allowlisted sandbox can reach: its own proxy, and the
+/// databases the project declared.
+fn forwarded_ports(proxy_port: Option<u16>, forwards: &[DbForward]) -> String {
+    let ports: Vec<String> = proxy_port
+        .iter()
+        .map(u16::to_string)
+        .chain(forwards.iter().map(|forward| forward.port.to_string()))
+        .collect();
+    if ports.is_empty() {
         return NO_PORTS.to_string();
     }
-    forwards.iter().map(|forward| forward.port.to_string()).collect::<Vec<_>>().join(",")
+    ports.join(",")
 }
 
 /// The `ip` invocations that empty a sandbox's route tables, one per address
@@ -166,9 +204,17 @@ fn argument(path: &Path) -> String {
 /// Start pasta and wait for it to finish setting the namespace up. pasta forks
 /// into the background once it is wired, so the process hort spawns exiting is
 /// the signal that the sandbox's networking is live.
-fn start_pasta(arguments: &[String]) -> Result<(), String> {
+///
+/// It reports the whole topology it configured, and that report is the only
+/// account hort ever gets of it, so the report goes to the sandbox's log rather
+/// than to hort's own streams: the process that survives keeps whatever it was
+/// started with, and a reader of a piped invocation would wait on it forever.
+fn start_pasta(arguments: &[String], sandbox_dir: &Path) -> Result<(), String> {
     let status = Command::new(PASTA)
         .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(open_sandbox_log(sandbox_dir)?)
+        .stderr(open_sandbox_log(sandbox_dir)?)
         .status()
         .map_err(|err| format!("spawning {PASTA}: {err}"))?;
     if !status.success() {
@@ -288,13 +334,19 @@ mod tests {
     use super::*;
 
     use std::fs;
+    use std::net::TcpStream;
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
 
+    use crate::adapters::proxy;
     use crate::domain::egress::{EgressPolicy, HostPattern};
     use crate::domain::model::Domain;
     use crate::ports::DbForward;
 
     const USERNS: &str = "/proc/4242/ns/user";
     const PID_FILE: &str = "/state/sandboxes/demo/pasta.pid";
+    /// A port the kernel could have handed the sandbox's proxy.
+    const PROXY_PORT: u16 = 44001;
 
     fn network_spec(egress: EgressPolicy, db_forwards: Vec<DbForward>) -> NetworkSpec {
         NetworkSpec {
@@ -313,11 +365,24 @@ mod tests {
         DbForward { host: "127.0.0.1".to_string(), port }
     }
 
+    /// Whether the port stops answering, waiting for it: a signalled process takes
+    /// a moment to leave.
+    fn stopped_answering_within_deadline(port: u16) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if TcpStream::connect(("127.0.0.1", port)).is_err() {
+                return true;
+            }
+            sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
     #[test]
     fn open_egress_asks_pasta_to_configure_the_namespace() {
         let spec = network_spec(EgressPolicy::Open, Vec::new());
 
-        let arguments = pasta_arguments(&spec, Path::new(USERNS), Path::new(PID_FILE));
+        let arguments = pasta_arguments(&spec, Path::new(USERNS), Path::new(PID_FILE), None);
 
         // What `--no-netns-quit` gives up is pasta watching the directory of the
         // namespace file so it can leave when the file goes away. It cannot watch
@@ -344,7 +409,8 @@ mod tests {
     fn allowlist_egress_unmaps_the_host_loopback() {
         let spec = network_spec(allowlist(), vec![database_on(5432)]);
 
-        let arguments = pasta_arguments(&spec, Path::new(USERNS), Path::new(PID_FILE));
+        let arguments =
+            pasta_arguments(&spec, Path::new(USERNS), Path::new(PID_FILE), Some(PROXY_PORT));
 
         // The default mapping exposes every one of the host's loopback services
         // to the sandbox, and declaring forwarded ports does not close it. Only
@@ -364,7 +430,7 @@ mod tests {
                 "--map-guest-addr",
                 "none",
                 "-T",
-                "5432",
+                "44001,5432",
                 "-P",
                 "/state/sandboxes/demo/pasta.pid",
             ]
@@ -375,7 +441,8 @@ mod tests {
     fn allowlist_egress_forwards_the_declared_database_ports() {
         let spec = network_spec(allowlist(), vec![database_on(5432), database_on(6379)]);
 
-        let arguments = pasta_arguments(&spec, Path::new(USERNS), Path::new(PID_FILE));
+        let arguments =
+            pasta_arguments(&spec, Path::new(USERNS), Path::new(PID_FILE), Some(PROXY_PORT));
 
         assert_eq!(
             arguments,
@@ -391,7 +458,7 @@ mod tests {
                 "--map-guest-addr",
                 "none",
                 "-T",
-                "5432,6379",
+                "44001,5432,6379",
                 "-P",
                 "/state/sandboxes/demo/pasta.pid",
             ]
@@ -402,10 +469,12 @@ mod tests {
     fn allowlist_egress_forwards_nothing_when_no_database_is_declared() {
         let spec = network_spec(allowlist(), Vec::new());
 
-        let arguments = pasta_arguments(&spec, Path::new(USERNS), Path::new(PID_FILE));
+        let arguments =
+            pasta_arguments(&spec, Path::new(USERNS), Path::new(PID_FILE), Some(PROXY_PORT));
 
-        // "none" is pasta's own spelling for an empty forward list. Leaving the
-        // flag out instead would forward pasta's defaults.
+        // With no database declared, the sandbox's own proxy is the whole of the
+        // forward list, and that one port is the whole of what the sandbox can
+        // reach.
         assert_eq!(
             arguments,
             [
@@ -420,7 +489,7 @@ mod tests {
                 "--map-guest-addr",
                 "none",
                 "-T",
-                "none",
+                "44001",
                 "-P",
                 "/state/sandboxes/demo/pasta.pid",
             ]
@@ -501,6 +570,22 @@ mod tests {
         assert!(result.is_ok());
         assert!(Path::new(&format!("/proc/{recorded}")).exists());
     }
+
+    #[test]
+    fn tearing_a_sandbox_down_stops_its_proxy() {
+        let state_root = tempfile::tempdir().unwrap();
+        let sandbox_dir = state_root.path().join("sandboxes").join("demo");
+        fs::create_dir_all(&sandbox_dir).unwrap();
+        let port = proxy::start(&sandbox_dir, &allowlist()).unwrap();
+        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+
+        provider.teardown(&SandboxName::new("demo").unwrap()).unwrap();
+
+        // The proxy is the second host-side process a sandbox leaves behind, and
+        // like pasta it has no reason to leave on its own. A teardown that stops
+        // only one of the two leaks the other for every sandbox that ever ran.
+        assert!(stopped_answering_within_deadline(port));
+    }
 }
 
 #[cfg(all(test, feature = "privileged-tests"))]
@@ -508,13 +593,17 @@ mod privileged_tests {
     use super::*;
 
     use std::fs;
+    use std::net::TcpStream;
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
     use serial_test::serial;
 
+    use crate::adapters::proxy;
     use crate::adapters::runtime::LibcontainerRuntime;
-    use crate::domain::egress::EgressPolicy;
+    use crate::adapters::streams::sandbox_log_path;
+    use crate::domain::egress::{EgressPolicy, HostPattern};
+    use crate::domain::model::Domain;
     use crate::ports::{ContainerRuntime, OciSpec};
 
     const PASTA_DEADLINE: Duration = Duration::from_secs(5);
@@ -566,6 +655,24 @@ mod privileged_tests {
             egress: EgressPolicy::Allowlist(Vec::new()),
             db_forwards: Vec::new(),
         }
+    }
+
+    /// A sandbox network in the allowlist posture that permits one host. The
+    /// empty allowlist above is deliberately not reused: a list that permits
+    /// nothing leaves whether a proxy exists at all open to the implementation.
+    fn allowlist_network_permitting_one_host(name: &SandboxName, anchor: u32) -> NetworkSpec {
+        NetworkSpec {
+            name: name.clone(),
+            netns: PathBuf::from(format!("/proc/{anchor}/ns/net")),
+            egress: EgressPolicy::Allowlist(vec![HostPattern::Exact(
+                Domain::new("api.anthropic.com").unwrap(),
+            )]),
+            db_forwards: Vec::new(),
+        }
+    }
+
+    fn sandbox_dir(state_root: &Path) -> PathBuf {
+        state_root.join("sandboxes/demo")
     }
 
     /// The sandbox's IPv4 routing table as the host reads it. An emptied table is
@@ -622,6 +729,34 @@ mod privileged_tests {
     #[test]
     #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
     #[serial]
+    fn provisioning_keeps_what_pasta_reports_in_the_sandbox_log() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = LibcontainerRuntime::new(
+            youki_root.path().to_path_buf(),
+            state_root.path().to_path_buf(),
+        );
+        let spec = sandbox_spec(rootfs, state_root.path());
+        let token = runtime.start_anchor(&spec).unwrap();
+        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+
+        provider.provision(&open_network(&spec.name, token.pid.0)).unwrap();
+
+        // pasta reports every mapping and forwarding rule it installed, and that
+        // report is the only account hort ever gets of the one host-side helper
+        // whose failure is otherwise silent. It goes to the stream pasta was
+        // started with, and the process that survives keeps that stream open.
+        let sandbox_dir = state_root.path().join("sandboxes/demo");
+        let logged = fs::read_to_string(sandbox_log_path(&sandbox_dir)).expect("the sandbox log");
+        assert!(!logged.is_empty());
+        provider.teardown(&spec.name).unwrap();
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+    #[serial]
     fn allowlist_provisioning_empties_the_sandbox_routing_table() {
         let Some(rootfs) = prepared_rootfs() else { return };
         let youki_root = tempfile::tempdir().unwrap();
@@ -667,6 +802,90 @@ mod privileged_tests {
         // pasta never quits on its own once it is told not to watch the namespace
         // file, so a teardown that does not signal it leaves it running for good.
         assert!(stopped_within_deadline(pasta));
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+    #[serial]
+    fn allowlist_provisioning_starts_the_sandbox_proxy() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = LibcontainerRuntime::new(
+            youki_root.path().to_path_buf(),
+            state_root.path().to_path_buf(),
+        );
+        let spec = sandbox_spec(rootfs, state_root.path());
+        let token = runtime.start_anchor(&spec).unwrap();
+        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+
+        provider
+            .provision(&allowlist_network_permitting_one_host(&spec.name, token.pid.0))
+            .unwrap();
+
+        // Closing the namespace is only half of the posture. A sandbox whose
+        // routes are gone and whose proxy was never started is not restricted,
+        // it is disconnected, and the allowlist it was given permits nothing.
+        let port = proxy::recorded_port(&sandbox_dir(state_root.path())).expect("a proxy port");
+        assert!(TcpStream::connect(("127.0.0.1", port)).is_ok());
+        provider.teardown(&spec.name).unwrap();
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+    #[serial]
+    fn allowlist_provisioning_tells_pasta_to_splice_the_proxy_port() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = LibcontainerRuntime::new(
+            youki_root.path().to_path_buf(),
+            state_root.path().to_path_buf(),
+        );
+        let spec = sandbox_spec(rootfs, state_root.path());
+        let token = runtime.start_anchor(&spec).unwrap();
+        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+
+        provider
+            .provision(&allowlist_network_permitting_one_host(&spec.name, token.pid.0))
+            .unwrap();
+
+        // The sandbox reaches the proxy at all only because pasta was told to
+        // splice that one port, which is also why the proxy has to be listening
+        // before pasta is started: an unspliced proxy is a proxy nobody inside
+        // can talk to.
+        let port = proxy::recorded_port(&sandbox_dir(state_root.path())).expect("a proxy port");
+        let pasta = recorded_pasta_pid(state_root.path());
+        let cmdline = fs::read(format!("/proc/{pasta}/cmdline")).unwrap();
+        assert!(String::from_utf8_lossy(&cmdline).contains(&port.to_string()));
+        provider.teardown(&spec.name).unwrap();
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+    #[serial]
+    fn open_provisioning_starts_no_proxy() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = LibcontainerRuntime::new(
+            youki_root.path().to_path_buf(),
+            state_root.path().to_path_buf(),
+        );
+        let spec = sandbox_spec(rootfs, state_root.path());
+        let token = runtime.start_anchor(&spec).unwrap();
+        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+
+        provider.provision(&open_network(&spec.name, token.pid.0)).unwrap();
+
+        // Open egress is unfiltered by contract, so a proxy standing in an open
+        // sandbox would be a chokepoint nobody asked for and a second thing to
+        // stop for no gain.
+        assert_eq!(proxy::recorded_port(&sandbox_dir(state_root.path())), None);
+        provider.teardown(&spec.name).unwrap();
         runtime.teardown(&spec.name).unwrap();
     }
 }

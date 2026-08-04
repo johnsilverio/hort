@@ -40,6 +40,7 @@ use libcontainer::oci_spec::runtime::{
 use libcontainer::syscall::syscall::SyscallType;
 
 use crate::adapters::namespaces::{enter, owning_user_namespace};
+use crate::adapters::streams::open_sandbox_log;
 use crate::domain::error::HortError;
 use crate::domain::model::{AnchorPid, LivenessToken, MountNsInode, SandboxName};
 use crate::ports::{
@@ -54,6 +55,7 @@ const UPPER_LAYER: &str = "upper";
 const WORK_LAYER: &str = "work";
 const MERGED_ROOT: &str = "merged";
 const WORKDIR: &str = "/workdir";
+const DEV_NULL: &str = "/dev/null";
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const CPU_PERIOD_USEC: u64 = 100_000;
 /// The byte both handshakes send; only its arrival, never its value, carries
@@ -107,8 +109,12 @@ impl LibcontainerRuntime {
         Self { youki_root, state_root }
     }
 
+    fn sandbox_dir(&self, name: &SandboxName) -> PathBuf {
+        self.state_root.join(SANDBOXES_DIR).join(name.as_str())
+    }
+
     fn bundle_dir(&self, name: &SandboxName) -> PathBuf {
-        self.state_root.join(SANDBOXES_DIR).join(name.as_str()).join(BUNDLE_DIR)
+        self.sandbox_dir(name).join(BUNDLE_DIR)
     }
 
     fn container_dir(&self, name: &SandboxName) -> PathBuf {
@@ -122,6 +128,7 @@ impl LibcontainerRuntime {
     fn build_sandbox(
         &self,
         spec: &OciSpec,
+        streams: AnchorStreams,
         mut ready: PipeWriter,
         mut released: PipeReader,
     ) -> Result<u32, String> {
@@ -141,7 +148,7 @@ impl LibcontainerRuntime {
         mount_merged_root(spec)?;
         let bundle = self.bundle_dir(&spec.name);
         write_bundle_config(&bundle, &anchor_spec(spec))?;
-        start_container(&spec.name, &bundle, &self.youki_root)
+        start_container(&spec.name, &bundle, &self.youki_root, streams)
     }
 
     /// The pid of a running sandbox's anchor, taken from the container state the
@@ -169,6 +176,7 @@ impl LibcontainerRuntime {
 impl ContainerRuntime for LibcontainerRuntime {
     fn start_anchor(&self, spec: &OciSpec) -> Result<LivenessToken, HortError> {
         let owner = host_owner(&spec.workdir)?;
+        let streams = anchor_streams(&self.sandbox_dir(&spec.name)).map_err(runtime_failure)?;
         let (ready_reader, ready_writer) = channel()?;
         let (released_reader, released_writer) = channel()?;
         let (report_reader, report_writer) = channel()?;
@@ -181,7 +189,7 @@ impl ContainerRuntime for LibcontainerRuntime {
                 drop(ready_reader);
                 drop(released_writer);
                 drop(report_reader);
-                let outcome = self.build_sandbox(spec, ready_writer, released_reader);
+                let outcome = self.build_sandbox(spec, streams, ready_writer, released_reader);
                 report_and_exit(report_writer, outcome);
             }
             child => {
@@ -375,13 +383,21 @@ fn write_bundle_config(bundle: &Path, spec: &Spec) -> Result<(), String> {
 /// Build the container from the bundle and start its anchor, returning the pid
 /// the anchor runs under on the host. The build only creates the container; the
 /// anchor is not running until `start`.
-fn start_container(name: &SandboxName, bundle: &Path, youki_root: &Path) -> Result<u32, String> {
+fn start_container(
+    name: &SandboxName,
+    bundle: &Path,
+    youki_root: &Path,
+    streams: AnchorStreams,
+) -> Result<u32, String> {
     fs::create_dir_all(youki_root)
         .map_err(|err| format!("creating {}: {err}", youki_root.display()))?;
 
     let mut container = ContainerBuilder::new(name.as_str().to_string(), SyscallType::default())
         .with_root_path(youki_root)
         .map_err(|err| format!("rooting the container state at {}: {err}", youki_root.display()))?
+        .with_stdin(streams.input)
+        .with_stdout(streams.output)
+        .with_stderr(streams.errors)
         .as_init(bundle)
         .with_detach(true)
         .build()
@@ -393,6 +409,32 @@ fn start_container(name: &SandboxName, bundle: &Path, youki_root: &Path) -> Resu
         .ok_or_else(|| "the runtime started the anchor but reported no pid".to_string())?;
     u32::try_from(pid.as_raw())
         .map_err(|_| format!("the runtime reported {} as the anchor pid", pid.as_raw()))
+}
+
+/// The streams the anchor is given: the sandbox's log for both outputs, and
+/// nothing to read.
+struct AnchorStreams {
+    input: File,
+    output: File,
+    errors: File,
+}
+
+/// Open them from hort's own process. An anchor keeps whatever it is started
+/// with for as long as the sandbox lives, so one started with hort's streams
+/// holds a redirected or piped invocation open forever, and holds the writing
+/// end of whatever feeds hort open just as long.
+///
+/// Opening them here rather than inside the sandbox process is what keeps them
+/// readable: a file opened after the mount namespace has been unshared carries
+/// that namespace's copy of the mount, and once the container pivots away from
+/// it `/proc/<anchor>/fd/1` renders as a path relative to a mount the host
+/// cannot reach, naming no file anyone can open.
+fn anchor_streams(sandbox_dir: &Path) -> Result<AnchorStreams, String> {
+    Ok(AnchorStreams {
+        input: File::open(DEV_NULL).map_err(|err| format!("opening {DEV_NULL}: {err}"))?,
+        output: open_sandbox_log(sandbox_dir)?,
+        errors: open_sandbox_log(sandbox_dir)?,
+    })
 }
 
 /// Climb into the sandbox and start the session there, from the forked child.
@@ -853,6 +895,7 @@ mod privileged_tests {
     use super::*;
 
     use std::fs;
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
     use std::thread::sleep;
@@ -860,6 +903,8 @@ mod privileged_tests {
 
     use serial_test::serial;
     use tempfile::TempDir;
+
+    use crate::adapters::streams::sandbox_log_path;
 
     const ANCHOR_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -928,6 +973,21 @@ mod privileged_tests {
             sleep(Duration::from_millis(50));
         }
         panic!("the anchor did not exec within {ANCHOR_DEADLINE:?}");
+    }
+
+    /// Point this process's input at `path` and hand back the restore. An anchor
+    /// inherits whatever hort was invoked with, so a test whose own input is
+    /// already `/dev/null` cannot tell an anchor that was detached from its
+    /// caller from one that merely inherited a null caller.
+    fn redirect_stdin(path: &Path) -> impl FnOnce() {
+        let saved = unsafe { libc::dup(0) };
+        assert!(saved != -1, "saving the input of the test process");
+        let replacement = File::open(path).expect("the file standing in for hort's input");
+        assert!(unsafe { libc::dup2(replacement.as_raw_fd(), 0) } != -1, "redirecting the input");
+        move || {
+            unsafe { libc::dup2(saved, 0) };
+            unsafe { libc::close(saved) };
+        }
     }
 
     /// Whether the anchor is gone, waiting for it: the runtime kills it, and the
@@ -1041,6 +1101,56 @@ mod privileged_tests {
         runtime.teardown(&spec.name).unwrap();
 
         assert!(stopped_within_deadline(token.pid.0));
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn anchor_writes_its_streams_to_the_sandbox_log() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = runtime_under(&youki_root, &state_root);
+        let spec = sandbox_spec(rootfs, state_root.path());
+
+        let token = runtime.start_anchor(&spec).unwrap();
+
+        // The anchor outlives the command that started it, so an anchor left
+        // holding the streams hort was invoked with holds them for the life of
+        // the sandbox: a piped or redirected invocation never reaches EOF and its
+        // reader waits on a `sleep infinity` that will never write.
+        wait_for_anchor(token.pid.0);
+        let log = sandbox_log_path(&state_root.path().join("sandboxes/demo"));
+        assert_eq!(fs::read_link(format!("/proc/{}/fd/1", token.pid.0)).unwrap(), log);
+        assert_eq!(fs::read_link(format!("/proc/{}/fd/2", token.pid.0)).unwrap(), log);
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn the_anchor_reads_from_nothing_rather_than_from_what_invoked_hort() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = runtime_under(&youki_root, &state_root);
+        let spec = sandbox_spec(rootfs, state_root.path());
+        let invocation_input = state_root.path().join("invocation-input");
+        fs::write(&invocation_input, b"").unwrap();
+        let restore_stdin = redirect_stdin(&invocation_input);
+
+        let token = runtime.start_anchor(&spec).unwrap();
+
+        restore_stdin();
+        wait_for_anchor(token.pid.0);
+        // The anchor never reads, but it outlives the command that started it, so
+        // one left holding hort's input keeps that end of a pipe open for the life
+        // of the sandbox and whoever writes into hort never learns nobody reads.
+        assert_eq!(
+            fs::read_link(format!("/proc/{}/fd/0", token.pid.0)).unwrap(),
+            PathBuf::from("/dev/null")
+        );
+        runtime.teardown(&spec.name).unwrap();
     }
 
     #[test]
