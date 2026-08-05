@@ -2,28 +2,31 @@
 //! debris (orphaned and inconsistent sandboxes, plus corrupt metadata dirs).
 //!
 //! It reconciles the records against the live anchors and the worktrees still on
-//! disk, gathers the corrupt dirs, observes idle and dirty state, and runs the
-//! pure selection. The dirty guard is the one question still answered by the
-//! current repository's worktree list, so a sandbox of another project carries
-//! no dirty state to protect it. An
-//! empty removal set never prompts; otherwise, without `--force`, a non-TTY stdin
-//! refuses and a TTY prompts with every candidate name listed first. Each chosen
-//! removal follows the mandatory teardown order, and a single stale-registration
-//! sweep runs at the end of every non-refused, non-declined run.
+//! disk, gathers the corrupt dirs, observes idle and worktree risk, and runs the
+//! pure selection. Every question about a worktree is asked at that candidate's
+//! own path on disk, because `prune` is global and the repository the user
+//! happens to be standing in knows nothing about the other projects' sandboxes.
+//! An empty removal set never prompts; otherwise, without `--force`, a non-TTY
+//! stdin refuses and a TTY prompts with every candidate name listed first. Each
+//! chosen removal follows the mandatory teardown order, and a single
+//! stale-registration sweep runs at the end of every non-refused, non-declined
+//! run.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use crate::commands::present_worktrees;
 use crate::domain::error::HortError;
 use crate::domain::idle::{IdleState, idle, parse_timestamp};
 use crate::domain::model::{SandboxName, SandboxRecord};
-use crate::domain::prune::{CorruptInput, PruneInput, PrunePlan, PruneSkip, prune_selection};
+use crate::domain::prune::{
+    CorruptInput, PruneInput, PrunePlan, PruneSkip, WorktreeRisk, prune_selection,
+};
 use crate::domain::reconcile::reconcile_all;
 use crate::domain::teardown::{TeardownStep, teardown_plan};
 use crate::ports::{
     Clock, Confirmer, ContainerRegistry, ContainerRuntime, MetadataStore, NetworkProvider,
-    SessionProbe, Worktree, WorktreeProvider,
+    SessionProbe, WorktreeProvider,
 };
 
 /// What a `prune` run removed and what it skipped, with the reason for each skip.
@@ -83,7 +86,6 @@ impl PruneCommand<'_> {
     ) -> Result<PruneReport, HortError> {
         let records = self.store.list()?;
         let live = self.registry.list_live()?;
-        let listed = self.worktrees.list()?;
         let corrupt = self.store.list_corrupt()?;
         let now = self.clock.now();
 
@@ -94,8 +96,8 @@ impl PruneCommand<'_> {
             .filter_map(|(name, state)| {
                 let record = records.iter().find(|record| record.name() == &name)?;
                 let idle = self.sandbox_idle(record, now);
-                let dirty = self.sandbox_dirty(record, &listed);
-                Some(PruneInput { name, state, idle, dirty })
+                let risk = self.sandbox_risk(record);
+                Some(PruneInput { name, state, idle, risk })
             })
             .collect();
 
@@ -103,7 +105,7 @@ impl PruneCommand<'_> {
             .iter()
             .map(|entry| CorruptInput {
                 name: entry.name.clone(),
-                dirty: self.corrupt_dirty(&entry.name, &listed),
+                risk: self.corrupt_risk(&entry.name),
             })
             .collect();
 
@@ -168,37 +170,50 @@ impl PruneCommand<'_> {
         Some(idle(sessions, created, attach, None, now))
     }
 
-    /// Whether a record's worktree is dirty, probed only when there is something
-    /// to protect: a no-git record or an absent worktree has nothing to lose, so
-    /// it is `None`. An unanswerable probe reads as dirty, because the gate
-    /// guards uncommitted work and `--force` is the only override.
-    fn sandbox_dirty(&self, record: &SandboxRecord, listed: &[Worktree]) -> Option<bool> {
-        record.branch()?;
-        if !path_listed(listed, record.worktree_path()) {
-            return None;
+    /// What a record's worktree holds, asked only when there is something to
+    /// protect: without git the folder is the user's own and is never removed,
+    /// and a worktree already gone from disk has nothing left to lose, which is
+    /// what keeps that debris prunable. Presence is read from the disk at the
+    /// record's own path, so a sandbox is judged by what is there rather than by
+    /// whether the current repository happens to list it. A probe git cannot
+    /// answer leaves the state unknown, and unknown protects.
+    fn sandbox_risk(&self, record: &SandboxRecord) -> WorktreeRisk {
+        if record.branch().is_none() {
+            return WorktreeRisk::NothingAtRisk;
         }
-        Some(self.worktrees.is_dirty(record.name()).unwrap_or(true))
+        if !self.worktrees.exists(record.worktree_path()) {
+            return WorktreeRisk::NothingAtRisk;
+        }
+        self.probed_risk(record.name())
     }
 
-    /// Whether a corrupt dir's worktree is dirty. A corrupt entry has no record
-    /// to read the path from, so the canonical state-root layout supplies it; the
-    /// same probe-error-as-dirty mapping applies once the worktree is present.
-    fn corrupt_dirty(&self, name: &str, listed: &[Worktree]) -> Option<bool> {
-        let path = self.corrupt_worktree_path(name);
-        if !path_listed(listed, &path) {
-            return None;
+    /// What a corrupt dir's worktree holds. A corrupt entry has no record to read
+    /// the path from, so the canonical state-root layout supplies it; from there
+    /// the question and its answers are the record path's.
+    fn corrupt_risk(&self, name: &str) -> WorktreeRisk {
+        if !self.worktrees.exists(&self.corrupt_worktree_path(name)) {
+            return WorktreeRisk::NothingAtRisk;
         }
-        let sandbox_name = SandboxName::new(name).ok()?;
-        Some(self.worktrees.is_dirty(&sandbox_name).unwrap_or(true))
+        let Ok(sandbox_name) = SandboxName::new(name) else {
+            return WorktreeRisk::NothingAtRisk;
+        };
+        self.probed_risk(&sandbox_name)
+    }
+
+    /// The dirty probe read as risk. It lives in one place because the two paths
+    /// that ask it gate the same deletion, and a mapping that drifts between them
+    /// reopens the data-loss path on whichever side was left behind.
+    fn probed_risk(&self, name: &SandboxName) -> WorktreeRisk {
+        match self.worktrees.is_dirty(name) {
+            Ok(true) => WorktreeRisk::HoldsWork,
+            Ok(false) => WorktreeRisk::NothingAtRisk,
+            Err(_) => WorktreeRisk::Unknown,
+        }
     }
 
     fn corrupt_worktree_path(&self, name: &str) -> PathBuf {
         self.state_root.join("sandboxes").join(name).join(format!("worktree-{name}"))
     }
-}
-
-fn path_listed(listed: &[Worktree], path: &Path) -> bool {
-    listed.iter().any(|worktree| worktree.path == *path)
 }
 
 /// A confirmation message naming every candidate, sandbox and corrupt dir alike,
@@ -278,11 +293,11 @@ mod tests {
 
         let report = command.run(None, true, false).unwrap();
 
-        // Debris is what prune exists to remove, and a sandbox reads as debris
-        // the moment its worktree looks gone. Answering that from the current
-        // repository's list turns `prune` run in one project into a teardown of
-        // another project's running sandbox, worktree and uncommitted work
-        // included, with nothing in the way once `--force` skips the prompt.
+        // A sandbox reads as debris the moment its worktree looks gone, and
+        // answering that from the current repository's list makes every other
+        // project's box look exactly that way. What spares this one is
+        // reconciling as live, not the risk guard: with no idle threshold a live
+        // sandbox is never a candidate for the guard to see.
         assert!(report.removed.is_empty());
     }
 
@@ -535,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_treats_dirty_probe_failure_as_dirty() {
+    fn prune_skips_a_sandbox_whose_worktree_state_it_cannot_determine() {
         let name = SandboxName::new("demo").unwrap();
         let store = InMemoryMetadataStore::new();
         store.put(&sample_record("demo")).unwrap();
@@ -553,10 +568,125 @@ mod tests {
 
         let report = command.run(None, false, false).unwrap();
 
+        // Calling this one dirty sends the user hunting for uncommitted changes
+        // that git can no longer enumerate at all, which is the wrong thing to
+        // read right before deciding to pass --force.
+        assert_eq!(
+            report.skipped,
+            vec![PruneSkip { name: "demo".to_string(), reason: SkipReason::Unknown }]
+        );
+    }
+
+    #[test]
+    fn prune_spares_a_dirty_sandbox_whose_worktree_this_repository_does_not_list() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo").with_token(canned_token())).unwrap();
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees =
+            FakeWorktreeProvider::new().with_present_worktree(&name).with_dirty_worktree(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+        );
+
+        let report = command.run(None, false, true).unwrap();
+
+        // A reboot leaves every sandbox on the machine orphaned, so this is what
+        // Monday morning looks like from any other project: uncommitted work one
+        // confirmation away from being torn down, and nothing in the report to
+        // say it was ever at risk.
         assert_eq!(
             report.skipped,
             vec![PruneSkip { name: "demo".to_string(), reason: SkipReason::Dirty }]
         );
+    }
+
+    #[test]
+    fn prune_spares_a_dirty_corrupt_entry_whose_worktree_this_repository_does_not_list() {
+        let rotten = SandboxName::new("rotten").unwrap();
+        let store = InMemoryMetadataStore::new().with_corrupt_entry("rotten", "broken json");
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees =
+            FakeWorktreeProvider::new().with_present_worktree(&rotten).with_dirty_worktree(&rotten);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+        );
+
+        let report = command.run(None, false, true).unwrap();
+
+        assert_eq!(
+            report.skipped,
+            vec![PruneSkip { name: "rotten".to_string(), reason: SkipReason::Dirty }]
+        );
+    }
+
+    #[test]
+    fn prune_removes_a_sandbox_whose_worktree_vanished_from_disk() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo").with_token(canned_token())).unwrap();
+        let registry = FakeRegistry::new(vec![(name.clone(), canned_token())]);
+        let worktrees = FakeWorktreeProvider::new().with_failing_dirty_probe(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+        );
+
+        command.run(None, false, true).unwrap();
+
+        // Debris whose worktree is already gone is exactly what prune exists to
+        // clear, and git has nothing left to answer about it. A guard that asks
+        // anyway reads the failure as a reason to protect and keeps the debris
+        // forever.
+        assert_eq!(store.get(&name).unwrap(), None);
+    }
+
+    #[test]
+    fn prune_removes_a_no_git_sandbox_whose_folder_is_not_a_repository() {
+        let name = SandboxName::new("demo").unwrap();
+        let record = SandboxRecord::new(
+            name.clone(),
+            None,
+            PathBuf::from("/state/sandboxes/demo/worktree-demo"),
+            PathBuf::from("/state/sandboxes/demo/overlay"),
+            "2026-06-12T12:00:00Z".to_string(),
+            "2026-06-12T12:00:00Z".to_string(),
+            None,
+        );
+        let store = InMemoryMetadataStore::new();
+        store.put(&record).unwrap();
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new()
+            .with_present_worktree(&name)
+            .with_failing_dirty_probe(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+        );
+
+        command.run(None, false, true).unwrap();
+
+        // Without git that folder is the user's own and prune never removes it,
+        // so whatever it holds is not this guard's business.
+        assert_eq!(store.get(&name).unwrap(), None);
     }
 
     #[test]

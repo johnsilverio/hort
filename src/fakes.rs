@@ -571,8 +571,8 @@ impl WorktreeProvider for FakeWorktreeProvider {
 
     fn is_dirty(&self, name: &SandboxName) -> Result<bool, HortError> {
         if self.failing_dirty_probes.contains(name) {
-            // An unasserted stand-in error: prune reads any probe failure as
-            // dirty, so the variant does not matter, only that it is an `Err`.
+            // An unasserted stand-in error: no consumer asserts the variant,
+            // only that it is an `Err`.
             return Err(HortError::InvalidConfig {
                 detail: "fake worktree: dirty probe scripted to fail".to_string(),
             });

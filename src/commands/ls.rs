@@ -5,13 +5,13 @@
 //! worktrees still on disk, joins each verdict back to its record, and derives
 //! age and idle from the recorded timestamps. Liveness comes from matching the
 //! record tokens against the registry entries, so there is no liveness probe
-//! here. The dirty column is the one question still answered by the current
-//! repository's worktree list, which is why a sandbox of another project shows
-//! its dirty state as unknown. A record with a corrupt timestamp degrades only
-//! its own row to an unknown age and idle, and the listing never mutates
-//! anything.
+//! here. The dirty column is asked at each record's own worktree path on disk,
+//! so a sandbox of another project reports its dirty state like any other; the
+//! forgotten box holding uncommitted work is the one this listing exists to
+//! surface, and it is rarely the box of the project you are standing in. A
+//! record with a corrupt timestamp degrades only its own row to an unknown age
+//! and idle, and the listing never mutates anything.
 
-use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use crate::commands::present_worktrees;
@@ -19,18 +19,17 @@ use crate::domain::error::HortError;
 use crate::domain::idle::{IdleState, age, idle, parse_timestamp};
 use crate::domain::model::{BranchName, SandboxName, SandboxRecord};
 use crate::domain::reconcile::{SandboxState, reconcile_all};
-use crate::ports::{
-    Clock, ContainerRegistry, MetadataStore, SessionProbe, Worktree, WorktreeProvider,
-};
+use crate::ports::{Clock, ContainerRegistry, MetadataStore, SessionProbe, WorktreeProvider};
 
 /// One row of `ls` output: a sandbox's reconciled state plus the figures the CLI
 /// renders beside it. `age`, `idle`, and `branch` are `None` when there is no
 /// record to derive them from (a lost-record row) or the record's timestamps are
 /// corrupt; `branch` is also `None` for a no-git record. `dirty` is probed only
-/// for a git record whose worktree is listed; it is `None` for no record, a
-/// no-git record, an absent worktree, or a failed probe, which `ls` reports as
-/// unknown rather than guessing, where `prune` instead reads a failed probe as
-/// dirty so it never deletes possibly uncommitted work.
+/// for a git record whose worktree is still on disk; it is `None` for no record,
+/// a no-git record, an absent worktree, or a failed probe, all of which `ls`
+/// reports as unknown rather than guessing. It stays an `Option<bool>` while
+/// `prune` reads the same probe into three states, because here the answer is
+/// displayed and there it decides a deletion.
 pub struct LsEntry {
     pub name: SandboxName,
     pub state: SandboxState,
@@ -68,7 +67,6 @@ impl LsCommand<'_> {
     pub fn run(&self) -> Result<Vec<LsEntry>, HortError> {
         let records = self.store.list()?;
         let live = self.registry.list_live()?;
-        let listed = self.worktrees.list()?;
         let present = present_worktrees(self.worktrees, &records);
         let now = self.clock.now();
 
@@ -81,7 +79,7 @@ impl LsCommand<'_> {
                 // whole listing: a single racing sandbox must not blind the rest.
                 let sessions = self.sessions.session_pids(&name).map_or(0, |pids| pids.len());
                 let record = records.iter().find(|record| record.name() == &name);
-                let dirty = record.and_then(|record| self.observe_dirty(record, &listed));
+                let dirty = record.and_then(|record| self.observe_dirty(record));
                 build_entry(name, state, sessions, record, dirty, now)
             })
             .collect();
@@ -90,21 +88,16 @@ impl LsCommand<'_> {
     }
 
     /// Whether a sandbox's worktree is dirty, observed only when there is a git
-    /// record whose worktree is still listed. A failed probe degrades to unknown,
-    /// which `ls` reports honestly rather than guessing, unlike `prune`, which
-    /// reads a failed probe as dirty to keep from deleting possibly uncommitted
-    /// work.
-    fn observe_dirty(&self, record: &SandboxRecord, listed: &[Worktree]) -> Option<bool> {
+    /// record whose worktree is still on disk at the path that record names. A
+    /// failed probe degrades to unknown, which `ls` reports honestly rather than
+    /// guessing; nothing here gates a deletion, so unknown costs a dash.
+    fn observe_dirty(&self, record: &SandboxRecord) -> Option<bool> {
         record.branch()?;
-        if !path_listed(listed, record.worktree_path()) {
+        if !self.worktrees.exists(record.worktree_path()) {
             return None;
         }
         self.worktrees.is_dirty(record.name()).ok()
     }
-}
-
-fn path_listed(listed: &[Worktree], path: &Path) -> bool {
-    listed.iter().any(|worktree| worktree.path == *path)
 }
 
 fn build_entry(
@@ -393,6 +386,27 @@ mod tests {
 
         let entries = command.run().unwrap();
 
+        assert_eq!(entries[0].dirty, Some(true));
+    }
+
+    #[test]
+    fn ls_reports_dirty_for_a_worktree_this_repository_does_not_list() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo").with_token(canned_token())).unwrap();
+        let registry = FakeRegistry::new(vec![(name.clone(), canned_token())]);
+        let worktrees =
+            FakeWorktreeProvider::new().with_present_worktree(&name).with_dirty_worktree(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock);
+
+        let entries = command.run().unwrap();
+
+        // A box of another project is the most forgettable one there is, and it
+        // is the box holding uncommitted work that `ls` exists to keep from
+        // being lost. Printing a dash for it from anywhere but its own directory
+        // hides exactly the row that needed attention.
         assert_eq!(entries[0].dirty, Some(true));
     }
 

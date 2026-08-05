@@ -519,6 +519,24 @@ mod tests {
     }
 
     #[test]
+    fn git_worktree_is_dirty_fails_when_the_parent_repository_is_gone() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+        fs::remove_dir_all(&repo).unwrap();
+
+        let result = provider.is_dirty(&name);
+
+        // The worktree is still on disk and is now the only copy of everything
+        // it holds, committed work included. Answering "clean" here would let
+        // the guard that protects uncommitted work delete the last copy.
+        assert!(matches!(result, Err(HortError::GitCommandFailed { .. })));
+    }
+
+    #[test]
     fn git_worktree_prune_stale_clears_vanished_registration() {
         let (_repo, repo) = temp_dir();
         let (_state, state_root) = temp_dir();

@@ -325,6 +325,7 @@ fn render_line(entry: &LsEntry) -> String {
 fn skip_reason_label(reason: &SkipReason) -> &'static str {
     match reason {
         SkipReason::Dirty => "dirty",
+        SkipReason::Unknown => "unknown",
     }
 }
 
@@ -447,6 +448,21 @@ mod tests {
         assert!(rendered.contains("demo"));
         assert!(rendered.contains("rotten"));
         assert!(rendered.contains("dirty"));
+    }
+
+    #[test]
+    fn render_prune_reports_an_unknown_worktree_state_as_its_own_reason() {
+        let report = PruneReport {
+            removed: Vec::new(),
+            skipped: vec![PruneSkip { name: "demo".to_string(), reason: SkipReason::Unknown }],
+        };
+
+        let rendered = render_prune(&report);
+
+        // This line is what the user reads before deciding whether to pass
+        // --force, and "dirty" would send them looking for uncommitted changes
+        // in a worktree whose repository is gone.
+        assert!(rendered.contains("unknown"));
     }
 
     #[test]
