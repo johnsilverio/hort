@@ -283,6 +283,32 @@ fn cli_up_leaves_no_sandbox_behind_when_it_cannot_build() {
 }
 
 #[test]
+fn cli_up_refuses_a_directory_that_is_not_a_project() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    // A configuration with no rootfs, so the refusal has to come before the host
+    // preconditions to be the message the user reads. Standing in the wrong
+    // directory is what the person got wrong, and sending them off to prepare a
+    // rootfs first would send them to fix something else.
+    let (_config, config_home) = temp_config_home("{}");
+    let plain = TempDir::new().unwrap();
+    let plain_path = plain.path().canonicalize().unwrap();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .current_dir(&plain_path)
+        .args(["up", "demo"])
+        .assert()
+        .code(1)
+        .stderr(format!(
+            "'{}' is not a project — run hort from a git repository, or add a .hort.json there to sandbox the directory itself\n",
+            plain_path.display()
+        ));
+}
+
+#[test]
 fn cli_ls_lists_sandboxes_despite_a_malformed_project_config() {
     let xdg = TempDir::new().unwrap();
     let xdg_root = xdg.path().canonicalize().unwrap();
@@ -386,6 +412,56 @@ fn cli_up_reports_a_configuration_advisory_on_stderr() {
         .args(["down", "cfgdemo"])
         .assert()
         .success();
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_down_without_git_leaves_the_project_folder() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let state_root = xdg_root.join("hort");
+    let runtime = TempDir::new().unwrap();
+    let runtime_root = runtime.path().canonicalize().unwrap();
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let project = TempDir::new().unwrap();
+    let project_path = project.path().canonicalize().unwrap();
+    // No git here: the marker file is the whole of what makes this a project.
+    fs::write(project_path.join(".hort.json"), "{}").unwrap();
+    fs::write(project_path.join("notes.md"), "work in progress\n").unwrap();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .current_dir(&project_path)
+        .args(["up", "nogitdemo"])
+        .assert()
+        .success();
+
+    let record = FileMetadataStore::new(state_root.clone())
+        .get(&SandboxName::new("nogitdemo").unwrap())
+        .unwrap()
+        .expect("up records the sandbox it built");
+    assert_eq!(record.worktree_path(), project_path);
+    assert_eq!(record.branch(), None);
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .current_dir(&project_path)
+        .args(["down", "nogitdemo"])
+        .assert()
+        .success();
+
+    // The folder hort mounted is the user's own, and tearing the sandbox down
+    // must leave it exactly where it was, contents and all.
+    assert!(project_path.join("notes.md").exists());
+    assert!(project_path.join(".hort.json").exists());
+    assert!(!state_root.join("sandboxes").join("nogitdemo").exists());
 }
 
 #[test]

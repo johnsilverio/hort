@@ -47,6 +47,9 @@ pub enum HortError {
     UpInProgress { name: String },
     /// `up`: a branch flag was given in a project that is not a git repository.
     BranchRequiresGit,
+    /// `up`: the directory is neither a git repository nor marked as a project,
+    /// so nothing there authorizes hort to hand it to a sandbox.
+    NotAProject { path: String },
     /// `attach`: the name has metadata but no live anchor.
     SandboxNotRunning { name: String },
     /// `attach`: no sandbox of this name is known ("what's alive" wording).
@@ -160,6 +163,10 @@ impl fmt::Display for HortError {
             HortError::BranchRequiresGit => {
                 write!(f, "--branch requires a git repository, but this project is not one")
             }
+            HortError::NotAProject { path } => write!(
+                f,
+                "'{path}' is not a project — run hort from a git repository, or add a .hort.json there to sandbox the directory itself"
+            ),
             HortError::SandboxNotRunning { name } => write!(
                 f,
                 "sandbox '{name}' is not running (run 'hort up {name}' to start it, or 'hort prune' to clean up the stale record)"
@@ -277,6 +284,16 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "--branch requires a git repository, but this project is not one"
+        );
+    }
+
+    #[test]
+    fn not_a_project_error_renders_canonical_string() {
+        let error = HortError::NotAProject { path: "/home/tester/Downloads".to_string() };
+
+        assert_eq!(
+            error.to_string(),
+            "'/home/tester/Downloads' is not a project — run hort from a git repository, or add a .hort.json there to sandbox the directory itself"
         );
     }
 

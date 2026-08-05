@@ -145,10 +145,11 @@ fn expand_home(value: &str, home: &Path) -> String {
 /// Find the project root by walking up from `start` to the first directory that
 /// holds a project marker: `.hort.json`, `.devcontainer/devcontainer.json`, or
 /// `.git`. The nearest marker wins, so a subproject inside a larger repository
-/// resolves to the subproject. With no marker anywhere up the chain, `start`
-/// itself is the project.
-pub fn find_project_dir(start: &Path) -> PathBuf {
-    start.ancestors().find(|dir| holds_project_marker(dir)).unwrap_or(start).to_path_buf()
+/// resolves to the subproject. With no marker anywhere up the chain there is no
+/// project, which is a different answer from "the directory you happen to be
+/// standing in".
+pub fn find_project_dir(start: &Path) -> Option<PathBuf> {
+    start.ancestors().find(|dir| holds_project_marker(dir)).map(Path::to_path_buf)
 }
 
 /// Whether a directory looks like a project root. Each marker is tested for mere
@@ -432,7 +433,7 @@ mod tests {
 
         let found = find_project_dir(&start);
 
-        assert_eq!(found, project);
+        assert_eq!(found, Some(project));
     }
 
     #[test]
@@ -445,7 +446,7 @@ mod tests {
 
         let found = find_project_dir(&start);
 
-        assert_eq!(found, project);
+        assert_eq!(found, Some(project));
     }
 
     #[test]
@@ -458,7 +459,7 @@ mod tests {
 
         let found = find_project_dir(&start);
 
-        assert_eq!(found, repo);
+        assert_eq!(found, Some(repo));
     }
 
     #[test]
@@ -473,11 +474,11 @@ mod tests {
 
         let found = find_project_dir(&start);
 
-        assert_eq!(found, worktree);
+        assert_eq!(found, Some(worktree));
     }
 
     #[test]
-    fn find_project_dir_falls_back_to_the_starting_directory() {
+    fn find_project_dir_finds_no_project_without_a_marker() {
         // Assumes no project marker sits above the scratch directory, which holds
         // for a temp root under the system temp dir.
         let (_root, root) = temp_dir();
@@ -486,6 +487,6 @@ mod tests {
 
         let found = find_project_dir(&start);
 
-        assert_eq!(found, start);
+        assert_eq!(found, None);
     }
 }

@@ -148,11 +148,13 @@ mod tests {
     }
 
     #[test]
-    fn down_no_git_keeps_user_folder() {
+    fn down_leaves_the_project_folder_without_git() {
+        // The record a build without git writes: no branch, and a worktree path
+        // that is the user's own project folder rather than anything hort made.
         let record = SandboxRecord::new(
             SandboxName::new("demo").unwrap(),
             None,
-            PathBuf::from("/state/sandboxes/demo/worktree-demo"),
+            PathBuf::from("/home/tester/project"),
             PathBuf::from("/state/sandboxes/demo/overlay"),
             "2026-06-11T12:00:00Z".to_string(),
             "2026-06-11T12:00:00Z".to_string(),

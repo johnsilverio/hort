@@ -102,6 +102,7 @@ pub struct FakeRuntime {
     start_fails: bool,
     started_env: RefCell<Vec<(String, String)>>,
     started_rootfs: RefCell<PathBuf>,
+    started_workdir: RefCell<PathBuf>,
     started_resources: RefCell<Option<ResourceLimits>>,
     sessions: RefCell<Vec<SessionSpec>>,
     teardowns: RefCell<Vec<SandboxName>>,
@@ -118,6 +119,7 @@ impl FakeRuntime {
             start_fails: false,
             started_env: RefCell::new(Vec::new()),
             started_rootfs: RefCell::new(PathBuf::new()),
+            started_workdir: RefCell::new(PathBuf::new()),
             started_resources: RefCell::new(None),
             sessions: RefCell::new(Vec::new()),
             teardowns: RefCell::new(Vec::new()),
@@ -146,6 +148,12 @@ impl FakeRuntime {
     /// The base rootfs of the spec the last `start_anchor` was handed.
     pub fn started_rootfs(&self) -> PathBuf {
         self.started_rootfs.borrow().clone()
+    }
+
+    /// The host directory the spec the last `start_anchor` was handed binds at
+    /// `/workdir`.
+    pub fn started_workdir(&self) -> PathBuf {
+        self.started_workdir.borrow().clone()
     }
 
     /// The memory ceiling of the spec the last `start_anchor` was handed.
@@ -187,6 +195,7 @@ impl ContainerRuntime for FakeRuntime {
     fn start_anchor(&self, spec: &OciSpec) -> Result<LivenessToken, HortError> {
         self.started_env.borrow_mut().clone_from(&spec.env);
         self.started_rootfs.borrow_mut().clone_from(&spec.rootfs);
+        self.started_workdir.borrow_mut().clone_from(&spec.workdir);
         *self.started_resources.borrow_mut() = spec
             .resources
             .as_ref()

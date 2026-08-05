@@ -91,6 +91,10 @@ pub struct RealDeps {
     /// Kept so `prune` can derive a corrupt entry's canonical worktree path,
     /// which has no record to read it from.
     state_root: PathBuf,
+    /// The project a marker declares, `None` when nothing declares one.
+    project_dir: Option<PathBuf>,
+    /// Where hort was invoked, which is the directory a refusal names.
+    current_dir: PathBuf,
 }
 
 impl RealDeps {
@@ -120,22 +124,27 @@ impl RealDeps {
                 detail: format!("could not resolve the current directory: {error}"),
             })?;
         // One notion of where the project is, so what the configuration is read
-        // from and what the worktrees are cut from cannot come to disagree.
+        // from and what the worktrees are cut from cannot come to disagree. With
+        // no project at all the adapters still need a directory to point at, and
+        // what refuses to build on an unmarked one is the command.
         let project_dir = find_project_dir(&current_dir);
+        let adapters_dir = project_dir.clone().unwrap_or_else(|| current_dir.clone());
 
         Ok(Self {
             lock: FlockSandboxLock::new(state_root.clone()),
             store: FileMetadataStore::new(state_root.clone()),
             probe: ProcLivenessProbe,
-            worktrees: GitWorktreeProvider::new(project_dir.clone(), state_root.clone()),
+            worktrees: GitWorktreeProvider::new(adapters_dir.clone(), state_root.clone()),
             runtime: LibcontainerRuntime::new(resolve_youki_root(), state_root.clone()),
             sessions: NullRuntime,
             network: PastaNetworkProvider::new(state_root.clone()),
             clock: SystemClock,
             confirmer: StdinConfirmer,
             env: HostEnvironmentProbe,
-            config: ConfigResolver::new(resolve_config_root()?, project_dir, home_dir()?),
+            config: ConfigResolver::new(resolve_config_root()?, adapters_dir, home_dir()?),
             state_root,
+            project_dir,
+            current_dir,
         })
     }
 }
@@ -215,6 +224,8 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<(), HortError> {
                 &deps.clock,
                 &deps.env,
                 deps.state_root.clone(),
+                deps.project_dir.clone(),
+                deps.current_dir.clone(),
                 &config,
             );
             let warnings = command.run(name, branch)?;

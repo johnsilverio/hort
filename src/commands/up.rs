@@ -1,10 +1,11 @@
 //! `up <name>`: build a sandbox, or resume a half-built one of the same name.
 //!
-//! Checks the host and rootfs preconditions before it takes anything, acquires
-//! the per-name build lock, decides admission against the recorded and live
-//! state, creates or reuses the worktree, persists the metadata record before the
-//! container starts, then records the anchor's liveness token and provisions
-//! networking. This slice is git mode and always detached.
+//! Refuses a directory no marker declares a project, checks the host and rootfs
+//! preconditions before it takes anything, acquires the per-name build lock,
+//! decides admission against the recorded and live state, creates or reuses the
+//! worktree (or mounts the project folder itself where there is no git),
+//! persists the metadata record before the container starts, then records the
+//! anchor's liveness token and provisions networking. Always detached.
 
 use std::path::{Path, PathBuf};
 
@@ -35,6 +36,12 @@ pub struct UpCommand<'a> {
     clock: &'a dyn Clock,
     env: &'a dyn EnvironmentProbe,
     state_root: PathBuf,
+    /// The project a marker declares, `None` when nothing up the chain declares
+    /// one. Without git this directory is what backs `/workdir`, and its absence
+    /// is what a build refuses on.
+    project_dir: Option<PathBuf>,
+    /// Where hort was invoked, which is the directory a refusal names.
+    current_dir: PathBuf,
     config: &'a ResolvedConfig,
 }
 
@@ -51,6 +58,8 @@ impl<'a> UpCommand<'a> {
         clock: &'a dyn Clock,
         env: &'a dyn EnvironmentProbe,
         state_root: PathBuf,
+        project_dir: Option<PathBuf>,
+        current_dir: PathBuf,
         config: &'a ResolvedConfig,
     ) -> Self {
         Self {
@@ -64,6 +73,8 @@ impl<'a> UpCommand<'a> {
             clock,
             env,
             state_root,
+            project_dir,
+            current_dir,
             config,
         }
     }
@@ -78,6 +89,15 @@ impl UpCommand<'_> {
         name: SandboxName,
         branch: Option<BranchName>,
     ) -> Result<Vec<Warning>, HortError> {
+        // Asked before anything about the host, because it asks a different
+        // question: the host checks answer whether sandboxes can be built here at
+        // all, this one answers whether hort was given anything to sandbox. It is
+        // also what keeps a build off whatever directory the shell happened to be
+        // in, so it cannot sit behind checks that need a real kernel to reach.
+        let Some(project_dir) = self.project_dir.as_ref() else {
+            return Err(HortError::NotAProject { path: self.current_dir.display().to_string() });
+        };
+
         let host = self.env.detect();
         let rootfs_facts = self.config.rootfs.as_deref().map(|configured| {
             self.env.inspect_rootfs(Path::new(configured), self.config.shell.as_deref())
@@ -106,7 +126,6 @@ impl UpCommand<'_> {
         }
 
         let sandbox_dir = self.state_root.join("sandboxes").join(name.as_str());
-        let worktree_path = sandbox_dir.join(format!("worktree-{}", name.as_str()));
         let overlay_path = sandbox_dir.join("overlay");
 
         let stored = self.store.get(&name)?;
@@ -120,21 +139,32 @@ impl UpCommand<'_> {
                 .then_some(SandboxState::LostRecord),
         };
 
+        // The fork sits above every read below, not just above the worktree
+        // creation: listing worktrees is already a git command, and outside a
+        // repository it is the first one to fail. Without git the project folder
+        // itself is what the sandbox mounts and there is no branch at all.
+        let git = self.worktrees.is_git_repo()?;
+        let worktree_path = if git {
+            sandbox_dir.join(format!("worktree-{}", name.as_str()))
+        } else {
+            project_dir.clone()
+        };
         let worktree_listed =
-            self.worktrees.list()?.iter().any(|worktree| worktree.path == worktree_path);
+            git && self.worktrees.list()?.iter().any(|worktree| worktree.path == worktree_path);
         let own = stored.is_some() || worktree_listed;
 
-        let (intent, branch_to_checkout) = match &branch {
-            None => {
+        let (intent, branch_to_checkout) = match (git, &branch) {
+            (false, _) => (BranchIntent::NoGit { branch_flag: branch.is_some() }, None),
+            (true, None) => {
                 let own_branch = BranchName::new(name.as_str())?;
                 let branch_taken = self.worktrees.branch_exists(&own_branch)? && !own;
-                (BranchIntent::CreateNew { branch_taken }, own_branch)
+                (BranchIntent::CreateNew { branch_taken }, Some(own_branch))
             }
-            Some(target) => {
+            (true, Some(target)) => {
                 let checked_out_elsewhere = self.worktrees.is_checked_out(target)?;
                 (
                     BranchIntent::UseExisting { branch: target.clone(), checked_out_elsewhere },
-                    target.clone(),
+                    Some(target.clone()),
                 )
             }
         };
@@ -143,6 +173,9 @@ impl UpCommand<'_> {
             return Err(error);
         }
 
+        // Past the selection a branch flag means git mode, because without git the
+        // flag was already refused: adding a git test here would be dead, and
+        // dropping the selection above would put a git read in the no-git arm.
         if let Some(target) = &branch
             && !self.worktrees.branch_exists(target)?
         {
@@ -152,8 +185,10 @@ impl UpCommand<'_> {
             });
         }
 
-        if !worktree_listed {
-            self.worktrees.create(&name, &branch_to_checkout)?;
+        if let Some(target) = &branch_to_checkout
+            && !worktree_listed
+        {
+            self.worktrees.create(&name, target)?;
         }
 
         // Persist the record before the anchor starts: if the container then fails
@@ -165,7 +200,7 @@ impl UpCommand<'_> {
                 let timestamp = humantime::format_rfc3339(self.clock.now()).to_string();
                 let fresh = SandboxRecord::new(
                     name.clone(),
-                    Some(branch_to_checkout),
+                    branch_to_checkout,
                     worktree_path.clone(),
                     overlay_path.clone(),
                     timestamp.clone(),
@@ -277,6 +312,8 @@ mod tests {
             clock,
             env,
             state_root: PathBuf::from("/state"),
+            project_dir: Some(PathBuf::from("/project")),
+            current_dir: PathBuf::from("/project"),
             config,
         }
     }
@@ -904,6 +941,183 @@ mod tests {
         command.run(SandboxName::new("demo").unwrap(), None).unwrap();
 
         assert_eq!(network.provisioned_forwards(), vec![("127.0.0.1".to_string(), 5432)]);
+    }
+
+    #[test]
+    fn up_builds_from_the_project_folder_without_git() {
+        let project = PathBuf::from("/home/tester/project");
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new().no_git();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let command = UpCommand {
+            project_dir: Some(project.clone()),
+            current_dir: project.clone(),
+            ..up_command(
+                &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
+                &config,
+            )
+        };
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        assert_eq!(runtime.started_workdir(), project);
+    }
+
+    #[test]
+    fn up_records_no_branch_without_git() {
+        let project = PathBuf::from("/home/tester/project");
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new().no_git();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let command = UpCommand {
+            project_dir: Some(project.clone()),
+            current_dir: project,
+            ..up_command(
+                &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
+                &config,
+            )
+        };
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // A null branch is what every later reader keys on, teardown included, so
+        // a sandbox that loses it is one whose teardown starts deleting the
+        // user's own folder.
+        let persisted = store.get(&SandboxName::new("demo").unwrap()).unwrap().unwrap();
+        assert_eq!(persisted.branch(), None);
+    }
+
+    #[test]
+    fn up_creates_no_worktree_without_git() {
+        let project = PathBuf::from("/home/tester/project");
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new().no_git();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let command = UpCommand {
+            project_dir: Some(project.clone()),
+            current_dir: project,
+            ..up_command(
+                &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
+                &config,
+            )
+        };
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        assert!(worktrees.creates().is_empty());
+    }
+
+    #[test]
+    fn up_refuses_a_directory_that_is_not_a_project() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new().no_git();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let command = UpCommand {
+            project_dir: None,
+            current_dir: PathBuf::from("/home/tester/Downloads"),
+            ..up_command(
+                &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
+                &config,
+            )
+        };
+
+        let result = command.run(SandboxName::new("demo").unwrap(), None);
+
+        // What authorizes hort to hand a host folder to a sandbox running an
+        // agent with no permission limits is the user having left a marker file
+        // there, never where the shell happened to be.
+        assert_eq!(
+            result,
+            Err(HortError::NotAProject { path: "/home/tester/Downloads".to_string() })
+        );
+    }
+
+    #[test]
+    fn up_reports_branch_requires_git_for_the_branch_flag_without_git() {
+        let project = PathBuf::from("/home/tester/project");
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new().no_git();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let command = UpCommand {
+            project_dir: Some(project.clone()),
+            current_dir: project,
+            ..up_command(
+                &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
+                &config,
+            )
+        };
+
+        let result = command
+            .run(SandboxName::new("demo").unwrap(), Some(BranchName::new("feature-x").unwrap()));
+
+        assert_eq!(result, Err(HortError::BranchRequiresGit));
+    }
+
+    #[test]
+    fn up_refuses_a_directory_that_is_not_a_project_even_with_the_branch_flag() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new().no_git();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let command = UpCommand {
+            project_dir: None,
+            current_dir: PathBuf::from("/home/tester/Downloads"),
+            ..up_command(
+                &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
+                &config,
+            )
+        };
+
+        let result = command
+            .run(SandboxName::new("demo").unwrap(), Some(BranchName::new("feature-x").unwrap()));
+
+        // Whether a branch flag is legal here is a question about a project, and
+        // there is no project to ask it about.
+        assert_eq!(
+            result,
+            Err(HortError::NotAProject { path: "/home/tester/Downloads".to_string() })
+        );
     }
 
     #[test]
