@@ -10,6 +10,7 @@
 
 use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::domain::error::HortError;
@@ -90,13 +91,19 @@ impl MetadataStore for FileMetadataStore {
     }
 
     fn remove(&self, name: &SandboxName) -> Result<(), HortError> {
-        match fs::remove_dir_all(self.sandbox_dir(name)) {
+        let sandbox_dir = self.sandbox_dir(name);
+        match fs::remove_dir_all(&sandbox_dir) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(corrupt(format!(
-                "could not remove sandbox state for '{}': {error}",
-                name.as_str()
-            ))),
+            Err(_) => {
+                take_back_traversal(&sandbox_dir);
+                fs::remove_dir_all(&sandbox_dir).map_err(|error| {
+                    corrupt(format!(
+                        "could not remove sandbox state for '{}': {error}",
+                        name.as_str()
+                    ))
+                })
+            }
         }
     }
 
@@ -192,6 +199,25 @@ fn load(path: &Path) -> Result<Option<SandboxRecord>, HortError> {
     Ok(Some(record))
 }
 
+/// Give the owner back the right to enter and read every directory under this
+/// one, so what is inside can be removed.
+///
+/// Mounting a sandbox's writable layer leaves a work directory behind that the
+/// kernel takes every permission off, its owner included, and a recursive remove
+/// stops at one of those. Everything under a sandbox's directory belongs to hort
+/// and is on its way out, so the modes there are nothing to preserve. Each step
+/// is attempted and never insisted on: this runs to make the removal that failed
+/// possible, and that removal reports what is still in the way.
+fn take_back_traversal(dir: &Path) {
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            take_back_traversal(&entry.path());
+        }
+    }
+}
+
 fn corrupt(detail: String) -> HortError {
     HortError::CorruptMetadata { detail }
 }
@@ -201,6 +227,7 @@ mod tests {
     use super::*;
 
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     use crate::fakes::{
@@ -258,6 +285,25 @@ mod tests {
         metadata_store_remove_is_idempotent_for_missing_name(FileMetadataStore::new(
             dir.path().to_path_buf(),
         ));
+    }
+
+    #[test]
+    fn file_store_remove_clears_a_directory_the_overlay_left_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileMetadataStore::new(dir.path().to_path_buf());
+        let sandbox_dir = dir.path().join("sandboxes").join("demo");
+        let left_behind = sandbox_dir.join("overlay").join("work").join("work");
+        fs::create_dir_all(&left_behind).unwrap();
+        fs::set_permissions(&left_behind, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = store.remove(&SandboxName::new("demo").unwrap());
+
+        // Mounting the sandbox's own writable layer leaves this behind, and the
+        // kernel takes every permission off it, its owner included. A teardown
+        // that gives up here can never remove a sandbox that really ran, and no
+        // amount of reconciling later gets past it either.
+        assert!(result.is_ok());
+        assert!(!sandbox_dir.exists());
     }
 
     #[test]
