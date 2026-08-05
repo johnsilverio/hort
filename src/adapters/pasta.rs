@@ -70,6 +70,14 @@ impl PastaNetworkProvider {
     }
 
     fn wire(&self, spec: &NetworkSpec) -> Result<(), String> {
+        // Building a name that already has helpers running is a resume, and what
+        // it left behind serves a namespace that is gone: pasta is told not to
+        // leave when that happens, and the proxy and the forwarding answer on the
+        // host, where nothing ever held them up. Starting new ones over them
+        // takes their place in the only files that record them, and leaves them
+        // running for as long as the machine is up.
+        self.stop(&spec.name)?;
+
         let netns = File::open(&spec.netns).map_err(|err| {
             format!("opening the sandbox network namespace {}: {err}", spec.netns.display())
         })?;
@@ -769,6 +777,19 @@ mod privileged_tests {
         recorded.trim().parse().expect("a pid")
     }
 
+    /// Whether the port stops answering, waiting for it: a signalled process
+    /// takes a moment to leave.
+    fn stopped_answering_within_deadline(port: u16) -> bool {
+        let deadline = Instant::now() + PASTA_DEADLINE;
+        while Instant::now() < deadline {
+            if TcpStream::connect(("127.0.0.1", port)).is_err() {
+                return true;
+            }
+            sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
     /// Whether the process is gone, waiting for it: a signalled process takes a
     /// moment to leave the process table.
     fn stopped_within_deadline(pid: u32) -> bool {
@@ -1000,6 +1021,72 @@ mod privileged_tests {
         // sandbox would be a chokepoint nobody asked for and a second thing to
         // stop for no gain.
         assert_eq!(proxy::recorded_port(&sandbox_dir(state_root.path())), None);
+        provider.teardown(&spec.name).unwrap();
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+    #[serial]
+    fn provisioning_a_resumed_sandbox_stops_the_pasta_it_left_behind() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = LibcontainerRuntime::new(
+            youki_root.path().to_path_buf(),
+            state_root.path().to_path_buf(),
+        );
+        let spec = sandbox_spec(rootfs, state_root.path());
+        let first = runtime.start_anchor(&spec).unwrap();
+        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        provider.provision(&open_network(&spec.name, first.pid.0)).unwrap();
+        let left_behind = recorded_pasta_pid(state_root.path());
+        runtime.teardown(&spec.name).unwrap();
+
+        let resumed = runtime.start_anchor(&spec).unwrap();
+        provider.provision(&open_network(&spec.name, resumed.pid.0)).unwrap();
+
+        // pasta is told not to leave when the namespace it serves goes away,
+        // which is what keeps a sandbox wired while nothing else holds it, and is
+        // also why the one whose anchor died is still running when the same name
+        // is built again. Provisioning that only starts things leaves that one
+        // running for good and overwrites the only record of it.
+        assert!(stopped_within_deadline(left_behind));
+        provider.teardown(&spec.name).unwrap();
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+    #[serial]
+    fn allowlist_provisioning_of_a_resumed_sandbox_stops_the_proxy_it_left_behind() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = LibcontainerRuntime::new(
+            youki_root.path().to_path_buf(),
+            state_root.path().to_path_buf(),
+        );
+        let spec = sandbox_spec(rootfs, state_root.path());
+        let first = runtime.start_anchor(&spec).unwrap();
+        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        provider
+            .provision(&allowlist_network_permitting_one_host(&spec.name, first.pid.0))
+            .unwrap();
+        let left_behind =
+            proxy::recorded_port(&sandbox_dir(state_root.path())).expect("a proxy port");
+        runtime.teardown(&spec.name).unwrap();
+
+        let resumed = runtime.start_anchor(&spec).unwrap();
+        provider
+            .provision(&allowlist_network_permitting_one_host(&spec.name, resumed.pid.0))
+            .unwrap();
+
+        // The proxy answers on the host loopback, which no sandbox namespace
+        // holds up, so it survives its sandbox exactly as pasta does. One left
+        // behind holds a port for good and keeps enforcing a list the sandbox it
+        // was started for no longer has.
+        assert!(stopped_answering_within_deadline(left_behind));
         provider.teardown(&spec.name).unwrap();
         runtime.teardown(&spec.name).unwrap();
     }

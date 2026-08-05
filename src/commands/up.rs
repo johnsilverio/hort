@@ -38,6 +38,37 @@ pub struct UpCommand<'a> {
     config: &'a ResolvedConfig,
 }
 
+impl<'a> UpCommand<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        lock: &'a dyn SandboxLock,
+        store: &'a dyn MetadataStore,
+        probe: &'a dyn LivenessProbe,
+        registry: &'a dyn ContainerRegistry,
+        worktrees: &'a dyn WorktreeProvider,
+        runtime: &'a dyn ContainerRuntime,
+        network: &'a dyn NetworkProvider,
+        clock: &'a dyn Clock,
+        env: &'a dyn EnvironmentProbe,
+        state_root: PathBuf,
+        config: &'a ResolvedConfig,
+    ) -> Self {
+        Self {
+            lock,
+            store,
+            probe,
+            registry,
+            worktrees,
+            runtime,
+            network,
+            clock,
+            env,
+            state_root,
+            config,
+        }
+    }
+}
+
 impl UpCommand<'_> {
     /// Build (or resume) the sandbox, returning the advisories the user has to
     /// hear: a resource cap the host cannot enforce, and whatever later slices
