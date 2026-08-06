@@ -93,11 +93,6 @@ pub enum HortError {
     /// is not a canonical product string, so callers match the variant, not the
     /// text.
     NetworkProviderFailed { detail: String },
-    /// The container runtime is not available in this build. The placeholder
-    /// runtime adapter returns this for any operation that would start a real
-    /// container; it disappears once the embedded runtime lands. Its message is
-    /// not a canonical product string.
-    RuntimeUnavailable,
     /// Preparing the state directory failed: creating or resolving the root hort
     /// keeps its records under. Carries a human-readable detail; the rendered
     /// message is not a canonical product string, so callers match the variant,
@@ -198,9 +193,6 @@ impl fmt::Display for HortError {
             }
             HortError::NetworkProviderFailed { detail } => {
                 write!(f, "sandbox networking failed: {detail}")
-            }
-            HortError::RuntimeUnavailable => {
-                write!(f, "the container runtime is not available in this build")
             }
             HortError::StateIo { detail } => write!(f, "state directory error: {detail}"),
         }

@@ -1,6 +1,6 @@
 //! The container half of a sandbox: `LibcontainerRuntime`, the embedded OCI
 //! runtime that starts and stops the anchor, and `NullRuntime`, the honest
-//! stand-in the binary still wires while the embedded one is being built.
+//! stand-in that answers no session while the process list is being built.
 //!
 //! Starting an anchor is a fork, not an unshare in place. Creating a user
 //! namespace requires a single-threaded process, and hort's own process has to
@@ -82,29 +82,8 @@ const HANDSHAKE: [u8; 1] = [1];
 const PROCESS_FAILED: u8 = 0;
 const PROCESS_STARTED: u8 = 1;
 
-/// A `ContainerRuntime` (and the read ports the embedded runtime will also serve)
-/// for builds without the in-process container runtime.
+/// A `SessionProbe` for builds without the per-sandbox process list.
 pub struct NullRuntime;
-
-impl ContainerRuntime for NullRuntime {
-    fn start_anchor(&self, _spec: &OciSpec) -> Result<LivenessToken, HortError> {
-        Err(HortError::RuntimeUnavailable)
-    }
-
-    fn join_session(&self, _spec: &SessionSpec) -> Result<Session, HortError> {
-        Err(HortError::RuntimeUnavailable)
-    }
-
-    fn teardown(&self, _name: &SandboxName) -> Result<(), HortError> {
-        Ok(())
-    }
-}
-
-impl ContainerRegistry for NullRuntime {
-    fn list_live(&self) -> Result<Vec<RegistryEntry>, HortError> {
-        Ok(Vec::new())
-    }
-}
 
 impl SessionProbe for NullRuntime {
     fn session_pids(&self, _name: &SandboxName) -> Result<Vec<u32>, HortError> {

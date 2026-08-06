@@ -13,7 +13,6 @@ pub mod liveness;
 pub mod lock;
 pub mod metadata;
 pub mod namespaces;
-pub mod network;
 pub mod notify;
 pub mod pasta;
 pub mod prompt;
