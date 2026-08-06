@@ -15,6 +15,13 @@
 //! declares no network namespace, so a session ends up wherever its caller was
 //! unless the caller enters the sandbox's network namespace first.
 //!
+//! A session that asks for a terminal gets one of the sandbox's own, made from
+//! the sandbox's `/dev/pts` and handed back over a socket. Two things about that
+//! are not free to move: the socket has to be listening before the fork, because
+//! what connects to it is the process building the session, and the status of a
+//! session is only readable because this process claims every session it starts
+//! before forking away from it.
+//!
 //! Enumerating the live anchors reads the same state back. Loading a container
 //! refreshes its status against the `/proc` entry of the pid it recorded, so
 //! walking the state root and loading each entry answers which anchors are up
@@ -29,11 +36,13 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, PipeReader, PipeWriter, Read, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use libcontainer::container::builder::ContainerBuilder;
 use libcontainer::container::{Container, ContainerStatus};
@@ -46,14 +55,15 @@ use libcontainer::syscall::syscall::SyscallType;
 use libcontainer::workload::default::DefaultExecutor;
 use libcontainer::workload::{Executor, ExecutorError, ExecutorValidationError};
 
+use crate::adapters::console;
 use crate::adapters::landlock;
 use crate::adapters::namespaces::{enter, owning_user_namespace};
 use crate::adapters::streams::open_sandbox_log;
 use crate::domain::error::HortError;
 use crate::domain::model::{AnchorPid, LivenessToken, MountNsInode, SandboxName};
 use crate::ports::{
-    ContainerRegistry, ContainerRuntime, OciSpec, RegistryEntry, ResourceLimits, SessionProbe,
-    SessionSpec,
+    ContainerRegistry, ContainerRuntime, OciSpec, RegistryEntry, ResourceLimits, Session,
+    SessionProbe, SessionSpec,
 };
 
 const SANDBOXES_DIR: &str = "sandboxes";
@@ -81,7 +91,7 @@ impl ContainerRuntime for NullRuntime {
         Err(HortError::RuntimeUnavailable)
     }
 
-    fn join_session(&self, _spec: &SessionSpec) -> Result<u32, HortError> {
+    fn join_session(&self, _spec: &SessionSpec) -> Result<Session, HortError> {
         Err(HortError::RuntimeUnavailable)
     }
 
@@ -159,6 +169,17 @@ impl LibcontainerRuntime {
         start_container(&spec.name, &bundle, &self.youki_root, streams)
     }
 
+    /// The console this session asks for, or `None` when it asks for no terminal
+    /// and runs on the streams it inherits instead.
+    fn console_for(&self, spec: &SessionSpec) -> Result<Option<SessionConsole>, HortError> {
+        if !spec.terminal {
+            return Ok(None);
+        }
+        SessionConsole::open(&self.sandbox_dir(&spec.name), spec)
+            .map(Some)
+            .map_err(|detail| runtime_failure(format!("join_session: {detail}")))
+    }
+
     /// The pid of a running sandbox's anchor, taken from the container state the
     /// runtime keeps. It is the anchor's namespaces a session climbs into, and
     /// naming it here is what spares the caller from carrying it around.
@@ -216,13 +237,15 @@ impl ContainerRuntime for LibcontainerRuntime {
         }
     }
 
-    fn join_session(&self, spec: &SessionSpec) -> Result<u32, HortError> {
+    fn join_session(&self, spec: &SessionSpec) -> Result<Session, HortError> {
         let anchor = self.anchor_pid(&spec.name)?;
         // Read here, and not where it is applied: by then the session is inside
         // the sandbox, whose root holds no host state directory to read from.
         let reachable = landlock::recorded_connect_ports(&self.sandbox_dir(&spec.name))
             .map_err(|detail| runtime_failure(format!("join_session: {detail}")))?;
+        let console = self.console_for(spec)?;
         let (report_reader, report_writer) = channel()?;
+        become_subreaper()?;
 
         // The climb crosses a user namespace, which only a single-threaded
         // process may do, and hort's own process has to stay on the host anyway.
@@ -235,14 +258,31 @@ impl ContainerRuntime for LibcontainerRuntime {
                 let session = ConfinedSession { connect_ports: reachable };
                 report_and_exit(
                     report_writer,
-                    open_session(spec, anchor, &self.youki_root, session),
+                    open_session(spec, anchor, &self.youki_root, session, console.as_ref()),
                 );
             }
             child => {
                 drop(report_writer);
+                // Taken while the child is still building, which is when the
+                // terminal is sent. However that goes, the report is still read
+                // and the child still reaped afterwards, so a console that failed
+                // leaves behind no session nobody is going to hear about.
+                let master = match &console {
+                    Some(console) => console.accept_master(&report_reader),
+                    None => Ok(None),
+                };
                 let report = read_report(report_reader, "join_session");
                 reap(child);
-                report
+
+                let pid = report?;
+                let pty =
+                    master.map_err(|detail| runtime_failure(format!("join_session: {detail}")))?;
+                if console.is_some() && pty.is_none() {
+                    return Err(runtime_failure(
+                        "join_session: the session started without the terminal it asked for",
+                    ));
+                }
+                Ok(Session { pid, pty })
             }
         }
     }
@@ -496,6 +536,139 @@ fn anchor_streams(sandbox_dir: &Path) -> Result<AnchorStreams, String> {
     })
 }
 
+/// What one session's terminal takes on the host: the file the tenant reads its
+/// terminal request from, and the socket the sandbox sends the pty master back
+/// on.
+///
+/// Both belong to a single session and are removed once it has been opened. Two
+/// attaches to the same sandbox at the same time are ordinary, and neither may
+/// find the other's socket.
+struct SessionConsole {
+    process_file: PathBuf,
+    socket_path: PathBuf,
+    listener: UnixListener,
+}
+
+impl SessionConsole {
+    fn open(sandbox_dir: &Path, spec: &SessionSpec) -> Result<Self, String> {
+        fs::create_dir_all(sandbox_dir)
+            .map_err(|err| format!("creating {}: {err}", sandbox_dir.display()))?;
+        let session = format!("session-{}-{}", std::process::id(), next_session_number());
+        let process_file = sandbox_dir.join(format!("{session}.process.json"));
+        let process = serde_json::to_vec(&session_process(spec))
+            .map_err(|err| format!("describing the session process: {err}"))?;
+        fs::write(&process_file, process)
+            .map_err(|err| format!("writing {}: {err}", process_file.display()))?;
+
+        // Bound before the fork, because the sandbox connects from inside the
+        // build and finds nothing to connect to if this is left until after it.
+        let socket_name = format!("{session}.console");
+        let listener = listen_in(sandbox_dir, &socket_name)?;
+        Ok(Self { process_file, socket_path: sandbox_dir.join(socket_name), listener })
+    }
+
+    /// The pty master the sandbox sends, waited for while the session is being
+    /// built. `None` means the build reported before it ever connected: the
+    /// report the caller reads next says why, and waiting for a master that will
+    /// never arrive hangs instead of reporting it.
+    fn accept_master(&self, report: &PipeReader) -> Result<Option<OwnedFd>, String> {
+        if !readable_before_report(self.listener.as_raw_fd(), report)? {
+            return Ok(None);
+        }
+        let (stream, _) = self
+            .listener
+            .accept()
+            .map_err(|err| format!("accepting the console connection: {err}"))?;
+        if !readable_before_report(stream.as_raw_fd(), report)? {
+            return Ok(None);
+        }
+        console::receive_descriptor(&stream).map(Some)
+    }
+}
+
+impl Drop for SessionConsole {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.socket_path);
+        let _ = fs::remove_file(&self.process_file);
+    }
+}
+
+/// Listen on a socket named `name` inside `dir`, at an address whose size does
+/// not depend on what `dir` costs. The socket still lands on the real path,
+/// which is what the sandbox connects to and what removes it afterwards.
+///
+/// A socket address holds 107 bytes of path where a path holds 4096, so naming
+/// the directory in the address spends the budget on the depth of the state root
+/// and leaves the rest to the sandbox name: an ordinary home takes a third of it
+/// before the name is counted, and a state directory on another mount takes the
+/// lot. Naming the directory by an open descriptor instead costs the same few
+/// bytes however deep the sandbox lives.
+fn listen_in(dir: &Path, name: &str) -> Result<UnixListener, String> {
+    let directory = File::open(dir).map_err(|err| format!("opening {}: {err}", dir.display()))?;
+    let address = format!("/proc/self/fd/{}/{name}", directory.as_raw_fd());
+    UnixListener::bind(address)
+        .map_err(|err| format!("listening on {}: {err}", dir.join(name).display()))
+}
+
+/// Whether `wanted` has something to take, waiting for it, and `false` once the
+/// session has reported instead. The report is written after the terminal is
+/// sent, so a report arriving first is a session that will send none.
+fn readable_before_report(wanted: RawFd, report: &PipeReader) -> Result<bool, String> {
+    let mut watched = [
+        libc::pollfd { fd: wanted, events: libc::POLLIN, revents: 0 },
+        libc::pollfd { fd: report.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+    ];
+    loop {
+        if unsafe { libc::poll(watched.as_mut_ptr(), watched.len() as libc::nfds_t, -1) } == -1 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!("waiting for the session terminal: {err}"));
+        }
+        if watched[0].revents != 0 {
+            return Ok(true);
+        }
+        if watched[1].revents != 0 {
+            return Ok(false);
+        }
+    }
+}
+
+fn next_session_number() -> u64 {
+    static OPENED: AtomicU64 = AtomicU64::new(0);
+    OPENED.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Make hort the parent a session falls to when the process that started it
+/// exits. The session is built by a forked child that reports the pid and dies,
+/// so without this the kernel hands the session to init, and a process nobody is
+/// the parent of is a process nobody can learn the exit status of.
+fn become_subreaper() -> Result<(), HortError> {
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1 as libc::c_ulong) } == -1 {
+        return Err(runtime_failure(format!(
+            "join_session: claiming the sessions this process starts: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+/// The process a session with a terminal runs. The tenant API takes a terminal
+/// request only through a process file: everything it builds from its own
+/// setters asks for none.
+fn session_process(spec: &SessionSpec) -> Process {
+    let mut process = Process::default();
+    process.set_args(Some(spec.command.clone()));
+    process.set_cwd(spec.cwd.clone());
+    process.set_env(Some(environment(&spec.env)));
+    process.set_terminal(Some(true));
+    // Set here because a process file replaces what the tenant API would have
+    // built, and what it would have built inherits the sandbox's empty set.
+    process.set_capabilities(Some(no_capabilities()));
+    process
+}
+
 /// Climb into the sandbox and start the session there, from the forked child.
 /// Every rung is only reachable with the privilege the one below it grants, so
 /// the order is not a preference: the owning user namespace first, then the
@@ -511,13 +684,14 @@ fn open_session(
     anchor: u32,
     youki_root: &Path,
     session: ConfinedSession,
+    console: Option<&SessionConsole>,
 ) -> Result<u32, String> {
     let netns = anchor_namespace(anchor, "net")?;
     let container_user = anchor_namespace(anchor, "user")?;
     let owner = owning_user_namespace(netns.as_fd())?;
 
     enter(&[owner.as_fd(), netns.as_fd(), container_user.as_fd()])?;
-    start_session(spec, youki_root, session)
+    start_session(spec, youki_root, session, console)
 }
 
 fn anchor_namespace(anchor: u32, namespace: &str) -> Result<File, String> {
@@ -552,23 +726,41 @@ impl Executor for ConfinedSession {
 /// tenant is detached because a session outlives the call that opened it; the
 /// namespaces it is missing are the ones the climb already entered, which it
 /// inherits from this process.
+///
+/// A session that asked for a terminal is described by a file instead of by the
+/// builder's own setters, which is the only way the tenant API takes the
+/// request, and the runtime insists on a console socket for exactly that pairing.
 fn start_session(
     spec: &SessionSpec,
     youki_root: &Path,
     session: ConfinedSession,
+    console: Option<&SessionConsole>,
 ) -> Result<u32, String> {
-    let environment: HashMap<String, String> = spec.env.iter().cloned().collect();
-    let pid = ContainerBuilder::new(spec.name.as_str().to_string(), SyscallType::default())
+    let builder = ContainerBuilder::new(spec.name.as_str().to_string(), SyscallType::default())
         .with_root_path(youki_root)
         .map_err(|err| format!("rooting the container state at {}: {err}", youki_root.display()))?
-        .with_executor(session)
-        .as_tenant()
-        .with_container_args(spec.command.clone())
-        .with_cwd(Some(spec.cwd.clone()))
-        .with_env(environment)
-        .with_detach(true)
-        .build()
-        .map_err(|err| format!("joining a session to '{}': {err}", spec.name.as_str()))?;
+        .with_executor(session);
+
+    let joined = match console {
+        Some(console) => builder
+            .with_console_socket(Some(&console.socket_path))
+            .as_tenant()
+            .with_process(Some(&console.process_file))
+            .with_detach(true)
+            .build(),
+        None => {
+            let environment: HashMap<String, String> = spec.env.iter().cloned().collect();
+            builder
+                .as_tenant()
+                .with_container_args(spec.command.clone())
+                .with_cwd(Some(spec.cwd.clone()))
+                .with_env(environment)
+                .with_detach(true)
+                .build()
+        }
+    };
+    let pid =
+        joined.map_err(|err| format!("joining a session to '{}': {err}", spec.name.as_str()))?;
 
     u32::try_from(pid.as_raw())
         .map_err(|_| format!("the runtime reported {} as the session pid", pid.as_raw()))
@@ -796,6 +988,31 @@ mod tests {
         // ambient set included, which is a silent loss of the empty-capability
         // guarantee. Only setting all five explicitly zeroes them.
         let process = assembled.process().as_ref().unwrap();
+        let capabilities = process.capabilities().as_ref().unwrap();
+        assert_eq!(capabilities.bounding(), &Some(Capabilities::new()));
+        assert_eq!(capabilities.effective(), &Some(Capabilities::new()));
+        assert_eq!(capabilities.inheritable(), &Some(Capabilities::new()));
+        assert_eq!(capabilities.permitted(), &Some(Capabilities::new()));
+        assert_eq!(capabilities.ambient(), &Some(Capabilities::new()));
+    }
+
+    #[test]
+    fn session_process_sets_every_capability_set_empty() {
+        let spec = SessionSpec {
+            name: SandboxName::new("demo").unwrap(),
+            command: vec!["/bin/sh".to_string()],
+            cwd: PathBuf::from("/workdir"),
+            env: Vec::new(),
+            terminal: true,
+        };
+
+        // A session that asks for a terminal is the one case the tenant API
+        // cannot serve from its own setters, so it is handed a process file
+        // instead, and that file replaces the process the API would have built
+        // rather than adding to it. The empty set it would have inherited from
+        // the sandbox goes with it, so a session on a pty would be the one
+        // process in the box holding capabilities.
+        let process = session_process(&spec);
         let capabilities = process.capabilities().as_ref().unwrap();
         assert_eq!(capabilities.bounding(), &Some(Capabilities::new()));
         assert_eq!(capabilities.effective(), &Some(Capabilities::new()));
@@ -1182,11 +1399,44 @@ mod privileged_tests {
             command: vec!["sleep".to_string(), "infinity".to_string()],
             cwd: PathBuf::from(WORKDIR),
             env: Vec::new(),
+            terminal: false,
         }
     }
 
     fn sandbox_dir(state_root: &Path) -> PathBuf {
         state_root.join("sandboxes/demo")
+    }
+
+    /// The file a session leaves in `/workdir` when it finds a terminal on its
+    /// input. `/workdir` is a bind mount of a host directory, so what the session
+    /// writes there is what a test outside the sandbox can read.
+    const TERMINAL_WITNESS: &str = "ran-on-a-terminal";
+
+    /// A session that asks for a terminal and reports from inside whether it got
+    /// one.
+    fn reporting_session(name: &SandboxName) -> SessionSpec {
+        SessionSpec {
+            name: name.clone(),
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("test -t 0 && touch {WORKDIR}/{TERMINAL_WITNESS}; sleep infinity"),
+            ],
+            cwd: PathBuf::from(WORKDIR),
+            env: Vec::new(),
+            terminal: true,
+        }
+    }
+
+    fn appeared_within_deadline(path: &Path) -> bool {
+        let deadline = Instant::now() + SESSION_DEADLINE;
+        while Instant::now() < deadline {
+            if path.exists() {
+                return true;
+            }
+            sleep(POLL);
+        }
+        false
     }
 
     /// An allowlisted sandbox declaring one database on the host's own loopback.
@@ -1230,6 +1480,7 @@ mod privileged_tests {
             ],
             cwd: PathBuf::from(WORKDIR),
             env: Vec::new(),
+            terminal: false,
         }
     }
 
@@ -1545,7 +1796,7 @@ mod privileged_tests {
 
         let session = runtime.join_session(&session_spec(&spec.name)).unwrap();
 
-        assert_eq!(namespace_inode(session, "mnt"), namespace_inode(token.pid.0, "mnt"));
+        assert_eq!(namespace_inode(session.pid, "mnt"), namespace_inode(token.pid.0, "mnt"));
         runtime.teardown(&spec.name).unwrap();
     }
 
@@ -1568,7 +1819,87 @@ mod privileged_tests {
         // so a session opened straight from hort lands on the host network. It
         // sees the same worktree, runs the same shell and answers every other
         // question here correctly, while the egress allowlist restricts nothing.
-        assert_eq!(namespace_inode(session, "net"), namespace_inode(token.pid.0, "net"));
+        assert_eq!(namespace_inode(session.pid, "net"), namespace_inode(token.pid.0, "net"));
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn a_session_that_asked_for_a_terminal_runs_on_one() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = runtime_under(&youki_root, &state_root);
+        let spec = sandbox_spec(rootfs, state_root.path());
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+
+        // Held for as long as the answer is waited for: closing the master hangs
+        // the session's terminal up, and a session hung up before it has run
+        // answers nothing about the terminal it was given.
+        let _session = runtime.join_session(&reporting_session(&spec.name)).unwrap();
+
+        // What the agent inside sees has to be a terminal or the interactive
+        // tools the sandbox exists to run refuse to draw anything, and the pty
+        // that terminal is made of has to be the sandbox's own.
+        assert!(appeared_within_deadline(&spec.workdir.join(TERMINAL_WITNESS)));
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn the_master_of_a_session_terminal_reaches_hort() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = runtime_under(&youki_root, &state_root);
+        let spec = sandbox_spec(rootfs, state_root.path());
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+
+        let session = runtime.join_session(&reporting_session(&spec.name)).unwrap();
+
+        // The runtime only sends the master; hort has to be the one listening
+        // for it, and a session whose master never arrives is a terminal nobody
+        // can relay, which is a shell the user cannot type into.
+        let master = session.pty.expect("the pty master of a session that asked for a terminal");
+        assert_eq!(unsafe { libc::isatty(master.as_raw_fd()) }, 1);
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn a_session_gets_its_terminal_under_a_deep_state_root() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        // A state root as deep as real ones get: an XDG state home under a long
+        // login name, a home on an organisation path, a state dir on an external
+        // mount. Every test path in this repo lives directly under /tmp and is
+        // therefore short, so nothing else here can tell a socket address that
+        // fits from one that does not.
+        let deep = state_root
+            .path()
+            .join("home-on-a-long-organisation-path")
+            .join("with-a-nested-xdg-state-home");
+        fs::create_dir_all(&deep).unwrap();
+        let runtime = LibcontainerRuntime::new(youki_root.path().to_path_buf(), deep.clone());
+        let spec = sandbox_spec(rootfs, &deep);
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+
+        // A Unix socket address is capped at 107 usable bytes, so a console
+        // socket named from the state root spends that budget on the depth of the
+        // path and leaves the rest to the sandbox name. hort listens on this one
+        // itself, and the limit binds both ends independently: the runtime it
+        // embeds dodges it on its own connect by pointing a short symlink at the
+        // long path, which does nothing for the address hort binds.
+        let session = runtime.join_session(&reporting_session(&spec.name)).unwrap();
+
+        assert!(session.pty.is_some());
         runtime.teardown(&spec.name).unwrap();
     }
 

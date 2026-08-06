@@ -5,6 +5,7 @@
 //! decision logic that drives it can be tested against an in-memory fake. Every
 //! port has exactly one real adapter and one test fake.
 
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -47,13 +48,14 @@ pub trait ContainerRuntime {
     /// runs under.
     fn start_anchor(&self, spec: &OciSpec) -> Result<LivenessToken, HortError>;
     /// Join a new session into the running sandbox's namespaces, returning the
-    /// host pid the session process runs under, which is what a caller waits on.
+    /// session a caller waits on and, when the spec asked for a terminal, the
+    /// pty master the sandbox allocated for it.
     /// The sandbox's network namespace is one of the namespaces the session has
     /// to end up in, and it is the one nothing hands over on its own: a session
     /// is born in the network namespace of the process that opened it, so an
     /// implementation that leaves that to the runtime puts the session on the
     /// host network, where an egress allowlist restricts nothing.
-    fn join_session(&self, spec: &SessionSpec) -> Result<u32, HortError>;
+    fn join_session(&self, spec: &SessionSpec) -> Result<Session, HortError>;
     /// Stop every session and the anchor, and tear the container down. Releases
     /// the worktree mount, so it runs before the worktree is removed.
     fn teardown(&self, name: &SandboxName) -> Result<(), HortError>;
@@ -224,6 +226,41 @@ pub struct SessionSpec {
     pub cwd: PathBuf,
     /// Environment pairs this session sees on top of what the sandbox exports.
     pub env: Vec<(String, String)>,
+    /// Whether the sandbox allocates a pty for this session. The caller decides
+    /// it, because whether there is a terminal to relay is a fact about the
+    /// process that invoked hort and not about the sandbox.
+    pub terminal: bool,
+}
+
+/// One session opened inside a running sandbox: the host pid it runs under, and
+/// the pty master when the spec asked for a terminal.
+///
+/// The master is the sandbox's own pty, never hort's terminal, which is what
+/// keeps a process inside the box from writing to the terminal the user is
+/// sitting at. It is per session, so two concurrent attaches to one sandbox
+/// never share it.
+///
+/// `Debug` only: a session owns an open descriptor, so equality is not something
+/// two of them can have, and a caller that needs to compare one compares its pid.
+#[derive(Debug)]
+pub struct Session {
+    pub pid: u32,
+    pub pty: Option<OwnedFd>,
+}
+
+/// The user's terminal for the length of one session: raw mode on hort's own
+/// stdin, both copy directions between it and the session's pty, window-size
+/// changes forwarded to what runs inside, and the terminal put back the way it
+/// was on the way out.
+///
+/// It is a port of its own rather than another method on the runtime because the
+/// container and the user's terminal are unrelated subsystems, and because
+/// `attach` and the session `up` opens need the identical relay.
+pub trait SessionTerminal {
+    /// Hold the terminal until the session ends and report the wait status the
+    /// kernel gives for it. A session that asked for no terminal has nothing to
+    /// relay and is only waited on.
+    fn relay(&self, session: Session) -> Result<i32, HortError>;
 }
 
 /// The per-sandbox resource ceiling. `cpus` is an amount of CPU time (2.0 means

@@ -13,7 +13,7 @@ use crate::domain::config::ResolvedConfig;
 use crate::domain::error::HortError;
 use crate::domain::model::{SandboxName, SandboxRecord};
 use crate::domain::reconcile::SandboxState;
-use crate::ports::{Clock, ContainerRuntime, LivenessProbe, MetadataStore, SessionSpec};
+use crate::ports::{Clock, ContainerRuntime, LivenessProbe, MetadataStore, Session, SessionSpec};
 
 /// Where every session starts, which is the sandbox's own mount point for the
 /// worktree rather than anything the configuration can move.
@@ -33,10 +33,26 @@ pub struct AttachCommand<'a> {
     config: &'a ResolvedConfig,
 }
 
+impl<'a> AttachCommand<'a> {
+    pub fn new(
+        store: &'a dyn MetadataStore,
+        probe: &'a dyn LivenessProbe,
+        runtime: &'a dyn ContainerRuntime,
+        clock: &'a dyn Clock,
+        config: &'a ResolvedConfig,
+    ) -> Self {
+        Self { store, probe, runtime, clock, config }
+    }
+}
+
 impl AttachCommand<'_> {
-    /// Open a session in the sandbox named `name`, returning the host pid the
-    /// session process runs under so the caller can wait for it.
-    pub fn run(&self, name: SandboxName) -> Result<u32, HortError> {
+    /// Open a session in the sandbox named `name`, returning it so the caller can
+    /// hold its terminal and wait for it.
+    ///
+    /// `terminal` says whether the session gets a pty of the sandbox's own.
+    /// Whether there is a terminal to relay is a fact about the process that
+    /// invoked hort, so the caller decides it and this only carries it.
+    pub fn run(&self, name: SandboxName, terminal: bool) -> Result<Session, HortError> {
         let record = self
             .store
             .get(&name)?
@@ -51,6 +67,7 @@ impl AttachCommand<'_> {
             command: self.login_shell(),
             cwd: PathBuf::from(WORKDIR),
             env: sandbox_environment(&record),
+            terminal,
         })?;
 
         // Timestamped only once a session exists, because this is what tells an
@@ -131,7 +148,7 @@ mod tests {
         let config = config_with_shell(None);
         let command = attach_command(&store, &probe, &runtime, &clock, &config);
 
-        command.run(SandboxName::new("demo").unwrap()).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), false).unwrap();
 
         assert_eq!(runtime.joins(), vec![SandboxName::new("demo").unwrap()]);
     }
@@ -146,9 +163,9 @@ mod tests {
         let config = config_with_shell(None);
         let command = attach_command(&store, &probe, &runtime, &clock, &config);
 
-        let result = command.run(SandboxName::new("demo").unwrap());
+        let result = command.run(SandboxName::new("demo").unwrap(), false);
 
-        assert_eq!(result, Err(HortError::SandboxNotRunning { name: "demo".to_string() }));
+        assert_eq!(result.unwrap_err(), HortError::SandboxNotRunning { name: "demo".to_string() });
         assert!(runtime.joins().is_empty());
     }
 
@@ -161,9 +178,12 @@ mod tests {
         let config = config_with_shell(None);
         let command = attach_command(&store, &probe, &runtime, &clock, &config);
 
-        let result = command.run(SandboxName::new("demo").unwrap());
+        let result = command.run(SandboxName::new("demo").unwrap(), false);
 
-        assert_eq!(result, Err(HortError::UnknownSandboxOnAttach { name: "demo".to_string() }));
+        assert_eq!(
+            result.unwrap_err(),
+            HortError::UnknownSandboxOnAttach { name: "demo".to_string() }
+        );
         assert!(runtime.joins().is_empty());
     }
 
@@ -177,7 +197,7 @@ mod tests {
         let config = config_with_shell(Some("/usr/bin/fish"));
         let command = attach_command(&store, &probe, &runtime, &clock, &config);
 
-        command.run(SandboxName::new("demo").unwrap()).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), false).unwrap();
 
         assert_eq!(runtime.session_command(), vec!["/usr/bin/fish".to_string(), "-l".to_string()]);
     }
@@ -192,7 +212,7 @@ mod tests {
         let config = config_with_shell(None);
         let command = attach_command(&store, &probe, &runtime, &clock, &config);
 
-        command.run(SandboxName::new("demo").unwrap()).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), false).unwrap();
 
         // The one shell a prepared rootfs is required to carry, which is what
         // makes it the answer hort can always fall back to.
@@ -209,7 +229,7 @@ mod tests {
         let config = config_with_shell(None);
         let command = attach_command(&store, &probe, &runtime, &clock, &config);
 
-        command.run(SandboxName::new("demo").unwrap()).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), false).unwrap();
 
         assert_eq!(runtime.session_cwd(), PathBuf::from("/workdir"));
     }
@@ -224,7 +244,7 @@ mod tests {
         let config = config_with_shell(None);
         let command = attach_command(&store, &probe, &runtime, &clock, &config);
 
-        command.run(SandboxName::new("demo").unwrap()).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), false).unwrap();
 
         let environment = runtime.session_env();
         assert!(environment.contains(&("HORT_SANDBOX".to_string(), "demo".to_string())));
@@ -245,7 +265,7 @@ mod tests {
         let config = config_with_shell(None);
         let command = attach_command(&store, &probe, &runtime, &clock, &config);
 
-        command.run(name.clone()).unwrap();
+        command.run(name.clone(), false).unwrap();
 
         // This timestamp is what tells an idle sandbox from a busy one once the
         // sessions of an attach are gone, so a session that opens without
@@ -265,7 +285,7 @@ mod tests {
         let config = config_with_shell(None);
         let command = attach_command(&store, &probe, &runtime, &clock, &config);
 
-        command.run(name.clone()).unwrap();
+        command.run(name.clone(), false).unwrap();
 
         // Timestamping the attach makes it the second writer of a record only a
         // build used to touch, and one that rebuilds the record around the new
@@ -273,6 +293,45 @@ mod tests {
         // sandbox reads as orphaned, which is what prune removes without asking.
         let persisted = store.get(&name).unwrap().unwrap();
         assert_eq!(persisted.reconcile(&probe), SandboxState::Live);
+    }
+
+    #[test]
+    fn attach_asks_the_sandbox_for_a_terminal_when_the_caller_has_one() {
+        let store = InMemoryMetadataStore::new();
+        store.put(&live_record()).unwrap();
+        let probe = ScriptedLivenessProbe::new(true);
+        let runtime = FakeRuntime::new(canned_token());
+        let clock = ScriptedClock::new(humantime::parse_rfc3339("2026-06-11T13:00:00Z").unwrap());
+        let config = config_with_shell(None);
+        let command = attach_command(&store, &probe, &runtime, &clock, &config);
+
+        command.run(SandboxName::new("demo").unwrap(), true).unwrap();
+
+        // The pty belongs to the sandbox, and the session that runs without one
+        // gets the terminal hort was invoked on instead: a process inside the box
+        // can then write to the terminal the user is sitting at, and on a host
+        // that still allows it, push keystrokes the user's shell runs once hort
+        // is gone.
+        assert!(runtime.session_terminal());
+    }
+
+    #[test]
+    fn attach_asks_for_no_terminal_when_the_caller_has_none() {
+        let store = InMemoryMetadataStore::new();
+        store.put(&live_record()).unwrap();
+        let probe = ScriptedLivenessProbe::new(true);
+        let runtime = FakeRuntime::new(canned_token());
+        let clock = ScriptedClock::new(humantime::parse_rfc3339("2026-06-11T13:00:00Z").unwrap());
+        let config = config_with_shell(None);
+        let command = attach_command(&store, &probe, &runtime, &clock, &config);
+
+        command.run(SandboxName::new("demo").unwrap(), false).unwrap();
+
+        // With no terminal on this side there is no pty to relay and nothing to
+        // protect, so the session runs on the stdio it inherits. Asking for one
+        // anyway would leave a sandbox holding a master nobody reads, which is a
+        // shell that blocks on a full buffer for a run nobody is watching.
+        assert!(!runtime.session_terminal());
     }
 
     #[test]
@@ -285,11 +344,11 @@ mod tests {
         let config = config_with_shell(None);
         let command = attach_command(&store, &probe, &runtime, &clock, &config);
 
-        let session = command.run(SandboxName::new("demo").unwrap()).unwrap();
+        let session = command.run(SandboxName::new("demo").unwrap(), false).unwrap();
 
         // The session is the process the user is in, and nothing else hands its
         // pid back: a caller with no pid to wait for returns to the host prompt
         // while the shell it just opened is still running.
-        assert_eq!(session, FakeRuntime::SESSION_PID);
+        assert_eq!(session.pid, FakeRuntime::SESSION_PID);
     }
 }

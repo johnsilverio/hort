@@ -20,8 +20,8 @@ use crate::domain::preconditions::{ConfiguredShell, RootfsFacts};
 use crate::ports::{
     Clock, Confirmer, ContainerRegistry, ContainerRuntime, CorruptEntry, DbForward,
     EnvironmentProbe, LivenessProbe, MetadataStore, NetworkProvider, NetworkSpec, Notifier,
-    OciSpec, RegistryEntry, ResourceLimits, SandboxLock, SessionProbe, SessionSpec, Worktree,
-    WorktreeProvider,
+    OciSpec, RegistryEntry, ResourceLimits, SandboxLock, Session, SessionProbe, SessionSpec,
+    Worktree, WorktreeProvider,
 };
 
 /// The shared teardown-order witness threaded through the fakes that perform a
@@ -186,6 +186,11 @@ impl FakeRuntime {
         self.sessions.borrow().last().map(|spec| spec.env.clone()).unwrap_or_default()
     }
 
+    /// Whether the session opened last asked the sandbox for a terminal.
+    pub fn session_terminal(&self) -> bool {
+        self.sessions.borrow().last().is_some_and(|spec| spec.terminal)
+    }
+
     pub fn teardowns(&self) -> Vec<SandboxName> {
         self.teardowns.borrow().clone()
     }
@@ -208,14 +213,17 @@ impl ContainerRuntime for FakeRuntime {
         Ok(self.token)
     }
 
-    fn join_session(&self, spec: &SessionSpec) -> Result<u32, HortError> {
+    fn join_session(&self, spec: &SessionSpec) -> Result<Session, HortError> {
         self.sessions.borrow_mut().push(SessionSpec {
             name: spec.name.clone(),
             command: spec.command.clone(),
             cwd: spec.cwd.clone(),
             env: spec.env.clone(),
+            terminal: spec.terminal,
         });
-        Ok(Self::SESSION_PID)
+        // No pty: a fake that handed one back would be handing back something it
+        // never allocated, and nothing a fake can produce would prove a relay.
+        Ok(Session { pid: Self::SESSION_PID, pty: None })
     }
 
     fn teardown(&self, name: &SandboxName) -> Result<(), HortError> {

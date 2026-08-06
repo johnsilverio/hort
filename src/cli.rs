@@ -1,9 +1,14 @@
 //! CLI surface: the clap v4 derive definitions for the subcommands hort exposes,
 //! their dispatch, and the pure `ls`, `prune` and warning renderers.
 //!
-//! Only subcommands that work end to end ship here. This slice is `up`, `ls`,
-//! `down` and `prune`; `attach`, `config` and `doctor` arrive with the tasks
-//! that make them real, so the binary never offers a command that cannot run.
+//! Only subcommands that work end to end ship here. This slice is `up`, `attach`,
+//! `ls`, `down` and `prune`; `config` and `doctor` arrive with the tasks that
+//! make them real, so the binary never offers a command that cannot run.
+//!
+//! A run that opened a session leaves with the status that session exited with,
+//! which is what lets a script tell what ran inside a sandbox from what hort
+//! itself did. That collides with hort's own exit codes, the same trade `ssh`
+//! makes.
 
 use std::fs;
 use std::io::IsTerminal;
@@ -21,16 +26,20 @@ use crate::adapters::lock::FlockSandboxLock;
 use crate::adapters::metadata::FileMetadataStore;
 use crate::adapters::pasta::PastaNetworkProvider;
 use crate::adapters::runtime::{LibcontainerRuntime, NullRuntime};
+use crate::adapters::terminal::HostTerminal;
 use crate::adapters::worktree::GitWorktreeProvider;
+use crate::commands::attach::AttachCommand;
 use crate::commands::down::DownCommand;
 use crate::commands::ls::{LsCommand, LsEntry};
 use crate::commands::prune::{PruneCommand, PruneReport};
 use crate::commands::up::UpCommand;
+use crate::domain::config::ResolvedConfig;
 use crate::domain::error::HortError;
 use crate::domain::idle::IdleState;
 use crate::domain::model::{BranchName, SandboxName, Warning};
 use crate::domain::prune::SkipReason;
 use crate::domain::reconcile::SandboxState;
+use crate::ports::SessionTerminal;
 
 /// The parsed command line: one subcommand and its flags.
 #[derive(Parser)]
@@ -43,7 +52,7 @@ pub struct Cli {
 /// to run for real.
 #[derive(Subcommand)]
 pub enum CliCommand {
-    /// Build a sandbox and return to the prompt.
+    /// Build a sandbox and open a session in it.
     Up {
         /// The sandbox to build, which is also the branch it creates.
         name: String,
@@ -51,6 +60,15 @@ pub enum CliCommand {
         /// the sandbox.
         #[arg(long)]
         branch: Option<String>,
+        /// Return to the prompt with the sandbox running instead of opening a
+        /// session in it.
+        #[arg(short, long)]
+        detach: bool,
+    },
+    /// Open one more session in a running sandbox.
+    Attach {
+        /// The sandbox to join.
+        name: String,
     },
     /// List every sandbox with its reconciled state.
     Ls,
@@ -84,6 +102,7 @@ pub struct RealDeps {
     runtime: LibcontainerRuntime,
     sessions: NullRuntime,
     network: PastaNetworkProvider,
+    terminal: HostTerminal,
     clock: SystemClock,
     confirmer: StdinConfirmer,
     env: HostEnvironmentProbe,
@@ -138,6 +157,7 @@ impl RealDeps {
             runtime: LibcontainerRuntime::new(resolve_youki_root(), state_root.clone()),
             sessions: NullRuntime,
             network: PastaNetworkProvider::new(state_root.clone()),
+            terminal: HostTerminal,
             clock: SystemClock,
             confirmer: StdinConfirmer,
             env: HostEnvironmentProbe,
@@ -204,9 +224,9 @@ fn home_dir() -> Result<PathBuf, HortError> {
 /// (the `ls` rows, the `prune` report) to stdout and the advisories a build
 /// raised to stderr. A returned error propagates to the binary, which prints it
 /// once.
-pub fn run(cli: Cli, deps: &RealDeps) -> Result<(), HortError> {
+pub fn run(cli: Cli, deps: &RealDeps) -> Result<u8, HortError> {
     match cli.command {
-        CliCommand::Up { name, branch } => {
+        CliCommand::Up { name, branch, detach } => {
             let name = SandboxName::new(&name)?;
             let branch = branch.as_deref().map(BranchName::new).transpose()?;
             // Read here rather than at assembly: configuration is what a sandbox
@@ -228,9 +248,21 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<(), HortError> {
                 deps.current_dir.clone(),
                 &config,
             );
-            let warnings = command.run(name, branch)?;
+            let warnings = command.run(name.clone(), branch)?;
             eprint!("{}", render_warnings(&config_warnings, &warnings));
-            Ok(())
+            if detach {
+                return Ok(HORT_SUCCEEDED);
+            }
+            // Composed rather than built into `up`, so that `hort up x` is worth
+            // literally `hort up -d x` followed by `hort attach x`, one terminal
+            // contract and one exit-status rule for both.
+            open_session(deps, name, &config)
+        }
+        CliCommand::Attach { name } => {
+            let name = SandboxName::new(&name)?;
+            let (config, config_warnings) = deps.config.resolve()?;
+            eprint!("{}", render_warnings(&config_warnings, &[]));
+            open_session(deps, name, &config)
         }
         CliCommand::Ls => {
             let command = LsCommand::new(
@@ -242,7 +274,7 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<(), HortError> {
             );
             let entries = command.run()?;
             print!("{}", render_ls(&entries));
-            Ok(())
+            Ok(HORT_SUCCEEDED)
         }
         CliCommand::Down { name, force } => {
             let name = SandboxName::new(&name)?;
@@ -254,7 +286,8 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<(), HortError> {
                 &deps.network,
                 &deps.worktrees,
             );
-            command.run(name, force, std::io::stdin().is_terminal())
+            command.run(name, force, std::io::stdin().is_terminal())?;
+            Ok(HORT_SUCCEEDED)
         }
         CliCommand::Prune { force, idle } => {
             let command = PruneCommand::new(
@@ -270,12 +303,37 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<(), HortError> {
             );
             let report = command.run(idle, force, std::io::stdin().is_terminal())?;
             print!("{}", render_prune(&report));
-            Ok(())
+            Ok(HORT_SUCCEEDED)
         }
     }
 }
 
+/// Open a session in `name` and hold the terminal until it ends, reporting what
+/// it exited with.
+///
+/// Whether there is a terminal to lend is decided here and nowhere else: it is a
+/// fact about the process hort was invoked from, which the command it carries
+/// into cannot see. Without a terminal there is no pty to allocate and nothing to
+/// protect, so the session runs on the inherited streams instead of being
+/// refused, which is what keeps hort usable from a script.
+fn open_session(
+    deps: &RealDeps,
+    name: SandboxName,
+    config: &ResolvedConfig,
+) -> Result<u8, HortError> {
+    let command = AttachCommand::new(&deps.store, &deps.probe, &deps.runtime, &deps.clock, config);
+    let session = command.run(name, std::io::stdin().is_terminal())?;
+    Ok(session_exit_code(deps.terminal.relay(session)?))
+}
+
 const DASH: &str = "-";
+
+/// What hort leaves with when it ran a command of its own rather than a session.
+const HORT_SUCCEEDED: u8 = 0;
+
+/// What a shell adds to the signal number when it reports a process that was
+/// killed rather than one that returned.
+const SIGNALLED_EXIT_BASE: u8 = 128;
 
 /// Render the `ls` rows for the terminal: one line per sandbox with its name,
 /// lowercase state, session count, age, idle, branch, and worktree dirty state. A
@@ -307,6 +365,22 @@ pub fn render_prune(report: &PruneReport) -> String {
 /// the host cannot enforce, or a configuration key it ignored.
 pub fn render_warnings(config: &[Warning], command: &[Warning]) -> String {
     config.iter().chain(command).map(|warning| format!("warning: {warning}\n")).collect()
+}
+
+/// The code hort leaves with after a session it opened has ended, from the wait
+/// status the kernel reported for it.
+///
+/// A caller has to be able to tell what ran inside the sandbox from what hort
+/// itself did, and the only status a script knows how to read is the one its
+/// shell would have produced.
+pub fn session_exit_code(wait_status: i32) -> u8 {
+    if libc::WIFSIGNALED(wait_status) {
+        // The exit code carried in the wait status of a signalled process is
+        // zero, so without the shell's rule a session the user interrupted with
+        // ^C reports success to whatever script called hort.
+        return SIGNALLED_EXIT_BASE + libc::WTERMSIG(wait_status) as u8;
+    }
+    libc::WEXITSTATUS(wait_status) as u8
 }
 
 fn render_line(entry: &LsEntry) -> String {
@@ -478,6 +552,28 @@ mod tests {
         // like one running with it.
         assert!(rendered.contains("ignoring devcontainer key 'image'"));
         assert!(rendered.contains("memory limit dropped"));
+    }
+
+    #[test]
+    fn session_exit_code_is_the_code_the_session_exited_with() {
+        // The wait status of a process that called exit(7), which is the number
+        // in the second byte.
+        let exited_with_seven = 7 << 8;
+
+        assert_eq!(session_exit_code(exited_with_seven), 7);
+    }
+
+    #[test]
+    fn session_exit_code_of_a_killed_session_follows_the_shell_convention() {
+        // The wait status of a process killed by SIGINT, which is the signal
+        // number in the low byte and no exit code at all.
+        let killed_by_sigint = 2;
+
+        // Reading the exit code out of this status yields zero, so a session the
+        // user interrupted would report to a script as one that finished its
+        // work. Every shell answers 128 plus the signal here, and hort is read by
+        // the same scripts.
+        assert_eq!(session_exit_code(killed_by_sigint), 130);
     }
 
     #[test]

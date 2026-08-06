@@ -4,6 +4,7 @@
 pub mod clock;
 pub mod config;
 pub mod confirm;
+pub mod console;
 pub mod environment;
 pub mod forwarder;
 pub mod helper;
@@ -19,4 +20,5 @@ pub mod prompt;
 pub mod proxy;
 pub mod runtime;
 pub mod streams;
+pub mod terminal;
 pub mod worktree;

@@ -82,6 +82,11 @@ pub enum HortError {
     /// naming the operation; the rendered message is not a canonical product
     /// string, so callers match the variant, not the text.
     ContainerRuntimeFailed { detail: String },
+    /// Relaying a session's terminal failed: holding hort's own terminal for it,
+    /// carrying what each side typed to the other, or waiting for the session to
+    /// end. Carries a human-readable detail; the rendered message is not a
+    /// canonical product string, so callers match the variant, not the text.
+    SessionTerminalFailed { detail: String },
     /// Wiring a sandbox's host-side egress failed: reaching the sandbox's network
     /// namespace, spawning pasta, shaping the routes, or stopping any of it.
     /// Carries a human-readable detail naming the operation; the rendered message
@@ -187,6 +192,9 @@ impl fmt::Display for HortError {
             HortError::GitCommandFailed { detail } => write!(f, "git command failed: {detail}"),
             HortError::ContainerRuntimeFailed { detail } => {
                 write!(f, "container runtime failed: {detail}")
+            }
+            HortError::SessionTerminalFailed { detail } => {
+                write!(f, "session terminal failed: {detail}")
             }
             HortError::NetworkProviderFailed { detail } => {
                 write!(f, "sandbox networking failed: {detail}")

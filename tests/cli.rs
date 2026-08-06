@@ -67,6 +67,35 @@ fn write_orphaned_record(state_root: &Path, name: &str) {
     fs::write(sandbox_dir.join("metadata.json"), metadata).unwrap();
 }
 
+/// Write a record whose anchor the kernel no longer has: a real on-disk
+/// `metadata.json` carrying a liveness token for a process that has already
+/// exited. The mount-namespace inode is one no namespace can have, so a reused
+/// pid cannot make this record read as live either.
+fn write_record_with_a_dead_anchor(state_root: &Path, name: &str) {
+    let sandbox_dir = state_root.join("sandboxes").join(name);
+    fs::create_dir_all(&sandbox_dir).unwrap();
+    let worktree = sandbox_dir.join(format!("worktree-{name}")).display().to_string();
+    let overlay = sandbox_dir.join("overlay").display().to_string();
+    let reaped = GitCommand::new("true").spawn().unwrap();
+    let dead = reaped.id();
+    reaped.wait_with_output().unwrap();
+    let metadata = format!(
+        r#"{{
+  "schemaVersion": 1,
+  "name": "{name}",
+  "branch": "{name}",
+  "worktreePath": "{worktree}",
+  "overlayPath": "{overlay}",
+  "createdAt": "2026-06-11T12:00:00Z",
+  "lastAttachAt": "2026-06-11T12:00:00Z",
+  "notifyChannel": null,
+  "watcherPid": null,
+  "token": {{ "pid": {dead}, "mntNsInode": 1 }}
+}}"#
+    );
+    fs::write(sandbox_dir.join("metadata.json"), metadata).unwrap();
+}
+
 /// A throwaway XDG config root holding one global hort config, returned with its
 /// canonicalized path. Every test that resolves configuration points the binary
 /// at one of these, so the configuration on the developer's own machine can never
@@ -142,6 +171,46 @@ fn cli_down_unknown_name_prints_canonical_error_to_stderr() {
         .assert()
         .code(1)
         .stderr("no sandbox named 'ghost' (run 'hort ls' to see what exists)\n");
+}
+
+#[test]
+fn cli_attach_unknown_name_prints_canonical_error_to_stderr() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let (_repo, repo_path) = temp_git_repo();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &xdg_root)
+        .current_dir(&repo_path)
+        .args(["attach", "ghost"])
+        .assert()
+        .code(1)
+        .stderr("no sandbox named 'ghost' (run 'hort ls' to see what's alive)\n");
+}
+
+#[test]
+fn cli_attach_reports_a_sandbox_whose_anchor_is_gone() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let state_root = xdg_root.join("hort");
+    write_record_with_a_dead_anchor(&state_root, "demo");
+    let (_repo, repo_path) = temp_git_repo();
+
+    // A record hort still has and an anchor the kernel no longer does are a
+    // different answer from a name nothing knows, and the repair they point at
+    // is different too. Only the kernel can tell them apart, so this is also
+    // what proves the answer was asked of it rather than read off the record.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &xdg_root)
+        .current_dir(&repo_path)
+        .args(["attach", "demo"])
+        .assert()
+        .code(1)
+        .stderr(
+            "sandbox 'demo' is not running (run 'hort up demo' to start it, or 'hort prune' to clean up the stale record)\n",
+        );
 }
 
 #[test]
@@ -347,7 +416,7 @@ fn cli_up_builds_a_sandbox_the_kernel_is_running() {
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_RUNTIME_DIR", &runtime_root)
         .current_dir(&repo_path)
-        .args(["up", "clidemo"])
+        .args(["up", "-d", "clidemo"])
         .assert()
         .success();
 
@@ -368,6 +437,126 @@ fn cli_up_builds_a_sandbox_the_kernel_is_running() {
         .env("XDG_RUNTIME_DIR", &runtime_root)
         .current_dir(&repo_path)
         .args(["down", "clidemo"])
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_up_with_detach_returns_without_opening_a_session() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let runtime = TempDir::new().unwrap();
+    let runtime_root = runtime.path().canonicalize().unwrap();
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+
+    // Nothing inside the box ever reads this, and that is the assertion: a build
+    // that ignored the flag would run a shell that consumed it. Asked for by
+    // whoever scripts hort, and a flag that quietly opens a session anyway is a
+    // flag that lies.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .current_dir(&repo_path)
+        .args(["up", "-d", "detacheddemo"])
+        .write_stdin("echo ran-inside-the-sandbox\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ran-inside-the-sandbox").not());
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .current_dir(&repo_path)
+        .args(["down", "detacheddemo"])
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_up_without_detach_opens_a_session_in_the_sandbox_it_built() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let runtime = TempDir::new().unwrap();
+    let runtime_root = runtime.path().canonicalize().unwrap();
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+
+    // The sandbox the user asked for is one they are standing in, and a build
+    // that returns to the host prompt instead leaves them to work out that a box
+    // exists somewhere and has to be entered by name.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .current_dir(&repo_path)
+        .args(["up", "shelldemo"])
+        .write_stdin("echo ran-inside-the-sandbox\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ran-inside-the-sandbox"));
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .current_dir(&repo_path)
+        .args(["down", "shelldemo"])
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_attach_exits_with_the_status_of_the_session() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let runtime = TempDir::new().unwrap();
+    let runtime_root = runtime.path().canonicalize().unwrap();
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .current_dir(&repo_path)
+        .args(["up", "-d", "statusdemo"])
+        .assert()
+        .success();
+
+    // Without this a script cannot tell a command that failed inside the box
+    // from hort failing to open the box at all, and both of those are exit 1.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .current_dir(&repo_path)
+        .args(["attach", "statusdemo"])
+        .write_stdin("exit 7\n")
+        .assert()
+        .code(7);
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .current_dir(&repo_path)
+        .args(["down", "statusdemo"])
         .assert()
         .success();
 }
