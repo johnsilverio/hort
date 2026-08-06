@@ -302,9 +302,14 @@ impl ContainerRuntime for LibcontainerRuntime {
                 name.as_str()
             ))
         })?;
-        container.delete(true).map_err(|err| {
-            runtime_failure(format!("teardown: stopping '{}': {err}", name.as_str()))
-        })?;
+        // Not redundant: delete races systemd's collection of the emptied scope, so
+        // a late StopUnit hits "Unit not loaded" and aborts before the container dir
+        // is removed. That first failure is the proof the retry needs to finish.
+        if container.delete(true).is_err() {
+            container.delete(true).map_err(|err| {
+                runtime_failure(format!("teardown: stopping '{}': {err}", name.as_str()))
+            })?;
+        }
         Ok(())
     }
 }
