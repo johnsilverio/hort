@@ -654,6 +654,95 @@ fn cli_down_without_git_leaves_the_project_folder() {
 }
 
 #[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_up_leaves_the_pasta_pid_file_under_the_runtime_root() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let runtime = TempDir::new().unwrap();
+    let runtime_root = runtime.path().join("hort");
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .current_dir(&repo_path)
+        .args(["up", "-d", "pastapiddemo"])
+        .assert()
+        .success();
+
+    // Which root reaches which adapter is decided once, where hort wires itself
+    // up, and no test below that wiring can tell the two apart: an adapter asked
+    // about the root it was handed answers the same either way. The two roots
+    // point at different directories here for exactly that reason.
+    assert!(runtime_root.join("sandboxes").join("pastapiddemo").join("pasta.pid").exists());
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .current_dir(&repo_path)
+        .args(["down", "pastapiddemo"])
+        .assert()
+        .success();
+
+    // The directory the pid file lived in is written by two owners that each
+    // take away only their own files, and neither ever sweeps it: it goes when
+    // the last file does. So an owner that forgot one of its files leaves the
+    // whole directory standing, and this one line is what says every one of them
+    // did its half.
+    assert!(!runtime_root.join("sandboxes").join("pastapiddemo").exists());
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_up_writes_no_helper_artifact_into_the_state_root() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let state_root = xdg_root.join("hort");
+    let runtime = TempDir::new().unwrap();
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .current_dir(&repo_path)
+        .args(["up", "-d", "staterootdemo"])
+        .assert()
+        .success();
+
+    // Writing these under both roots satisfies every other test here and keeps
+    // the failure whole: the helpers that write them exec binaries the
+    // distribution labels, and the label the state root carries refuses them, so
+    // hort would still lose the pid it stops pasta by and the log it explains a
+    // dead sandbox from.
+    let sandbox_dir = state_root.join("sandboxes").join("staterootdemo");
+    // Asked first, because two absences under a directory that does not exist are
+    // two absences whatever hort did.
+    assert!(sandbox_dir.exists());
+    assert!(!sandbox_dir.join("pasta.pid").exists());
+    assert!(!sandbox_dir.join("output.log").exists());
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .current_dir(&repo_path)
+        .args(["down", "staterootdemo"])
+        .assert()
+        .success();
+}
+
+#[test]
 fn cli_prune_refuses_without_tty() {
     let xdg = TempDir::new().unwrap();
     let xdg_root = xdg.path().canonicalize().unwrap();

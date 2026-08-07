@@ -8,9 +8,9 @@
 //!
 //! The output goes to a file rather than nowhere because pasta reports the whole
 //! topology it configured, and that report is the only evidence hort would ever
-//! have about it. The file lives in the sandbox's own state directory, which is
-//! removed whole when the sandbox goes down, so keeping it needs no teardown step
-//! of its own and leaves nothing behind on the host.
+//! have about it. The file lives in the sandbox's own runtime directory, next to
+//! what the other surviving processes wrote and under a root the restart empties,
+//! so the most a leaked one costs is a file until the machine comes back up.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -46,9 +46,9 @@ mod tests {
 
         let log = sandbox_log_path(sandbox_dir.path());
 
-        // Everything under a sandbox's state directory goes away with the
-        // sandbox, so a log kept there is removed by the teardown that already
-        // exists and never outlives the box whose output it holds.
+        // The sandbox's runtime directory is emptied and taken away when the
+        // sandbox is torn down, so a log kept there never outlives the box whose
+        // output it holds.
         assert!(log.starts_with(sandbox_dir.path()));
     }
 

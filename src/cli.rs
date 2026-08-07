@@ -120,10 +120,14 @@ pub struct RealDeps {
 }
 
 impl RealDeps {
-    /// Resolve the state root and project directory and wire the real adapters.
-    /// The state root is created if missing, and both it and the project
-    /// directory are canonicalized so a symlinked root cannot make a record's
-    /// stored worktree path disagree with the path git reports.
+    /// Resolve the two roots and the project directory and wire the real
+    /// adapters. The state root is created if missing, and both it and the
+    /// project directory are canonicalized so a symlinked root cannot make a
+    /// record's stored worktree path disagree with the path git reports.
+    ///
+    /// Which root an adapter is handed is decided here and nowhere else: the ones
+    /// that keep a record of the sandbox get the state root, the ones whose files
+    /// mean nothing after a restart get the runtime root.
     ///
     /// Building the configuration reader reads nothing. Configuration is a
     /// precondition of building a sandbox and of nothing else, so a project whose
@@ -152,15 +156,16 @@ impl RealDeps {
         let project_dir = find_project_dir(&current_dir);
         let adapters_dir = project_dir.clone().unwrap_or_else(|| current_dir.clone());
         let host_home = home_dir()?;
+        let runtime_root = resolve_runtime_root();
 
         Ok(Self {
             lock: FlockSandboxLock::new(state_root.clone()),
             store: FileMetadataStore::new(state_root.clone()),
             probe: ProcLivenessProbe,
             worktrees: GitWorktreeProvider::new(adapters_dir.clone(), state_root.clone()),
-            runtime: LibcontainerRuntime::new(resolve_youki_root(), state_root.clone()),
+            runtime: LibcontainerRuntime::new(runtime_root.clone()),
             sessions: NullRuntime,
-            network: PastaNetworkProvider::new(state_root.clone()),
+            network: PastaNetworkProvider::new(runtime_root),
             terminal: HostTerminal,
             clock: SystemClock,
             confirmer: StdinConfirmer,
@@ -194,7 +199,8 @@ fn resolve_config_root() -> Result<PathBuf, HortError> {
     }
 }
 
-/// The directory the embedded runtime keeps its container state in:
+/// The directory hort keeps everything a restart makes meaningless in: the
+/// container states, and the files the host-side helpers of a sandbox write.
 /// `$XDG_RUNTIME_DIR/hort` when that variable names a directory, otherwise
 /// `/run/user/<uid>/hort`.
 ///
@@ -202,8 +208,10 @@ fn resolve_config_root() -> Result<PathBuf, HortError> {
 /// tidiness. The runtime refuses to build a container whose id it already has
 /// state for, so state that outlived the anchor it describes would make
 /// `up <name>` fail for good after a crash, leaving no way back but deleting
-/// files by hand. Keeping it under hort's own state would do exactly that.
-fn resolve_youki_root() -> PathBuf {
+/// files by hand. Keeping it under hort's own state would do exactly that, and
+/// the helpers have a second reason: they exec binaries the distribution labels,
+/// and the label a user's records carry refuses what those binaries write.
+fn resolve_runtime_root() -> PathBuf {
     xdg_hort_dir("XDG_RUNTIME_DIR").unwrap_or_else(|| {
         let uid = unsafe { libc::getuid() };
         PathBuf::from(format!("/run/user/{uid}")).join("hort")

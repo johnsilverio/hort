@@ -16,10 +16,17 @@
 //! process publishes one. pasta outlives the holder, which is why the holder is
 //! not one of the things tearing a sandbox down has to stop.
 //!
-//! The pid pasta records lives in the sandbox's state directory rather than in
-//! its metadata record, so nothing writes that record outside the build lock.
-//! Teardown reads the process's command line before signalling it, because a pid
-//! is reusable.
+//! The pid pasta records lives in a file rather than in the sandbox's metadata
+//! record, so nothing writes that record outside the build lock. Teardown reads
+//! the process's command line before signalling it, because a pid is reusable.
+//!
+//! That file, and every other file the helpers of one sandbox write, lives under
+//! the runtime root and never under the one hort keeps its records in. pasta is a
+//! binary the distribution labels, so it runs under a policy of its own from the
+//! moment it is executed, and the directory a user's records live in is one that
+//! policy refuses to write to: the pid file fails, pasta exits, and the log that
+//! would have said so is refused by the same rule. Nothing here is worth keeping
+//! past a restart anyway, which is what the runtime root is for.
 
 use std::ffi::OsStr;
 use std::fs::{self, File};
@@ -51,18 +58,18 @@ const HANDSHAKE: [u8; 1] = [1];
 /// The `NetworkProvider` hort wires real sandboxes with: pasta attached to the
 /// sandbox's network namespace, plus the route shaping an allowlist needs.
 pub struct PastaNetworkProvider {
-    state_root: PathBuf,
+    runtime_root: PathBuf,
 }
 
 impl PastaNetworkProvider {
-    /// Build a provider keeping each sandbox's pasta pid file under `state_root`,
-    /// which is also where teardown looks for it.
-    pub fn new(state_root: PathBuf) -> Self {
-        Self { state_root }
+    /// Build a provider keeping each sandbox's helper files under `runtime_root`,
+    /// which is also where teardown looks for them.
+    pub fn new(runtime_root: PathBuf) -> Self {
+        Self { runtime_root }
     }
 
     fn sandbox_dir(&self, name: &SandboxName) -> PathBuf {
-        self.state_root.join(SANDBOXES_DIR).join(name.as_str())
+        self.runtime_root.join(SANDBOXES_DIR).join(name.as_str())
     }
 
     fn pid_file(&self, name: &SandboxName) -> PathBuf {
@@ -120,15 +127,23 @@ impl PastaNetworkProvider {
         Ok(())
     }
 
-    /// Stop every host-side process a sandbox leaves behind. Each is stopped
-    /// whatever the others did: one that stayed behind because another failed is
-    /// one nothing ever comes back for.
+    /// Stop every host-side process a sandbox leaves behind, and take away what
+    /// recorded them. Each is stopped whatever the others did: one that stayed
+    /// behind because another failed is one nothing ever comes back for.
+    ///
+    /// Only what this side wrote, and the directory itself only if that empties
+    /// it. The log next to these files belongs to the container half, which is
+    /// still writing to it while this runs, and whichever of the two ends up
+    /// removing the last file removes the directory with it. One that will not go
+    /// is not a failure: it is a directory the next restart takes away.
     fn stop(&self, name: &SandboxName) -> Result<(), String> {
         let sandbox_dir = self.sandbox_dir(name);
         let stopped_pasta = self.stop_pasta_of(name);
         let stopped_proxy = proxy::stop(&sandbox_dir);
         let stopped_forwarding = forwarder::stop(&sandbox_dir);
-        stopped_pasta.and(stopped_proxy).and(stopped_forwarding)
+        let forgotten_ports = landlock::record_connect_ports(&sandbox_dir, None);
+        let _ = fs::remove_dir(&sandbox_dir);
+        stopped_pasta.and(stopped_proxy).and(stopped_forwarding).and(forgotten_ports)
     }
 
     fn stop_pasta_of(&self, name: &SandboxName) -> Result<(), String> {
@@ -369,7 +384,7 @@ mod tests {
     use crate::ports::DbForward;
 
     const USERNS: &str = "/proc/4242/ns/user";
-    const PID_FILE: &str = "/state/sandboxes/demo/pasta.pid";
+    const PID_FILE: &str = "/runtime/sandboxes/demo/pasta.pid";
     /// A port the kernel could have handed the sandbox's proxy.
     const PROXY_PORT: u16 = 44001;
     /// A destination reserved for documentation, so nothing ever answers there:
@@ -434,7 +449,7 @@ mod tests {
                 "--config-net",
                 "--no-netns-quit",
                 "-P",
-                "/state/sandboxes/demo/pasta.pid",
+                "/runtime/sandboxes/demo/pasta.pid",
             ]
         );
     }
@@ -466,7 +481,7 @@ mod tests {
                 "-T",
                 "44001,5432",
                 "-P",
-                "/state/sandboxes/demo/pasta.pid",
+                "/runtime/sandboxes/demo/pasta.pid",
             ]
         );
     }
@@ -494,7 +509,7 @@ mod tests {
                 "-T",
                 "44001,5432,6379",
                 "-P",
-                "/state/sandboxes/demo/pasta.pid",
+                "/runtime/sandboxes/demo/pasta.pid",
             ]
         );
     }
@@ -525,7 +540,7 @@ mod tests {
                 "-T",
                 "44001",
                 "-P",
-                "/state/sandboxes/demo/pasta.pid",
+                "/runtime/sandboxes/demo/pasta.pid",
             ]
         );
     }
@@ -548,8 +563,8 @@ mod tests {
 
     #[test]
     fn provision_fails_when_the_sandbox_namespace_is_gone() {
-        let state_root = tempfile::tempdir().unwrap();
-        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let runtime_root = tempfile::tempdir().unwrap();
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
         let mut spec = network_spec(EgressPolicy::Open, Vec::new());
         spec.netns = PathBuf::from("/proc/nonexistent/ns/net");
 
@@ -563,8 +578,8 @@ mod tests {
 
     #[test]
     fn teardown_is_idempotent_for_an_unknown_sandbox() {
-        let state_root = tempfile::tempdir().unwrap();
-        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let runtime_root = tempfile::tempdir().unwrap();
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
 
         let result = provider.teardown(&SandboxName::new("ghost").unwrap());
 
@@ -573,11 +588,11 @@ mod tests {
 
     #[test]
     fn teardown_survives_a_pid_file_it_cannot_read_as_a_pid() {
-        let state_root = tempfile::tempdir().unwrap();
-        let sandbox_dir = state_root.path().join("sandboxes").join("demo");
+        let runtime_root = tempfile::tempdir().unwrap();
+        let sandbox_dir = runtime_root.path().join("sandboxes").join("demo");
         fs::create_dir_all(&sandbox_dir).unwrap();
         fs::write(sandbox_dir.join("pasta.pid"), "half a pid\n").unwrap();
-        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
 
         let result = provider.teardown(&SandboxName::new("demo").unwrap());
 
@@ -589,15 +604,15 @@ mod tests {
 
     #[test]
     fn teardown_leaves_a_pid_that_is_no_longer_pasta_alone() {
-        let state_root = tempfile::tempdir().unwrap();
-        let sandbox_dir = state_root.path().join("sandboxes").join("demo");
+        let runtime_root = tempfile::tempdir().unwrap();
+        let sandbox_dir = runtime_root.path().join("sandboxes").join("demo");
         fs::create_dir_all(&sandbox_dir).unwrap();
         // The test process itself: a live pid that is certainly not pasta. A pid
         // is reusable, so a teardown that signals whatever the file names would
         // take this suite down with it.
         let recorded = std::process::id();
         fs::write(sandbox_dir.join("pasta.pid"), format!("{recorded}\n")).unwrap();
-        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
 
         let result = provider.teardown(&SandboxName::new("demo").unwrap());
 
@@ -607,11 +622,11 @@ mod tests {
 
     #[test]
     fn tearing_a_sandbox_down_stops_its_proxy() {
-        let state_root = tempfile::tempdir().unwrap();
-        let sandbox_dir = state_root.path().join("sandboxes").join("demo");
+        let runtime_root = tempfile::tempdir().unwrap();
+        let sandbox_dir = runtime_root.path().join("sandboxes").join("demo");
         fs::create_dir_all(&sandbox_dir).unwrap();
         let port = proxy::start(&sandbox_dir, &allowlist()).unwrap();
-        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
 
         provider.teardown(&SandboxName::new("demo").unwrap()).unwrap();
 
@@ -623,12 +638,12 @@ mod tests {
 
     #[test]
     fn tearing_a_sandbox_down_stops_its_database_forwarding() {
-        let state_root = tempfile::tempdir().unwrap();
-        let sandbox_dir = state_root.path().join("sandboxes").join("demo");
+        let runtime_root = tempfile::tempdir().unwrap();
+        let sandbox_dir = runtime_root.path().join("sandboxes").join("demo");
         fs::create_dir_all(&sandbox_dir).unwrap();
         let port = a_declared_port();
         forwarder::start(&sandbox_dir, &[remote_database_on(port)]).unwrap();
-        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
 
         provider.teardown(&SandboxName::new("demo").unwrap()).unwrap();
 
@@ -636,6 +651,27 @@ mod tests {
         // Left running, it holds the port of a database the next sandbox declares
         // just as much as it holds the one it was started for.
         assert!(stopped_answering_within_deadline(port));
+    }
+
+    #[test]
+    fn tearing_a_sandbox_down_leaves_no_runtime_directory_behind() {
+        let runtime_root = tempfile::tempdir().unwrap();
+        let sandbox_dir = runtime_root.path().join("sandboxes").join("demo");
+        fs::create_dir_all(&sandbox_dir).unwrap();
+        landlock::record_connect_ports(&sandbox_dir, Some(&[PROXY_PORT])).unwrap();
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
+        // Read before the act, because a directory holding nothing is a directory
+        // that goes whatever teardown did about what this side writes.
+        assert_eq!(landlock::recorded_connect_ports(&sandbox_dir).unwrap(), Some(vec![PROXY_PORT]));
+
+        provider.teardown(&SandboxName::new("demo").unwrap()).unwrap();
+
+        // Nothing sweeps this directory: each of its two owners takes away only
+        // what it wrote, and it is the last file leaving that takes the directory.
+        // An owner that forgets one of its own therefore leaves the directory
+        // standing for the life of the machine, holding a record of the ports a
+        // sandbox that no longer exists was reachable on.
+        assert!(!sandbox_dir.exists());
     }
 }
 
@@ -753,8 +789,8 @@ mod privileged_tests {
         }
     }
 
-    fn sandbox_dir(state_root: &Path) -> PathBuf {
-        state_root.join("sandboxes/demo")
+    fn sandbox_dir(runtime_root: &Path) -> PathBuf {
+        runtime_root.join("sandboxes/demo")
     }
 
     /// The sandbox's IPv4 routing table as the host reads it. An emptied table is
@@ -772,9 +808,9 @@ mod privileged_tests {
     }
 
     /// The pid pasta recorded for this sandbox.
-    fn recorded_pasta_pid(state_root: &Path) -> u32 {
+    fn recorded_pasta_pid(runtime_root: &Path) -> u32 {
         let recorded =
-            fs::read_to_string(state_root.join("sandboxes/demo/pasta.pid")).expect("a pid file");
+            fs::read_to_string(runtime_root.join("sandboxes/demo/pasta.pid")).expect("a pid file");
         recorded.trim().parse().expect("a pid")
     }
 
@@ -809,20 +845,17 @@ mod privileged_tests {
     #[serial]
     fn provision_attaches_pasta_to_the_sandbox_namespace() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = LibcontainerRuntime::new(
-            youki_root.path().to_path_buf(),
-            state_root.path().to_path_buf(),
-        );
+        let runtime = LibcontainerRuntime::new(runtime_root.path().to_path_buf());
         let spec = sandbox_spec(rootfs, state_root.path());
         let token = runtime.start_anchor(&spec).unwrap();
-        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
 
         let provisioned = provider.provision(&open_network(&spec.name, token.pid.0));
 
         assert!(provisioned.is_ok());
-        let pasta = recorded_pasta_pid(state_root.path());
+        let pasta = recorded_pasta_pid(runtime_root.path());
         let cmdline = fs::read(format!("/proc/{pasta}/cmdline")).unwrap();
         assert!(String::from_utf8_lossy(&cmdline).contains("pasta"));
         provider.teardown(&spec.name).unwrap();
@@ -834,15 +867,12 @@ mod privileged_tests {
     #[serial]
     fn provisioning_keeps_what_pasta_reports_in_the_sandbox_log() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = LibcontainerRuntime::new(
-            youki_root.path().to_path_buf(),
-            state_root.path().to_path_buf(),
-        );
+        let runtime = LibcontainerRuntime::new(runtime_root.path().to_path_buf());
         let spec = sandbox_spec(rootfs, state_root.path());
         let token = runtime.start_anchor(&spec).unwrap();
-        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
 
         provider.provision(&open_network(&spec.name, token.pid.0)).unwrap();
 
@@ -850,7 +880,7 @@ mod privileged_tests {
         // report is the only account hort ever gets of the one host-side helper
         // whose failure is otherwise silent. It goes to the stream pasta was
         // started with, and the process that survives keeps that stream open.
-        let sandbox_dir = state_root.path().join("sandboxes/demo");
+        let sandbox_dir = sandbox_dir(runtime_root.path());
         let logged = fs::read_to_string(sandbox_log_path(&sandbox_dir)).expect("the sandbox log");
         assert!(!logged.is_empty());
         provider.teardown(&spec.name).unwrap();
@@ -862,15 +892,12 @@ mod privileged_tests {
     #[serial]
     fn allowlist_provisioning_empties_the_sandbox_routing_table() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = LibcontainerRuntime::new(
-            youki_root.path().to_path_buf(),
-            state_root.path().to_path_buf(),
-        );
+        let runtime = LibcontainerRuntime::new(runtime_root.path().to_path_buf());
         let spec = sandbox_spec(rootfs, state_root.path());
         let token = runtime.start_anchor(&spec).unwrap();
-        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
 
         provider.provision(&allowlist_network(&spec.name, token.pid.0)).unwrap();
 
@@ -888,17 +915,14 @@ mod privileged_tests {
     #[serial]
     fn teardown_stops_the_pasta_of_a_sandbox() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = LibcontainerRuntime::new(
-            youki_root.path().to_path_buf(),
-            state_root.path().to_path_buf(),
-        );
+        let runtime = LibcontainerRuntime::new(runtime_root.path().to_path_buf());
         let spec = sandbox_spec(rootfs, state_root.path());
         let token = runtime.start_anchor(&spec).unwrap();
-        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
         provider.provision(&open_network(&spec.name, token.pid.0)).unwrap();
-        let pasta = recorded_pasta_pid(state_root.path());
+        let pasta = recorded_pasta_pid(runtime_root.path());
 
         provider.teardown(&spec.name).unwrap();
 
@@ -913,15 +937,12 @@ mod privileged_tests {
     #[serial]
     fn allowlist_provisioning_starts_the_sandbox_proxy() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = LibcontainerRuntime::new(
-            youki_root.path().to_path_buf(),
-            state_root.path().to_path_buf(),
-        );
+        let runtime = LibcontainerRuntime::new(runtime_root.path().to_path_buf());
         let spec = sandbox_spec(rootfs, state_root.path());
         let token = runtime.start_anchor(&spec).unwrap();
-        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
 
         provider
             .provision(&allowlist_network_permitting_one_host(&spec.name, token.pid.0))
@@ -930,7 +951,7 @@ mod privileged_tests {
         // Closing the namespace is only half of the posture. A sandbox whose
         // routes are gone and whose proxy was never started is not restricted,
         // it is disconnected, and the allowlist it was given permits nothing.
-        let port = proxy::recorded_port(&sandbox_dir(state_root.path())).expect("a proxy port");
+        let port = proxy::recorded_port(&sandbox_dir(runtime_root.path())).expect("a proxy port");
         assert!(TcpStream::connect(("127.0.0.1", port)).is_ok());
         provider.teardown(&spec.name).unwrap();
         runtime.teardown(&spec.name).unwrap();
@@ -941,15 +962,12 @@ mod privileged_tests {
     #[serial]
     fn allowlist_provisioning_tells_pasta_to_splice_the_proxy_port() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = LibcontainerRuntime::new(
-            youki_root.path().to_path_buf(),
-            state_root.path().to_path_buf(),
-        );
+        let runtime = LibcontainerRuntime::new(runtime_root.path().to_path_buf());
         let spec = sandbox_spec(rootfs, state_root.path());
         let token = runtime.start_anchor(&spec).unwrap();
-        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
 
         provider
             .provision(&allowlist_network_permitting_one_host(&spec.name, token.pid.0))
@@ -959,8 +977,8 @@ mod privileged_tests {
         // splice that one port, which is also why the proxy has to be listening
         // before pasta is started: an unspliced proxy is a proxy nobody inside
         // can talk to.
-        let port = proxy::recorded_port(&sandbox_dir(state_root.path())).expect("a proxy port");
-        let pasta = recorded_pasta_pid(state_root.path());
+        let port = proxy::recorded_port(&sandbox_dir(runtime_root.path())).expect("a proxy port");
+        let pasta = recorded_pasta_pid(runtime_root.path());
         let cmdline = fs::read(format!("/proc/{pasta}/cmdline")).unwrap();
         assert!(String::from_utf8_lossy(&cmdline).contains(&port.to_string()));
         provider.teardown(&spec.name).unwrap();
@@ -972,15 +990,12 @@ mod privileged_tests {
     #[serial]
     fn allowlist_provisioning_records_the_ports_a_session_may_connect_to() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = LibcontainerRuntime::new(
-            youki_root.path().to_path_buf(),
-            state_root.path().to_path_buf(),
-        );
+        let runtime = LibcontainerRuntime::new(runtime_root.path().to_path_buf());
         let spec = sandbox_spec(rootfs, state_root.path());
         let token = runtime.start_anchor(&spec).unwrap();
-        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
         let declared = a_declared_port();
 
         provider
@@ -991,7 +1006,7 @@ mod privileged_tests {
         // wired for, so it is written down here, by the run that wired it, and
         // not derived again from a configuration file that may have been edited
         // since. These two ports are the whole of what the sandbox can reach.
-        let sandbox_dir = sandbox_dir(state_root.path());
+        let sandbox_dir = sandbox_dir(runtime_root.path());
         let proxy = proxy::recorded_port(&sandbox_dir).expect("a proxy port");
         let recorded = recorded_connect_ports(&sandbox_dir);
         assert!(recorded.contains(&proxy));
@@ -1006,22 +1021,19 @@ mod privileged_tests {
     #[serial]
     fn open_provisioning_starts_no_proxy() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = LibcontainerRuntime::new(
-            youki_root.path().to_path_buf(),
-            state_root.path().to_path_buf(),
-        );
+        let runtime = LibcontainerRuntime::new(runtime_root.path().to_path_buf());
         let spec = sandbox_spec(rootfs, state_root.path());
         let token = runtime.start_anchor(&spec).unwrap();
-        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
 
         provider.provision(&open_network(&spec.name, token.pid.0)).unwrap();
 
         // Open egress is unfiltered by contract, so a proxy standing in an open
         // sandbox would be a chokepoint nobody asked for and a second thing to
         // stop for no gain.
-        assert_eq!(proxy::recorded_port(&sandbox_dir(state_root.path())), None);
+        assert_eq!(proxy::recorded_port(&sandbox_dir(runtime_root.path())), None);
         provider.teardown(&spec.name).unwrap();
         runtime.teardown(&spec.name).unwrap();
     }
@@ -1031,17 +1043,14 @@ mod privileged_tests {
     #[serial]
     fn provisioning_a_resumed_sandbox_stops_the_pasta_it_left_behind() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = LibcontainerRuntime::new(
-            youki_root.path().to_path_buf(),
-            state_root.path().to_path_buf(),
-        );
+        let runtime = LibcontainerRuntime::new(runtime_root.path().to_path_buf());
         let spec = sandbox_spec(rootfs, state_root.path());
         let first = runtime.start_anchor(&spec).unwrap();
-        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
         provider.provision(&open_network(&spec.name, first.pid.0)).unwrap();
-        let left_behind = recorded_pasta_pid(state_root.path());
+        let left_behind = recorded_pasta_pid(runtime_root.path());
         runtime.teardown(&spec.name).unwrap();
 
         let resumed = runtime.start_anchor(&spec).unwrap();
@@ -1062,20 +1071,17 @@ mod privileged_tests {
     #[serial]
     fn allowlist_provisioning_of_a_resumed_sandbox_stops_the_proxy_it_left_behind() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = LibcontainerRuntime::new(
-            youki_root.path().to_path_buf(),
-            state_root.path().to_path_buf(),
-        );
+        let runtime = LibcontainerRuntime::new(runtime_root.path().to_path_buf());
         let spec = sandbox_spec(rootfs, state_root.path());
         let first = runtime.start_anchor(&spec).unwrap();
-        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
         provider
             .provision(&allowlist_network_permitting_one_host(&spec.name, first.pid.0))
             .unwrap();
         let left_behind =
-            proxy::recorded_port(&sandbox_dir(state_root.path())).expect("a proxy port");
+            proxy::recorded_port(&sandbox_dir(runtime_root.path())).expect("a proxy port");
         runtime.teardown(&spec.name).unwrap();
 
         let resumed = runtime.start_anchor(&spec).unwrap();
@@ -1097,15 +1103,12 @@ mod privileged_tests {
     #[serial]
     fn open_provisioning_forwards_the_declared_databases() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = LibcontainerRuntime::new(
-            youki_root.path().to_path_buf(),
-            state_root.path().to_path_buf(),
-        );
+        let runtime = LibcontainerRuntime::new(runtime_root.path().to_path_buf());
         let spec = sandbox_spec(rootfs, state_root.path());
         let token = runtime.start_anchor(&spec).unwrap();
-        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
         let port = a_declared_port();
 
         provider.provision(&open_network_with_a_database(&spec.name, token.pid.0, port)).unwrap();

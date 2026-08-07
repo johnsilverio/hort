@@ -24,8 +24,15 @@
 //!
 //! Enumerating the live anchors reads the same state back. Loading a container
 //! refreshes its status against the `/proc` entry of the pid it recorded, so
-//! walking the state root and loading each entry answers which anchors are up
-//! without a daemon and without hort ever parsing the runtime's file format.
+//! walking the container states and loading each entry answers which anchors are
+//! up without a daemon and without hort ever parsing the runtime's file format.
+//!
+//! Everything this adapter writes is meaningless once the machine restarts, so it
+//! all lives under the runtime root: the container states under one directory, the
+//! files belonging to one sandbox under another. Keeping them apart is what lets a
+//! sandbox be named after either directory without one family landing inside the
+//! other. What remembers the sandbox across a reboot reaches here through the spec
+//! instead, and this adapter never writes to it.
 //!
 //! The spec the container is built from is assembled by a pure function over
 //! plain data, which is what keeps the interesting decisions (empty capability
@@ -58,7 +65,7 @@ use libcontainer::workload::{Executor, ExecutorError, ExecutorValidationError};
 use crate::adapters::console;
 use crate::adapters::landlock;
 use crate::adapters::namespaces::{enter, owning_user_namespace};
-use crate::adapters::streams::open_sandbox_log;
+use crate::adapters::streams::{open_sandbox_log, sandbox_log_path};
 use crate::domain::error::HortError;
 use crate::domain::model::{AnchorPid, LivenessToken, MountNsInode, SandboxName};
 use crate::domain::mounts::SANDBOX_HOME;
@@ -68,7 +75,9 @@ use crate::ports::{
 };
 
 const SANDBOXES_DIR: &str = "sandboxes";
+const CONTAINERS_DIR: &str = "containers";
 const BUNDLE_DIR: &str = "bundle";
+const CONSOLE_SUFFIXES: [&str; 2] = [".console", ".process.json"];
 const CONFIG_FILE: &str = "config.json";
 const UPPER_LAYER: &str = "upper";
 const WORK_LAYER: &str = "work";
@@ -96,28 +105,79 @@ impl SessionProbe for NullRuntime {
 /// The `ContainerRuntime` hort runs sandboxes on, embedding the OCI runtime in
 /// hort's own process: no daemon, no container binary to shell out to.
 pub struct LibcontainerRuntime {
-    youki_root: PathBuf,
-    state_root: PathBuf,
+    runtime_root: PathBuf,
 }
 
 impl LibcontainerRuntime {
-    /// Build a runtime keeping container state under `youki_root` (the same
-    /// registry the live-anchor enumeration walks) and per-sandbox files under
-    /// `state_root`.
-    pub fn new(youki_root: PathBuf, state_root: PathBuf) -> Self {
-        Self { youki_root, state_root }
+    /// Build a runtime keeping the container states and each sandbox's own
+    /// runtime files under `runtime_root`, which is also the registry the
+    /// live-anchor enumeration walks.
+    pub fn new(runtime_root: PathBuf) -> Self {
+        Self { runtime_root }
     }
 
     fn sandbox_dir(&self, name: &SandboxName) -> PathBuf {
-        self.state_root.join(SANDBOXES_DIR).join(name.as_str())
+        self.runtime_root.join(SANDBOXES_DIR).join(name.as_str())
     }
 
     fn bundle_dir(&self, name: &SandboxName) -> PathBuf {
         self.sandbox_dir(name).join(BUNDLE_DIR)
     }
 
+    /// Where every container state lives. A directory of its own, because a
+    /// sandbox may be named after the directory its neighbours keep their runtime
+    /// files in, and one family nested in the other would put that sandbox's state
+    /// on top of all of theirs.
+    fn containers_root(&self) -> PathBuf {
+        self.runtime_root.join(CONTAINERS_DIR)
+    }
+
     fn container_dir(&self, name: &SandboxName) -> PathBuf {
-        self.youki_root.join(name.as_str())
+        self.containers_root().join(name.as_str())
+    }
+
+    /// Take back what this adapter wrote for one sandbox, and the directory it
+    /// wrote it in once nothing is left there.
+    ///
+    /// Only its own files: the pid files next to them belong to the host-side
+    /// helpers, whose own teardown is the only thing that stops the processes they
+    /// name, and a sweep of the whole directory would leave a survivor running
+    /// with nothing left to recognize it by. Whichever side empties the directory
+    /// last removes it, and one that will not go is a directory the next restart
+    /// takes away.
+    fn remove_runtime_files(&self, name: &SandboxName) {
+        let sandbox_dir = self.sandbox_dir(name);
+        let _ = fs::remove_file(sandbox_log_path(&sandbox_dir));
+        let _ = fs::remove_dir_all(self.bundle_dir(name));
+        remove_console_leftovers(&sandbox_dir);
+        let _ = fs::remove_dir(&sandbox_dir);
+    }
+
+    /// Stop the sandbox's container, and with it every process joined to it.
+    fn stop_container(&self, name: &SandboxName) -> Result<(), HortError> {
+        let container_dir = self.container_dir(name);
+        if !container_dir.exists() {
+            // Teardown runs against a record, and the kernel is free to have
+            // outlived it: a sandbox the runtime never knew, or no longer knows,
+            // is already torn down.
+            return Ok(());
+        }
+
+        let mut container = Container::load(container_dir).map_err(|err| {
+            runtime_failure(format!(
+                "teardown: loading the container state of '{}': {err}",
+                name.as_str()
+            ))
+        })?;
+        // Not redundant: delete races systemd's collection of the emptied scope, so
+        // a late StopUnit hits "Unit not loaded" and aborts before the container dir
+        // is removed. That first failure is the proof the retry needs to finish.
+        if container.delete(true).is_err() {
+            container.delete(true).map_err(|err| {
+                runtime_failure(format!("teardown: stopping '{}': {err}", name.as_str()))
+            })?;
+        }
+        Ok(())
     }
 
     /// Everything that happens inside the sandbox's own namespaces, from the
@@ -147,7 +207,7 @@ impl LibcontainerRuntime {
         mount_merged_root(spec)?;
         let bundle = self.bundle_dir(&spec.name);
         write_bundle_config(&bundle, &anchor_spec(spec))?;
-        start_container(&spec.name, &bundle, &self.youki_root, streams)
+        start_container(&spec.name, &bundle, &self.containers_root(), streams)
     }
 
     /// The console this session asks for, or `None` when it asks for no terminal
@@ -186,7 +246,11 @@ impl LibcontainerRuntime {
 impl ContainerRuntime for LibcontainerRuntime {
     fn start_anchor(&self, spec: &OciSpec) -> Result<LivenessToken, HortError> {
         let owner = host_owner(&spec.workdir)?;
-        let streams = anchor_streams(&self.sandbox_dir(&spec.name)).map_err(runtime_failure)?;
+        let sandbox_dir = self.sandbox_dir(&spec.name);
+        fs::create_dir_all(&sandbox_dir).map_err(|err| {
+            runtime_failure(format!("start_anchor: creating {}: {err}", sandbox_dir.display()))
+        })?;
+        let streams = anchor_streams(&sandbox_dir).map_err(runtime_failure)?;
         let (ready_reader, ready_writer) = channel()?;
         let (released_reader, released_writer) = channel()?;
         let (report_reader, report_writer) = channel()?;
@@ -221,7 +285,7 @@ impl ContainerRuntime for LibcontainerRuntime {
     fn join_session(&self, spec: &SessionSpec) -> Result<Session, HortError> {
         let anchor = self.anchor_pid(&spec.name)?;
         // Read here, and not where it is applied: by then the session is inside
-        // the sandbox, whose root holds no host state directory to read from.
+        // the sandbox, whose root holds nothing of the host to read it from.
         let reachable = landlock::recorded_connect_ports(&self.sandbox_dir(&spec.name))
             .map_err(|detail| runtime_failure(format!("join_session: {detail}")))?;
         let console = self.console_for(spec)?;
@@ -239,7 +303,7 @@ impl ContainerRuntime for LibcontainerRuntime {
                 let session = ConfinedSession { connect_ports: reachable };
                 report_and_exit(
                     report_writer,
-                    open_session(spec, anchor, &self.youki_root, session, console.as_ref()),
+                    open_session(spec, anchor, &self.containers_root(), session, console.as_ref()),
                 );
             }
             child => {
@@ -269,35 +333,18 @@ impl ContainerRuntime for LibcontainerRuntime {
     }
 
     fn teardown(&self, name: &SandboxName) -> Result<(), HortError> {
-        let container_dir = self.container_dir(name);
-        if !container_dir.exists() {
-            // Teardown runs against a record, and the kernel is free to have
-            // outlived it: a sandbox the runtime never knew, or no longer knows,
-            // is already torn down.
-            return Ok(());
-        }
-
-        let mut container = Container::load(container_dir).map_err(|err| {
-            runtime_failure(format!(
-                "teardown: loading the container state of '{}': {err}",
-                name.as_str()
-            ))
-        })?;
-        // Not redundant: delete races systemd's collection of the emptied scope, so
-        // a late StopUnit hits "Unit not loaded" and aborts before the container dir
-        // is removed. That first failure is the proof the retry needs to finish.
-        if container.delete(true).is_err() {
-            container.delete(true).map_err(|err| {
-                runtime_failure(format!("teardown: stopping '{}': {err}", name.as_str()))
-            })?;
-        }
+        // The files go after the container and not before it, because the anchor
+        // is the last process writing to the log.
+        self.stop_container(name)?;
+        self.remove_runtime_files(name);
         Ok(())
     }
 }
 
 impl ContainerRegistry for LibcontainerRuntime {
     fn list_live(&self) -> Result<Vec<RegistryEntry>, HortError> {
-        let container_dirs = match fs::read_dir(&self.youki_root) {
+        let containers_root = self.containers_root();
+        let container_dirs = match fs::read_dir(&containers_root) {
             Ok(entries) => entries,
             // Nothing has been built on this boot, so no anchor is alive. Every
             // command that reconciles asks this before the first sandbox exists.
@@ -308,7 +355,7 @@ impl ContainerRegistry for LibcontainerRuntime {
             Err(err) => {
                 return Err(runtime_failure(format!(
                     "list_live: reading {}: {err}",
-                    self.youki_root.display()
+                    containers_root.display()
                 )));
             }
         };
@@ -471,15 +518,17 @@ fn write_bundle_config(bundle: &Path, spec: &Spec) -> Result<(), String> {
 fn start_container(
     name: &SandboxName,
     bundle: &Path,
-    youki_root: &Path,
+    containers_root: &Path,
     streams: AnchorStreams,
 ) -> Result<u32, String> {
-    fs::create_dir_all(youki_root)
-        .map_err(|err| format!("creating {}: {err}", youki_root.display()))?;
+    fs::create_dir_all(containers_root)
+        .map_err(|err| format!("creating {}: {err}", containers_root.display()))?;
 
     let mut container = ContainerBuilder::new(name.as_str().to_string(), SyscallType::default())
-        .with_root_path(youki_root)
-        .map_err(|err| format!("rooting the container state at {}: {err}", youki_root.display()))?
+        .with_root_path(containers_root)
+        .map_err(|err| {
+            format!("rooting the container state at {}: {err}", containers_root.display())
+        })?
         .with_stdin(streams.input)
         .with_stdout(streams.output)
         .with_stderr(streams.errors)
@@ -579,16 +628,31 @@ impl Drop for SessionConsole {
     }
 }
 
+/// Take away the console files of sessions that were never cleaned up after. A
+/// session removes its own the moment it has been opened, so what this finds is
+/// what a killed hort left behind.
+fn remove_console_leftovers(sandbox_dir: &Path) {
+    let Ok(entries) = fs::read_dir(sandbox_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if CONSOLE_SUFFIXES.iter().any(|suffix| name.ends_with(suffix)) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Listen on a socket named `name` inside `dir`, at an address whose size does
 /// not depend on what `dir` costs. The socket still lands on the real path,
 /// which is what the sandbox connects to and what removes it afterwards.
 ///
 /// A socket address holds 107 bytes of path where a path holds 4096, so naming
-/// the directory in the address spends the budget on the depth of the state root
-/// and leaves the rest to the sandbox name: an ordinary home takes a third of it
-/// before the name is counted, and a state directory on another mount takes the
-/// lot. Naming the directory by an open descriptor instead costs the same few
-/// bytes however deep the sandbox lives.
+/// the directory in the address spends the budget on the depth of the runtime
+/// root and leaves the rest to the sandbox name: a root the user pointed
+/// somewhere of their own can take the lot. Naming the directory by an open
+/// descriptor instead costs the same few bytes however deep the sandbox lives.
 fn listen_in(dir: &Path, name: &str) -> Result<UnixListener, String> {
     let directory = File::open(dir).map_err(|err| format!("opening {}: {err}", dir.display()))?;
     let address = format!("/proc/self/fd/{}/{name}", directory.as_raw_fd());
@@ -668,7 +732,7 @@ fn session_process(spec: &SessionSpec) -> Process {
 fn open_session(
     spec: &SessionSpec,
     anchor: u32,
-    youki_root: &Path,
+    containers_root: &Path,
     session: ConfinedSession,
     console: Option<&SessionConsole>,
 ) -> Result<u32, String> {
@@ -677,7 +741,7 @@ fn open_session(
     let owner = owning_user_namespace(netns.as_fd())?;
 
     enter(&[owner.as_fd(), netns.as_fd(), container_user.as_fd()])?;
-    start_session(spec, youki_root, session, console)
+    start_session(spec, containers_root, session, console)
 }
 
 fn anchor_namespace(anchor: u32, namespace: &str) -> Result<File, String> {
@@ -718,13 +782,15 @@ impl Executor for ConfinedSession {
 /// request, and the runtime insists on a console socket for exactly that pairing.
 fn start_session(
     spec: &SessionSpec,
-    youki_root: &Path,
+    containers_root: &Path,
     session: ConfinedSession,
     console: Option<&SessionConsole>,
 ) -> Result<u32, String> {
     let builder = ContainerBuilder::new(spec.name.as_str().to_string(), SyscallType::default())
-        .with_root_path(youki_root)
-        .map_err(|err| format!("rooting the container state at {}: {err}", youki_root.display()))?
+        .with_root_path(containers_root)
+        .map_err(|err| {
+            format!("rooting the container state at {}: {err}", containers_root.display())
+        })?
         .with_executor(session);
 
     let joined = match console {
@@ -1374,30 +1440,62 @@ mod tests {
 
     #[test]
     fn teardown_is_idempotent_for_an_unknown_sandbox() {
-        let youki_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = LibcontainerRuntime::new(
-            youki_root.path().to_path_buf(),
-            state_root.path().to_path_buf(),
-        );
+        let runtime_root = tempfile::tempdir().unwrap();
+        let runtime = LibcontainerRuntime::new(runtime_root.path().to_path_buf());
 
         let result = runtime.teardown(&SandboxName::new("ghost").unwrap());
 
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn teardown_removes_the_sandbox_runtime_directory() {
+        let runtime_root = tempfile::tempdir().unwrap();
+        let runtime = LibcontainerRuntime::new(runtime_root.path().to_path_buf());
+        let sandbox_runtime_dir = runtime_root.path().join("sandboxes").join("demo");
+        fs::create_dir_all(&sandbox_runtime_dir).unwrap();
+        fs::write(sandbox_runtime_dir.join("output.log"), b"pasta spoke\n").unwrap();
+
+        runtime.teardown(&SandboxName::new("demo").unwrap()).unwrap();
+
+        // Nothing else comes back for these: they used to be swept along by the
+        // removal of the sandbox's state directory, and a runtime directory that
+        // no step removes accumulates one log and one pid file per sandbox for as
+        // long as the machine is up.
+        assert!(!sandbox_runtime_dir.exists());
+    }
+
+    #[test]
+    fn container_state_and_helper_artifacts_do_not_share_a_directory() {
+        let runtime_root = tempfile::tempdir().unwrap();
+        let runtime = LibcontainerRuntime::new(runtime_root.path().to_path_buf());
+        let neighbour = runtime_root.path().join("sandboxes").join("demo");
+        fs::create_dir_all(&neighbour).unwrap();
+        fs::write(neighbour.join("output.log"), b"the anchor spoke\n").unwrap();
+
+        // A name nothing rejects: `SandboxName` refuses only the empty string and
+        // a path separator, so a user is free to call a sandbox after the
+        // directory the others keep their runtime files in.
+        runtime.teardown(&SandboxName::new("sandboxes").unwrap()).unwrap();
+
+        // With the two families in one tree, this one sandbox owns the parent of
+        // every other sandbox's runtime files, and tearing it down takes their
+        // logs and pid files with it, leaving live helpers nothing can stop.
+        assert!(neighbour.join("output.log").exists());
+    }
+
     /// Write the container state a build leaves behind, through the runtime's own
     /// public writer rather than by hand, so what these tests hand the registry is
     /// what a real sandbox writes and no test knows the file format.
-    fn record_container(youki_root: &Path, id: &str, status: ContainerStatus, pid: Option<i32>) {
-        let container_dir = youki_root.join(id);
+    fn record_container(runtime_root: &Path, id: &str, status: ContainerStatus, pid: Option<i32>) {
+        let container_dir = runtime_root.join("containers").join(id);
         let bundle = container_dir.join(BUNDLE_DIR);
         fs::create_dir_all(&bundle).unwrap();
         Container::new(id, status, pid, &bundle, &container_dir).unwrap().save().unwrap();
     }
 
-    fn registry_over(youki_root: &Path) -> LibcontainerRuntime {
-        LibcontainerRuntime::new(youki_root.to_path_buf(), youki_root.join("state"))
+    fn registry_over(runtime_root: &Path) -> LibcontainerRuntime {
+        LibcontainerRuntime::new(runtime_root.to_path_buf())
     }
 
     /// A pid that is certainly alive and certainly readable: this process. What a
@@ -1409,9 +1507,9 @@ mod tests {
 
     #[test]
     fn registry_reports_a_running_container_as_a_live_anchor() {
-        let youki_root = tempfile::tempdir().unwrap();
-        record_container(youki_root.path(), "demo", ContainerStatus::Running, Some(a_live_pid()));
-        let registry = registry_over(youki_root.path());
+        let runtime_root = tempfile::tempdir().unwrap();
+        record_container(runtime_root.path(), "demo", ContainerStatus::Running, Some(a_live_pid()));
+        let registry = registry_over(runtime_root.path());
 
         let live = registry.list_live().unwrap();
 
@@ -1424,9 +1522,9 @@ mod tests {
 
     #[test]
     fn registry_reports_a_token_the_liveness_probe_recognizes() {
-        let youki_root = tempfile::tempdir().unwrap();
-        record_container(youki_root.path(), "demo", ContainerStatus::Running, Some(a_live_pid()));
-        let registry = registry_over(youki_root.path());
+        let runtime_root = tempfile::tempdir().unwrap();
+        record_container(runtime_root.path(), "demo", ContainerStatus::Running, Some(a_live_pid()));
+        let registry = registry_over(runtime_root.path());
 
         let live = registry.list_live().unwrap();
 
@@ -1439,11 +1537,11 @@ mod tests {
 
     #[test]
     fn registry_skips_a_container_directory_it_cannot_read() {
-        let youki_root = tempfile::tempdir().unwrap();
-        record_container(youki_root.path(), "demo", ContainerStatus::Running, Some(a_live_pid()));
-        fs::create_dir_all(youki_root.path().join("half-written")).unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
+        record_container(runtime_root.path(), "demo", ContainerStatus::Running, Some(a_live_pid()));
+        fs::create_dir_all(runtime_root.path().join("containers").join("half-written")).unwrap();
 
-        let live = registry_over(youki_root.path()).list_live().unwrap();
+        let live = registry_over(runtime_root.path()).list_live().unwrap();
 
         // The registry reads state another process wrote and the kernel may have
         // outlived, so a directory it cannot make sense of is an ordinary state,
@@ -1456,15 +1554,15 @@ mod tests {
 
     #[test]
     fn registry_omits_a_container_whose_anchor_is_not_running() {
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         // A live pid with a status short of running: the runtime keeps that
         // status rather than promoting it, so nothing but the status itself
         // stands between this entry and being read as a live anchor. Recording
         // it with a dead pid instead would prove nothing, because a pid nobody
         // can read is dropped a step later anyway.
-        record_container(youki_root.path(), "demo", ContainerStatus::Created, Some(a_live_pid()));
+        record_container(runtime_root.path(), "demo", ContainerStatus::Created, Some(a_live_pid()));
 
-        let live = registry_over(youki_root.path()).list_live().unwrap();
+        let live = registry_over(runtime_root.path()).list_live().unwrap();
 
         // The container state outlives the anchor it describes, so the directory
         // alone means nothing. Reading it as alive makes `ls` report a dead
@@ -1474,12 +1572,12 @@ mod tests {
 
     #[test]
     fn registry_refuses_a_root_it_cannot_read_rather_than_reporting_an_empty_one() {
-        let state_root = tempfile::tempdir().unwrap();
-        let youki_root = state_root.path().join("containers");
-        // Anything but a directory where the root belongs: reading it fails with
-        // a kind that is not "nothing here yet", which is the whole distinction.
-        fs::write(&youki_root, b"not a directory\n").unwrap();
-        let registry = LibcontainerRuntime::new(youki_root, state_root.path().to_path_buf());
+        let runtime_root = tempfile::tempdir().unwrap();
+        // Anything but a directory where the container states belong: reading it
+        // fails with a kind that is not "nothing here yet", which is the whole
+        // distinction.
+        fs::write(runtime_root.path().join("containers"), b"not a directory\n").unwrap();
+        let registry = LibcontainerRuntime::new(runtime_root.path().to_path_buf());
 
         let live = registry.list_live();
 
@@ -1491,11 +1589,8 @@ mod tests {
 
     #[test]
     fn registry_reports_nothing_when_no_container_was_ever_built() {
-        let state_root = tempfile::tempdir().unwrap();
-        let registry = LibcontainerRuntime::new(
-            state_root.path().join("containers"),
-            state_root.path().to_path_buf(),
-        );
+        let runtime_root = tempfile::tempdir().unwrap();
+        let registry = LibcontainerRuntime::new(runtime_root.path().to_path_buf());
 
         let live = registry.list_live().unwrap();
 
@@ -1573,8 +1668,8 @@ mod privileged_tests {
         }
     }
 
-    fn runtime_under(youki_root: &TempDir, state_root: &TempDir) -> LibcontainerRuntime {
-        LibcontainerRuntime::new(youki_root.path().to_path_buf(), state_root.path().to_path_buf())
+    fn runtime_under(runtime_root: &TempDir) -> LibcontainerRuntime {
+        LibcontainerRuntime::new(runtime_root.path().to_path_buf())
     }
 
     /// A session that stays alive long enough to be read from the host, which is
@@ -1589,8 +1684,10 @@ mod privileged_tests {
         }
     }
 
-    fn sandbox_dir(state_root: &Path) -> PathBuf {
-        state_root.join("sandboxes/demo")
+    /// The directory the sandbox's helpers keep their runtime files in: the log,
+    /// the pid files, and the record of the ports a session may reach.
+    fn sandbox_dir(runtime_root: &Path) -> PathBuf {
+        runtime_root.join("sandboxes/demo")
     }
 
     /// The file a session leaves in `/workdir` when it finds a terminal on its
@@ -1842,9 +1939,9 @@ mod privileged_tests {
     #[serial]
     fn anchor_starts_and_reports_its_liveness_token() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&youki_root, &state_root);
+        let runtime = runtime_under(&runtime_root);
         let spec = sandbox_spec(rootfs, state_root.path());
 
         let token = runtime.start_anchor(&spec).unwrap();
@@ -1859,9 +1956,9 @@ mod privileged_tests {
     #[serial]
     fn registry_reports_the_token_the_anchor_was_started_under() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&youki_root, &state_root);
+        let runtime = runtime_under(&runtime_root);
         let spec = sandbox_spec(rootfs, state_root.path());
         let started = runtime.start_anchor(&spec).unwrap();
 
@@ -1884,9 +1981,9 @@ mod privileged_tests {
     #[serial]
     fn registry_stops_reporting_a_sandbox_whose_anchor_was_killed() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&youki_root, &state_root);
+        let runtime = runtime_under(&runtime_root);
         let spec = sandbox_spec(rootfs, state_root.path());
         let started = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(started.pid.0);
@@ -1908,9 +2005,9 @@ mod privileged_tests {
     #[serial]
     fn anchor_runs_with_an_empty_capability_set() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&youki_root, &state_root);
+        let runtime = runtime_under(&runtime_root);
         let spec = sandbox_spec(rootfs, state_root.path());
 
         let token = runtime.start_anchor(&spec).unwrap();
@@ -1930,9 +2027,9 @@ mod privileged_tests {
     #[serial]
     fn anchor_sees_the_worktree_at_workdir() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&youki_root, &state_root);
+        let runtime = runtime_under(&runtime_root);
         let spec = sandbox_spec(rootfs, state_root.path());
         fs::write(spec.workdir.join("from-the-host"), "worktree").unwrap();
 
@@ -1950,9 +2047,9 @@ mod privileged_tests {
     #[serial]
     fn anchor_root_is_the_merged_overlay() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&youki_root, &state_root);
+        let runtime = runtime_under(&runtime_root);
         let spec = sandbox_spec(rootfs, state_root.path());
         // A file planted in the sandbox's writable layer is visible at the
         // anchor's root only if that root is the overlay merge of the base rootfs
@@ -1974,9 +2071,9 @@ mod privileged_tests {
     #[serial]
     fn teardown_stops_the_anchor() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&youki_root, &state_root);
+        let runtime = runtime_under(&runtime_root);
         let spec = sandbox_spec(rootfs, state_root.path());
         let token = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(token.pid.0);
@@ -1991,9 +2088,9 @@ mod privileged_tests {
     #[serial]
     fn anchor_writes_its_streams_to_the_sandbox_log() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&youki_root, &state_root);
+        let runtime = runtime_under(&runtime_root);
         let spec = sandbox_spec(rootfs, state_root.path());
 
         let token = runtime.start_anchor(&spec).unwrap();
@@ -2003,7 +2100,7 @@ mod privileged_tests {
         // the sandbox: a piped or redirected invocation never reaches EOF and its
         // reader waits on a `sleep infinity` that will never write.
         wait_for_anchor(token.pid.0);
-        let log = sandbox_log_path(&state_root.path().join("sandboxes/demo"));
+        let log = sandbox_log_path(&sandbox_dir(runtime_root.path()));
         assert_eq!(fs::read_link(format!("/proc/{}/fd/1", token.pid.0)).unwrap(), log);
         assert_eq!(fs::read_link(format!("/proc/{}/fd/2", token.pid.0)).unwrap(), log);
         runtime.teardown(&spec.name).unwrap();
@@ -2012,11 +2109,33 @@ mod privileged_tests {
     #[test]
     #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
     #[serial]
+    fn the_state_root_holds_no_sandbox_log() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let runtime_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = runtime_under(&runtime_root);
+        let spec = sandbox_spec(rootfs, state_root.path());
+
+        let token = runtime.start_anchor(&spec).unwrap();
+
+        // The log is written by processes the distribution labels, and the state
+        // root carries a label those processes may not write to, so the one file
+        // hort diagnoses a failed sandbox from is also the one the policy silences.
+        // Writing it in both places would keep that failure and hand the reader two
+        // halves of one account.
+        wait_for_anchor(token.pid.0);
+        assert!(!sandbox_log_path(&state_root.path().join("sandboxes/demo")).exists());
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
     fn the_anchor_reads_from_nothing_rather_than_from_what_invoked_hort() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&youki_root, &state_root);
+        let runtime = runtime_under(&runtime_root);
         let spec = sandbox_spec(rootfs, state_root.path());
         let invocation_input = state_root.path().join("invocation-input");
         fs::write(&invocation_input, b"").unwrap();
@@ -2041,9 +2160,9 @@ mod privileged_tests {
     #[serial]
     fn anchor_runs_as_the_host_user_that_owns_the_worktree() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&youki_root, &state_root);
+        let runtime = runtime_under(&runtime_root);
         let spec = sandbox_spec(rootfs, state_root.path());
 
         let token = runtime.start_anchor(&spec).unwrap();
@@ -2062,9 +2181,9 @@ mod privileged_tests {
     #[serial]
     fn session_joins_the_sandbox_mount_namespace() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&youki_root, &state_root);
+        let runtime = runtime_under(&runtime_root);
         let spec = sandbox_spec(rootfs, state_root.path());
         let token = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(token.pid.0);
@@ -2080,9 +2199,9 @@ mod privileged_tests {
     #[serial]
     fn session_runs_in_the_sandbox_network_namespace() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&youki_root, &state_root);
+        let runtime = runtime_under(&runtime_root);
         let spec = sandbox_spec(rootfs, state_root.path());
         let token = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(token.pid.0);
@@ -2103,9 +2222,9 @@ mod privileged_tests {
     #[serial]
     fn a_session_finds_a_writable_home_at_the_dedicated_path() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&youki_root, &state_root);
+        let runtime = runtime_under(&runtime_root);
         let spec = sandbox_spec(rootfs, state_root.path());
         let token = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(token.pid.0);
@@ -2127,9 +2246,9 @@ mod privileged_tests {
     #[serial]
     fn a_session_reads_a_dotfile_mounted_from_the_host() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&youki_root, &state_root);
+        let runtime = runtime_under(&runtime_root);
         let spec = OciSpec {
             mounts: vec![dotfile_mount(state_root.path())],
             ..sandbox_spec(rootfs, state_root.path())
@@ -2153,9 +2272,9 @@ mod privileged_tests {
     #[serial]
     fn a_session_cannot_write_to_a_read_only_mount() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&youki_root, &state_root);
+        let runtime = runtime_under(&runtime_root);
         let spec = OciSpec {
             mounts: vec![dotfile_mount(state_root.path())],
             ..sandbox_spec(rootfs, state_root.path())
@@ -2177,9 +2296,9 @@ mod privileged_tests {
     #[serial]
     fn a_session_that_asked_for_a_terminal_runs_on_one() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&youki_root, &state_root);
+        let runtime = runtime_under(&runtime_root);
         let spec = sandbox_spec(rootfs, state_root.path());
         let token = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(token.pid.0);
@@ -2201,9 +2320,9 @@ mod privileged_tests {
     #[serial]
     fn the_master_of_a_session_terminal_reaches_hort() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&youki_root, &state_root);
+        let runtime = runtime_under(&runtime_root);
         let spec = sandbox_spec(rootfs, state_root.path());
         let token = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(token.pid.0);
@@ -2221,29 +2340,29 @@ mod privileged_tests {
     #[test]
     #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
     #[serial]
-    fn a_session_gets_its_terminal_under_a_deep_state_root() {
+    fn a_session_gets_its_terminal_under_a_deep_runtime_root() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        // A state root as deep as real ones get: an XDG state home under a long
-        // login name, a home on an organisation path, a state dir on an external
-        // mount. Every test path in this repo lives directly under /tmp and is
-        // therefore short, so nothing else here can tell a socket address that
-        // fits from one that does not.
-        let deep = state_root
+        // A runtime root as deep as one gets: the variable that names it is the
+        // user's to set, and a session bus or a container tool that points it at a
+        // path of its own is enough. Every test path in this repo lives directly
+        // under /tmp and is therefore short, so nothing else here can tell a socket
+        // address that fits from one that does not.
+        let deep = runtime_root
             .path()
-            .join("home-on-a-long-organisation-path")
-            .join("with-a-nested-xdg-state-home");
+            .join("runtime-dir-on-a-long-organisation-path")
+            .join("with-a-nested-hort-root");
         fs::create_dir_all(&deep).unwrap();
-        let runtime = LibcontainerRuntime::new(youki_root.path().to_path_buf(), deep.clone());
-        let spec = sandbox_spec(rootfs, &deep);
+        let runtime = LibcontainerRuntime::new(deep.clone());
+        let spec = sandbox_spec(rootfs, state_root.path());
         let token = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(token.pid.0);
 
         // A Unix socket address is capped at 107 usable bytes, so a console
-        // socket named from the state root spends that budget on the depth of the
-        // path and leaves the rest to the sandbox name. hort listens on this one
-        // itself, and the limit binds both ends independently: the runtime it
+        // socket named from the runtime root spends that budget on the depth of
+        // the path and leaves the rest to the sandbox name. hort listens on this
+        // one itself, and the limit binds both ends independently: the runtime it
         // embeds dodges it on its own connect by pointing a short symlink at the
         // long path, which does nothing for the address hort binds.
         let session = runtime.join_session(&reporting_session(&spec.name)).unwrap();
@@ -2260,13 +2379,13 @@ mod privileged_tests {
         if !connect_restriction_enforceable() {
             return;
         }
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&youki_root, &state_root);
+        let runtime = runtime_under(&runtime_root);
         let spec = sandbox_spec(rootfs, state_root.path());
         let token = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(token.pid.0);
-        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
         let declared = a_declared_port();
         let database = TcpListener::bind(("127.0.0.1", declared)).unwrap();
         provider
@@ -2277,7 +2396,7 @@ mod privileged_tests {
         // refusal here can come from nothing but the ruleset, which is the whole
         // point: a port the sandbox cannot reach anyway refuses itself, and a
         // test of that would report this layer as working while it was gone.
-        let sandbox_dir = sandbox_dir(state_root.path());
+        let sandbox_dir = sandbox_dir(runtime_root.path());
         let proxy = proxy::recorded_port(&sandbox_dir).expect("a proxy port");
         fs::write(sandbox_dir.join(CONNECT_PORTS_FILE), format!("{proxy}\n")).unwrap();
 
@@ -2293,13 +2412,13 @@ mod privileged_tests {
     #[serial]
     fn a_session_reaches_the_declared_database_on_the_sandbox_loopback() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&youki_root, &state_root);
+        let runtime = runtime_under(&runtime_root);
         let spec = sandbox_spec(rootfs, state_root.path());
         let token = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(token.pid.0);
-        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
         let declared = a_declared_port();
         let database = TcpListener::bind(("127.0.0.1", declared)).unwrap();
         provider
@@ -2322,13 +2441,13 @@ mod privileged_tests {
     #[serial]
     fn an_open_sandbox_leaves_its_sessions_free_to_connect() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&youki_root, &state_root);
+        let runtime = runtime_under(&runtime_root);
         let spec = sandbox_spec(rootfs, state_root.path());
         let token = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(token.pid.0);
-        let provider = PastaNetworkProvider::new(state_root.path().to_path_buf());
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
         let port = a_declared_port();
         let listening = TcpListener::bind(("127.0.0.1", port)).unwrap();
         provider.provision(&open_network(&spec.name, token.pid.0)).unwrap();
@@ -2348,9 +2467,9 @@ mod privileged_tests {
     #[ignore = "needs unprivileged user namespaces"]
     #[serial]
     fn start_anchor_fails_with_container_runtime_failed_for_a_missing_rootfs() {
-        let youki_root = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
         let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&youki_root, &state_root);
+        let runtime = runtime_under(&runtime_root);
         let absent = state_root.path().join("no-such-rootfs");
         let spec = sandbox_spec(absent, state_root.path());
 

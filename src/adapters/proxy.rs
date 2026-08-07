@@ -13,7 +13,7 @@
 //!
 //! The proxy listens on the host loopback on a port the kernel picks, and pasta
 //! splices that one port into the sandbox, so a sandbox reaches its own proxy and
-//! no other. The port is recorded in the sandbox's state directory, which is
+//! no other. The port is recorded in the sandbox's runtime directory, which is
 //! where a session filling its proxy variables finds it.
 //!
 //! Like pasta, the proxy outlives the command that started it and is stopped when
