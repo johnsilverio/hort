@@ -73,6 +73,8 @@ const UPPER_LAYER: &str = "upper";
 const WORK_LAYER: &str = "work";
 const MERGED_ROOT: &str = "merged";
 const WORKDIR: &str = "/workdir";
+const SANDBOX_HOME: &str = "/home/hort";
+const SANDBOX_TMP: &str = "/tmp";
 const DEV_NULL: &str = "/dev/null";
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const CPU_PERIOD_USEC: u64 = 100_000;
@@ -829,7 +831,8 @@ fn merged_root(overlay: &Path) -> Root {
     root
 }
 
-/// The base mount set plus the worktree. The rootless set is the one that works
+/// The base mount set, the worktree, and the two directories the sandbox writes
+/// to without keeping anything. The rootless base set is the one that works
 /// here: it binds the host `/sys` instead of mounting a fresh one, which a user
 /// namespace that does not own the network namespace may not do, and it drops
 /// the terminal group id, which is not mapped inside the sandbox.
@@ -841,7 +844,27 @@ fn sandbox_mounts(workdir: &Path) -> Vec<Mount> {
     worktree.set_source(Some(workdir.to_path_buf()));
     worktree.set_options(Some(vec!["rbind".to_string(), "rw".to_string()]));
     mounts.push(worktree);
+    mounts.push(ephemeral_tmpfs(SANDBOX_HOME, "0700"));
+    mounts.push(ephemeral_tmpfs(SANDBOX_TMP, "1777"));
     mounts
+}
+
+/// A RAM backed directory that dies with the sandbox. `noexec` is deliberately
+/// absent: the home and `/tmp` are exactly where an agent toolchain unpacks and
+/// runs things (npm, pip, an installer that downloads and executes), so refusing
+/// that would break ordinary use of the box to gain nothing, since what confines
+/// the box is the namespace and not the exec bit.
+fn ephemeral_tmpfs(destination: &str, mode: &str) -> Mount {
+    let mut tmpfs = Mount::default();
+    tmpfs.set_destination(PathBuf::from(destination));
+    tmpfs.set_typ(Some("tmpfs".to_string()));
+    tmpfs.set_source(Some(PathBuf::from("tmpfs")));
+    tmpfs.set_options(Some(vec![
+        "nosuid".to_string(),
+        "nodev".to_string(),
+        format!("mode={mode}"),
+    ]));
+    tmpfs
 }
 
 fn anchor_process(env: &[(String, String)]) -> Process {
@@ -852,10 +875,26 @@ fn anchor_process(env: &[(String, String)]) -> Process {
     process
 }
 
+/// The environment every process in the sandbox starts with, the anchor and each
+/// session alike. A session that asks for a terminal is described by a process
+/// file, and that file replaces the process the tenant API would have built
+/// rather than adding to it, so such a session inherits nothing from the
+/// sandbox: what is not named here is named nowhere for the shell a person
+/// actually types into.
 fn environment(pairs: &[(String, String)]) -> Vec<String> {
-    // The anchor is named without a directory, so the runtime resolves it
-    // through PATH and refuses to exec at all when the spec carries none.
-    let mut environment = vec![format!("PATH={DEFAULT_PATH}")];
+    // Without PATH the runtime cannot resolve the anchor, which is named without
+    // a directory, and refuses to exec at all. Without HOME the mapped uid, which
+    // has no passwd entry, falls back to HOME=/ and every tool in the box keeps
+    // its history and its caches in the root of the merged overlay. The four XDG
+    // variables are the ones the standard derives from HOME.
+    let mut environment = vec![
+        format!("PATH={DEFAULT_PATH}"),
+        format!("HOME={SANDBOX_HOME}"),
+        format!("XDG_CONFIG_HOME={SANDBOX_HOME}/.config"),
+        format!("XDG_DATA_HOME={SANDBOX_HOME}/.local/share"),
+        format!("XDG_STATE_HOME={SANDBOX_HOME}/.local/state"),
+        format!("XDG_CACHE_HOME={SANDBOX_HOME}/.cache"),
+    ];
     environment.extend(pairs.iter().map(|(key, value)| format!("{key}={value}")));
     environment
 }
@@ -1099,6 +1138,40 @@ mod tests {
     }
 
     #[test]
+    fn spec_backs_the_sandbox_home_with_a_tmpfs() {
+        let assembled = anchor_spec(&sandbox_spec());
+
+        // An arbitrary uid with no passwd entry has no home, and a home carved
+        // out of the merged root would put every cache and history file a tool
+        // writes into the overlay upper. This one is RAM backed and goes with the
+        // sandbox.
+        let home = assembled
+            .mounts()
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|mount| mount.destination() == &PathBuf::from("/home/hort"))
+            .expect("a mount at the sandbox home");
+        assert_eq!(home.typ(), &Some("tmpfs".to_string()));
+    }
+
+    #[test]
+    fn spec_backs_tmp_with_a_tmpfs() {
+        let assembled = anchor_spec(&sandbox_spec());
+
+        // The base mount set carries no /tmp at all, so without this one every
+        // temporary file the box writes lands in the overlay upper.
+        let tmp = assembled
+            .mounts()
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|mount| mount.destination() == &PathBuf::from("/tmp"))
+            .expect("a mount at /tmp");
+        assert_eq!(tmp.typ(), &Some("tmpfs".to_string()));
+    }
+
+    #[test]
     fn spec_roots_the_container_at_the_merged_overlay() {
         let assembled = anchor_spec(&sandbox_spec());
 
@@ -1128,6 +1201,54 @@ mod tests {
         assert!(
             environment.contains(&"HORT_WORKTREE=/state/sandboxes/demo/worktree-demo".to_string())
         );
+    }
+
+    #[test]
+    fn spec_exports_home_at_the_dedicated_path() {
+        let assembled = anchor_spec(&sandbox_spec());
+
+        // A uid with no passwd entry falls back to HOME=/, so a shell in the box
+        // writes its history and its caches into the root of the merged overlay
+        // and every tool that keeps state in a home keeps it nowhere.
+        let process = assembled.process().as_ref().unwrap();
+        let environment = process.env().as_ref().unwrap();
+        assert!(environment.contains(&"HOME=/home/hort".to_string()));
+    }
+
+    #[test]
+    fn spec_points_the_xdg_variables_inside_the_home() {
+        let assembled = anchor_spec(&sandbox_spec());
+
+        let process = assembled.process().as_ref().unwrap();
+        let environment = process.env().as_ref().unwrap();
+        assert!(environment.contains(&"XDG_CONFIG_HOME=/home/hort/.config".to_string()));
+        assert!(environment.contains(&"XDG_DATA_HOME=/home/hort/.local/share".to_string()));
+        assert!(environment.contains(&"XDG_STATE_HOME=/home/hort/.local/state".to_string()));
+        assert!(environment.contains(&"XDG_CACHE_HOME=/home/hort/.cache".to_string()));
+    }
+
+    #[test]
+    fn session_process_exports_the_sandbox_home_environment() {
+        let spec = SessionSpec {
+            name: SandboxName::new("demo").unwrap(),
+            command: vec!["/bin/sh".to_string()],
+            cwd: PathBuf::from("/workdir"),
+            env: Vec::new(),
+            terminal: true,
+        };
+
+        // A session that asks for a terminal is described by a process file, and
+        // that file replaces the process the tenant API would have built rather
+        // than adding to it: the environment it would have inherited from the
+        // sandbox goes with it. That session is the shell a person actually types
+        // into, so a home named only in the sandbox spec is a home nobody gets.
+        let process = session_process(&spec);
+        let environment = process.env().as_ref().unwrap();
+        assert!(environment.contains(&"HOME=/home/hort".to_string()));
+        assert!(environment.contains(&"XDG_CONFIG_HOME=/home/hort/.config".to_string()));
+        assert!(environment.contains(&"XDG_DATA_HOME=/home/hort/.local/share".to_string()));
+        assert!(environment.contains(&"XDG_STATE_HOME=/home/hort/.local/state".to_string()));
+        assert!(environment.contains(&"XDG_CACHE_HOME=/home/hort/.cache".to_string()));
     }
 
     #[test]
@@ -1448,6 +1569,26 @@ mod privileged_tests {
             netns: PathBuf::from(format!("/proc/{anchor}/ns/net")),
             egress: EgressPolicy::Open,
             db_forwards: Vec::new(),
+        }
+    }
+
+    /// The file a session leaves in whatever `HOME` names it.
+    const HOME_WITNESS: &str = "wrote-in-the-sandbox-home";
+
+    /// A session that writes in its own home and stays alive afterwards. It names
+    /// the directory the way a tool inside the box does, through the variable, so
+    /// what it writes says both that the variable arrived and where it pointed.
+    fn home_writing_session(name: &SandboxName) -> SessionSpec {
+        SessionSpec {
+            name: name.clone(),
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("touch \"$HOME/{HOME_WITNESS}\"; sleep infinity"),
+            ],
+            cwd: PathBuf::from(WORKDIR),
+            env: Vec::new(),
+            terminal: false,
         }
     }
 
@@ -1804,6 +1945,30 @@ mod privileged_tests {
         // sees the same worktree, runs the same shell and answers every other
         // question here correctly, while the egress allowlist restricts nothing.
         assert_eq!(namespace_inode(session.pid, "net"), namespace_inode(token.pid.0, "net"));
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn a_session_finds_a_writable_home_at_the_dedicated_path() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = runtime_under(&youki_root, &state_root);
+        let spec = sandbox_spec(rootfs, state_root.path());
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+
+        runtime.join_session(&home_writing_session(&spec.name)).unwrap();
+
+        // Three things no assembled spec can answer on its own: that the kernel
+        // takes the mount, that the runtime creates a directory the base rootfs
+        // never had, and that the home the sandbox exports is the home a session
+        // joined afterwards runs with. The prepared rootfs holds no /home/hort,
+        // so the file exists only if all three held.
+        let written = PathBuf::from(format!("/proc/{}/root/home/hort/{HOME_WITNESS}", token.pid.0));
+        assert!(appeared_within_deadline(&written));
         runtime.teardown(&spec.name).unwrap();
     }
 
