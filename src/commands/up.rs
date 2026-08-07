@@ -13,6 +13,7 @@ use crate::domain::config::ResolvedConfig;
 use crate::domain::egress::{EgressPolicy, egress_degradation_warning};
 use crate::domain::error::HortError;
 use crate::domain::model::{BranchName, SandboxName, SandboxRecord, Warning};
+use crate::domain::mounts::{declared_read_only_sources, read_only_mount_plan};
 use crate::domain::policy::{BranchIntent, up_error};
 use crate::domain::preconditions::up_precondition_error;
 use crate::domain::reconcile::SandboxState;
@@ -42,6 +43,10 @@ pub struct UpCommand<'a> {
     project_dir: Option<PathBuf>,
     /// Where hort was invoked, which is the directory a refusal names.
     current_dir: PathBuf,
+    /// The home the user has on this host. A declared path under it is carried
+    /// into the sandbox at the same place under the sandbox's own home, so the
+    /// decision cannot be made without knowing where that home starts.
+    host_home: PathBuf,
     config: &'a ResolvedConfig,
 }
 
@@ -60,6 +65,7 @@ impl<'a> UpCommand<'a> {
         state_root: PathBuf,
         project_dir: Option<PathBuf>,
         current_dir: PathBuf,
+        host_home: PathBuf,
         config: &'a ResolvedConfig,
     ) -> Self {
         Self {
@@ -75,6 +81,7 @@ impl<'a> UpCommand<'a> {
             state_root,
             project_dir,
             current_dir,
+            host_home,
             config,
         }
     }
@@ -120,6 +127,11 @@ impl UpCommand<'_> {
         // Said here rather than by the sessions that run degraded, because by the
         // time one of those starts the sandbox exists and the user is inside it.
         warnings.extend(egress_degradation_warning(&egress, host.landlock_abi));
+
+        let declared = declared_read_only_sources(self.config);
+        let (mounts, mount_warnings) =
+            read_only_mount_plan(&self.env.inspect_mount_sources(&declared), &self.host_home);
+        warnings.extend(mount_warnings);
 
         if !self.lock.try_acquire(&name)? {
             return Err(HortError::UpInProgress { name: name.as_str().to_string() });
@@ -222,6 +234,7 @@ impl UpCommand<'_> {
                 ("HORT_SANDBOX".to_string(), name.as_str().to_string()),
                 ("HORT_WORKTREE".to_string(), worktree_display),
             ],
+            mounts,
             resources: limits,
         })?;
         self.store.put(&record.with_token(token))?;
@@ -251,6 +264,8 @@ mod tests {
 
     use crate::domain::config::{Cache, Egress, Mounts, Network, Resources};
     use crate::domain::model::{AnchorPid, Capabilities, CgroupCaps, LivenessToken, MountNsInode};
+    use crate::ports::SandboxMount;
+
     use crate::fakes::{
         FakeCapabilities, FakeNetwork, FakeRegistry, FakeRuntime, FakeSandboxLock,
         FakeWorktreeProvider, InMemoryMetadataStore, ScriptedClock, ScriptedLivenessProbe,
@@ -314,6 +329,7 @@ mod tests {
             state_root: PathBuf::from("/state"),
             project_dir: Some(PathBuf::from("/project")),
             current_dir: PathBuf::from("/project"),
+            host_home: PathBuf::from("/home/tester"),
             config,
         }
     }
@@ -805,6 +821,68 @@ mod tests {
 
         assert_eq!(runtime.started_memory_bytes(), Some(4_294_967_296));
         assert_eq!(runtime.started_cpus(), Some(2.0));
+    }
+
+    #[test]
+    fn up_puts_the_declared_read_only_mounts_in_the_container_spec() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = ResolvedConfig {
+            mounts: Mounts { read_only: vec!["/home/tester/.config/fish".to_string()] },
+            ..healthy_config()
+        };
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // A plan nobody hands to the runtime builds the same empty box as no
+        // plan at all, and every test of the planning itself stays green while
+        // it happens.
+        assert_eq!(
+            runtime.started_mounts(),
+            vec![SandboxMount {
+                source: PathBuf::from("/home/tester/.config/fish"),
+                target: PathBuf::from("/home/hort/.config/fish"),
+            }]
+        );
+    }
+
+    #[test]
+    fn up_returns_the_warning_for_a_source_the_host_does_not_have() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host()).with_missing_mount_sources();
+        let config = ResolvedConfig {
+            mounts: Mounts { read_only: vec!["/home/tester/.tmux.conf".to_string()] },
+            ..healthy_config()
+        };
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+        );
+
+        let warnings = command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // The build survives the missing path either way, so a warning that
+        // stops at the planner leaves the user in a box quietly missing what
+        // they asked for.
+        assert!(
+            warnings.iter().any(|warning| warning.to_string().contains("/home/tester/.tmux.conf"))
+        );
     }
 
     #[test]

@@ -114,6 +114,9 @@ pub struct RealDeps {
     project_dir: Option<PathBuf>,
     /// Where hort was invoked, which is the directory a refusal names.
     current_dir: PathBuf,
+    /// The home the user has on this host, which is what a declared mount path
+    /// is measured against before it is carried into the sandbox.
+    host_home: PathBuf,
 }
 
 impl RealDeps {
@@ -148,6 +151,7 @@ impl RealDeps {
         // what refuses to build on an unmarked one is the command.
         let project_dir = find_project_dir(&current_dir);
         let adapters_dir = project_dir.clone().unwrap_or_else(|| current_dir.clone());
+        let host_home = home_dir()?;
 
         Ok(Self {
             lock: FlockSandboxLock::new(state_root.clone()),
@@ -161,10 +165,11 @@ impl RealDeps {
             clock: SystemClock,
             confirmer: StdinConfirmer,
             env: HostEnvironmentProbe,
-            config: ConfigResolver::new(resolve_config_root()?, adapters_dir, home_dir()?),
+            config: ConfigResolver::new(resolve_config_root()?, adapters_dir, host_home.clone()),
             state_root,
             project_dir,
             current_dir,
+            host_home,
         })
     }
 }
@@ -246,6 +251,7 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<u8, HortError> {
                 deps.state_root.clone(),
                 deps.project_dir.clone(),
                 deps.current_dir.clone(),
+                deps.host_home.clone(),
                 &config,
             );
             let warnings = command.run(name.clone(), branch)?;

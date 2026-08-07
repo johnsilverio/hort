@@ -22,6 +22,7 @@ use std::path::{Component, Path, PathBuf};
 use std::ptr;
 
 use crate::domain::model::{Capabilities, CgroupCaps};
+use crate::domain::mounts::MountSourceFacts;
 use crate::domain::preconditions::{ConfiguredShell, RootfsFacts};
 use crate::ports::EnvironmentProbe;
 
@@ -74,6 +75,16 @@ impl EnvironmentProbe for HostEnvironmentProbe {
             }),
             workdir_writable: workdir_writable(path),
         }
+    }
+
+    fn inspect_mount_sources(&self, paths: &[PathBuf]) -> Vec<MountSourceFacts> {
+        // `exists` and not `try_exists`: a path hort is refused permission to
+        // read has to answer absent and be skipped, because the alternative is
+        // handing the runtime a bind it cannot take and losing the whole box.
+        paths
+            .iter()
+            .map(|path| MountSourceFacts { path: path.clone(), exists: path.exists() })
+            .collect()
     }
 }
 
@@ -466,6 +477,26 @@ mod tests {
         let facts = HostEnvironmentProbe.inspect_rootfs(&rootfs, None);
 
         assert!(!facts.workdir_writable);
+    }
+
+    #[test]
+    fn inspect_mount_sources_answers_one_fact_per_path_in_the_order_asked() {
+        let (_dir, dir) = temp_dir();
+        let present = dir.join(".config").join("fish");
+        make_dir(&present, 0o755);
+        let absent = dir.join(".tmux.conf");
+
+        let facts = HostEnvironmentProbe.inspect_mount_sources(&[present.clone(), absent.clone()]);
+
+        // Nothing above this layer asks the disk anything, so this is where the
+        // feature is decided: a probe that answered short, or out of order, or
+        // absent for what is there, builds a box carrying none of the paths the
+        // user declared and reports no error doing it.
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].path, present);
+        assert!(facts[0].exists);
+        assert_eq!(facts[1].path, absent);
+        assert!(!facts[1].exists);
     }
 
     #[test]

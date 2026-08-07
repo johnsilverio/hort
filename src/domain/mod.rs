@@ -7,6 +7,7 @@ pub mod egress;
 pub mod error;
 pub mod idle;
 pub mod model;
+pub mod mounts;
 pub mod onboarding;
 pub mod policy;
 pub mod preconditions;

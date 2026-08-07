@@ -12,6 +12,7 @@ use std::time::SystemTime;
 use crate::domain::egress::EgressPolicy;
 use crate::domain::error::HortError;
 use crate::domain::model::{BranchName, Capabilities, LivenessToken, SandboxName, SandboxRecord};
+use crate::domain::mounts::MountSourceFacts;
 use crate::domain::preconditions::RootfsFacts;
 
 /// Is this recorded anchor still the live one? Alive iff the PID exists **and**
@@ -176,6 +177,15 @@ pub trait EnvironmentProbe {
     /// the session shell the configuration declares, `None` when it declares
     /// none.
     fn inspect_rootfs(&self, path: &Path, shell: Option<&str>) -> RootfsFacts;
+    /// Read what the host says about the mount sources the configuration
+    /// declared, one fact per path, in the order they were asked about.
+    ///
+    /// It sits here rather than on a port of its own for the same reason the
+    /// rootfs read does: both answer what the host has to say about a path the
+    /// configuration named, and both serve the same clients through the same
+    /// adapter. A path it cannot read yields the conservative fact, so a source
+    /// hort is unsure of degrades instead of taking the container down with it.
+    fn inspect_mount_sources(&self, paths: &[PathBuf]) -> Vec<MountSourceFacts>;
 }
 
 /// Enumerate the live anchors the runtime knows about. The cross-source
@@ -210,8 +220,21 @@ pub struct OciSpec {
     /// Environment pairs every process in the sandbox sees, `HORT_SANDBOX` and
     /// `HORT_WORKTREE` among them.
     pub env: Vec<(String, String)>,
+    /// The host paths the configuration declares, mounted read-only, in the
+    /// order they are applied. The order is contract rather than presentation:
+    /// a mount whose destination lives inside another is hidden by it unless it
+    /// comes after.
+    pub mounts: Vec<SandboxMount>,
     /// The per-sandbox resource ceiling; `None` leaves the sandbox uncapped.
     pub resources: Option<ResourceLimits>,
+}
+
+/// One host path carried into the sandbox: where it comes from and where the
+/// box finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxMount {
+    pub source: PathBuf,
+    pub target: PathBuf,
 }
 
 /// Everything `join_session` needs to open one session inside a running

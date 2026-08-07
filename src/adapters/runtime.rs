@@ -61,9 +61,10 @@ use crate::adapters::namespaces::{enter, owning_user_namespace};
 use crate::adapters::streams::open_sandbox_log;
 use crate::domain::error::HortError;
 use crate::domain::model::{AnchorPid, LivenessToken, MountNsInode, SandboxName};
+use crate::domain::mounts::SANDBOX_HOME;
 use crate::ports::{
-    ContainerRegistry, ContainerRuntime, OciSpec, RegistryEntry, ResourceLimits, Session,
-    SessionProbe, SessionSpec,
+    ContainerRegistry, ContainerRuntime, OciSpec, RegistryEntry, ResourceLimits, SandboxMount,
+    Session, SessionProbe, SessionSpec,
 };
 
 const SANDBOXES_DIR: &str = "sandboxes";
@@ -73,7 +74,6 @@ const UPPER_LAYER: &str = "upper";
 const WORK_LAYER: &str = "work";
 const MERGED_ROOT: &str = "merged";
 const WORKDIR: &str = "/workdir";
-const SANDBOX_HOME: &str = "/home/hort";
 const SANDBOX_TMP: &str = "/tmp";
 const DEV_NULL: &str = "/dev/null";
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -816,7 +816,7 @@ fn anchor_spec(spec: &OciSpec) -> Spec {
     assembled
         .set_hostname(Some(spec.name.as_str().to_string()))
         .set_root(Some(merged_root(&spec.overlay)))
-        .set_mounts(Some(sandbox_mounts(&spec.workdir)))
+        .set_mounts(Some(sandbox_mounts(&spec.workdir, &spec.mounts)))
         .set_process(Some(anchor_process(&spec.env)))
         .set_linux(Some(sandbox_linux(spec.resources.as_ref())));
     assembled
@@ -831,12 +831,13 @@ fn merged_root(overlay: &Path) -> Root {
     root
 }
 
-/// The base mount set, the worktree, and the two directories the sandbox writes
-/// to without keeping anything. The rootless base set is the one that works
-/// here: it binds the host `/sys` instead of mounting a fresh one, which a user
-/// namespace that does not own the network namespace may not do, and it drops
-/// the terminal group id, which is not mapped inside the sandbox.
-fn sandbox_mounts(workdir: &Path) -> Vec<Mount> {
+/// The base mount set, the worktree, the two directories the sandbox writes to
+/// without keeping anything, and the host paths it carries in read-only. The
+/// rootless base set is the one that works here: it binds the host `/sys`
+/// instead of mounting a fresh one, which a user namespace that does not own the
+/// network namespace may not do, and it drops the terminal group id, which is
+/// not mapped inside the sandbox.
+fn sandbox_mounts(workdir: &Path, read_only: &[SandboxMount]) -> Vec<Mount> {
     let mut mounts = get_rootless_mounts();
     let mut worktree = Mount::default();
     worktree.set_destination(PathBuf::from(WORKDIR));
@@ -846,7 +847,21 @@ fn sandbox_mounts(workdir: &Path) -> Vec<Mount> {
     mounts.push(worktree);
     mounts.push(ephemeral_tmpfs(SANDBOX_HOME, "0700"));
     mounts.push(ephemeral_tmpfs(SANDBOX_TMP, "1777"));
+    // Last, because the list is applied in order and most of these live inside
+    // the home: a tmpfs laid over them afterwards would cover every one.
+    mounts.extend(read_only.iter().map(read_only_bind));
     mounts
+}
+
+/// A host path the sandbox reads and cannot write. The sandbox holds no
+/// capability to remount anything, so what this option denies stays denied.
+fn read_only_bind(mount: &SandboxMount) -> Mount {
+    let mut bind = Mount::default();
+    bind.set_destination(mount.target.clone());
+    bind.set_typ(Some("bind".to_string()));
+    bind.set_source(Some(mount.source.clone()));
+    bind.set_options(Some(vec!["rbind".to_string(), "ro".to_string()]));
+    bind
 }
 
 /// A RAM backed directory that dies with the sandbox. `noexec` is deliberately
@@ -986,7 +1001,7 @@ mod tests {
     };
 
     use crate::adapters::liveness::ProcLivenessProbe;
-    use crate::ports::{LivenessProbe, ResourceLimits};
+    use crate::ports::{LivenessProbe, ResourceLimits, SandboxMount};
 
     fn sandbox_spec() -> OciSpec {
         OciSpec {
@@ -998,8 +1013,45 @@ mod tests {
                 ("HORT_SANDBOX".to_string(), "demo".to_string()),
                 ("HORT_WORKTREE".to_string(), "/state/sandboxes/demo/worktree-demo".to_string()),
             ],
+            mounts: Vec::new(),
             resources: None,
         }
+    }
+
+    /// A sandbox carrying one declared host path into the home the sandbox runs
+    /// with, which is where the mapping puts anything the user keeps in theirs.
+    fn spec_mounting_a_dotfile() -> OciSpec {
+        OciSpec {
+            mounts: vec![SandboxMount {
+                source: PathBuf::from("/home/tester/.config/fish"),
+                target: PathBuf::from("/home/hort/.config/fish"),
+            }],
+            ..sandbox_spec()
+        }
+    }
+
+    /// Where `destination` sits in the assembled mount list, which is the order
+    /// the kernel applies them in.
+    fn mount_index(assembled: &Spec, destination: &str) -> usize {
+        assembled
+            .mounts()
+            .as_ref()
+            .unwrap()
+            .iter()
+            .position(|mount| mount.destination() == &PathBuf::from(destination))
+            .unwrap_or_else(|| panic!("a mount at {destination}"))
+    }
+
+    /// Where the last RAM backed directory sits in the assembled mount list.
+    /// Anything mounted before it that lands underneath it is covered by it.
+    fn last_tmpfs_index(assembled: &Spec) -> usize {
+        assembled
+            .mounts()
+            .as_ref()
+            .unwrap()
+            .iter()
+            .rposition(|mount| mount.typ() == &Some("tmpfs".to_string()))
+            .expect("a tmpfs in the mount list")
     }
 
     #[test]
@@ -1169,6 +1221,34 @@ mod tests {
             .find(|mount| mount.destination() == &PathBuf::from("/tmp"))
             .expect("a mount at /tmp");
         assert_eq!(tmp.typ(), &Some("tmpfs".to_string()));
+    }
+
+    #[test]
+    fn spec_mounts_a_declared_path_read_only() {
+        let assembled = anchor_spec(&spec_mounting_a_dotfile());
+
+        // What holds a dotfile and a credential out of the box's reach is this
+        // option and nothing else: the sandbox holds no capability to remount
+        // anything, so a bind that arrives writable stays writable, and an agent
+        // running unrestricted inside the box can rewrite the shell
+        // configuration and the credentials of the user who started it.
+        let mounts = assembled.mounts().as_ref().unwrap();
+        let dotfile = &mounts[mount_index(&assembled, "/home/hort/.config/fish")];
+        assert_eq!(dotfile.source(), &Some(PathBuf::from("/home/tester/.config/fish")));
+        assert!(dotfile.options().as_ref().unwrap().contains(&"ro".to_string()));
+    }
+
+    #[test]
+    fn read_only_mounts_come_after_every_tmpfs_that_would_hide_them() {
+        let assembled = anchor_spec(&spec_mounting_a_dotfile());
+
+        // The mount list is applied in order, so a tmpfs laid down after a bind
+        // that lands underneath it covers that bind: the box comes up missing
+        // what the user declared, no error anywhere, and a shell that silently
+        // behaves like nobody's. The home is not the only one that can do it,
+        // because a declared source outside the user's own home keeps its
+        // absolute path and can therefore land under any of them.
+        assert!(last_tmpfs_index(&assembled) < mount_index(&assembled, "/home/hort/.config/fish"));
     }
 
     #[test]
@@ -1447,7 +1527,7 @@ mod privileged_tests {
     use crate::adapters::streams::sandbox_log_path;
     use crate::domain::egress::{EgressPolicy, HostPattern};
     use crate::domain::model::Domain;
-    use crate::ports::{DbForward, EnvironmentProbe, NetworkProvider, NetworkSpec};
+    use crate::ports::{DbForward, EnvironmentProbe, NetworkProvider, NetworkSpec, SandboxMount};
 
     const ANCHOR_DEADLINE: Duration = Duration::from_secs(5);
     /// How long a session is given to exec and dial, and therefore also how long
@@ -1488,6 +1568,7 @@ mod privileged_tests {
             overlay: state_root.join("sandboxes/demo/overlay"),
             env: vec![("HORT_SANDBOX".to_string(), "demo".to_string())],
             workdir,
+            mounts: Vec::new(),
             resources: None,
         }
     }
@@ -1585,6 +1666,75 @@ mod privileged_tests {
                 "/bin/sh".to_string(),
                 "-c".to_string(),
                 format!("touch \"$HOME/{HOME_WITNESS}\"; sleep infinity"),
+            ],
+            cwd: PathBuf::from(WORKDIR),
+            env: Vec::new(),
+            terminal: false,
+        }
+    }
+
+    /// The dotfile a sandbox carries in from the host, and the line in it. The
+    /// content has no trailing newline so a session can compare it against what
+    /// a command substitution gives back.
+    const DOTFILE: &str = "config.fish";
+    const DOTFILE_CONTENT: &str = "set -g fish_color_command blue";
+    /// Where the mapping puts a dotfile the user keeps under their own home.
+    const MOUNTED_DOTFILE_DIR: &str = "/home/hort/.config/fish";
+    /// The file a session leaves when the dotfile it read holds what the host
+    /// wrote.
+    const DOTFILE_WITNESS: &str = "read-the-dotfile";
+    /// The file a session leaves when the mount refused its write.
+    const REFUSAL_WITNESS: &str = "refused-the-write";
+
+    /// A host directory holding one dotfile, and the mount that carries it into
+    /// the sandbox home.
+    fn dotfile_mount(state_root: &Path) -> SandboxMount {
+        let source = state_root.join("dotfiles").join("fish");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join(DOTFILE), DOTFILE_CONTENT).unwrap();
+        SandboxMount { source, target: PathBuf::from(MOUNTED_DOTFILE_DIR) }
+    }
+
+    /// A session that reads the mounted dotfile and reports into `/workdir`
+    /// whether it held what the host put there. It leaves rather than sleeps:
+    /// nothing here needs it alive, and a session left running holds hort's own
+    /// output open.
+    fn dotfile_reading_session(name: &SandboxName) -> SessionSpec {
+        SessionSpec {
+            name: name.clone(),
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "test \"$(cat {MOUNTED_DOTFILE_DIR}/{DOTFILE})\" = \"{DOTFILE_CONTENT}\" && touch {WORKDIR}/{DOTFILE_WITNESS}"
+                ),
+            ],
+            cwd: PathBuf::from(WORKDIR),
+            env: Vec::new(),
+            terminal: false,
+        }
+    }
+
+    /// The file a session tries to write into the directory the mount carried
+    /// in.
+    const WRITE_PROBE: &str = "probe";
+
+    /// A session that writes into the mounted directory and reports into
+    /// `/workdir` when the write was refused.
+    ///
+    /// It checks the directory is there before it writes, and that guard is what
+    /// makes this discriminating rather than decorative: with no mount at all
+    /// the home is an empty tmpfs, so the write fails for want of a directory
+    /// and reports a refusal that never happened.
+    fn write_attempting_session(name: &SandboxName) -> SessionSpec {
+        SessionSpec {
+            name: name.clone(),
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "test -d {MOUNTED_DOTFILE_DIR} && ! touch {MOUNTED_DOTFILE_DIR}/{WRITE_PROBE} 2>/dev/null && touch {WORKDIR}/{REFUSAL_WITNESS}"
+                ),
             ],
             cwd: PathBuf::from(WORKDIR),
             env: Vec::new(),
@@ -1969,6 +2119,56 @@ mod privileged_tests {
         // so the file exists only if all three held.
         let written = PathBuf::from(format!("/proc/{}/root/home/hort/{HOME_WITNESS}", token.pid.0));
         assert!(appeared_within_deadline(&written));
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn a_session_reads_a_dotfile_mounted_from_the_host() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = runtime_under(&youki_root, &state_root);
+        let spec = OciSpec {
+            mounts: vec![dotfile_mount(state_root.path())],
+            ..sandbox_spec(rootfs, state_root.path())
+        };
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+
+        runtime.join_session(&dotfile_reading_session(&spec.name)).unwrap();
+
+        // This is the whole point of the feature and no assembled spec can stand
+        // in for it: the destination lives inside a tmpfs the base rootfs never
+        // had, the kernel has to take the bind under a mapping that owns
+        // neither side, and what the session reads has to be the bytes the user
+        // has on their own machine.
+        assert!(appeared_within_deadline(&spec.workdir.join(DOTFILE_WITNESS)));
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn a_session_cannot_write_to_a_read_only_mount() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let youki_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let runtime = runtime_under(&youki_root, &state_root);
+        let spec = OciSpec {
+            mounts: vec![dotfile_mount(state_root.path())],
+            ..sandbox_spec(rootfs, state_root.path())
+        };
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+
+        runtime.join_session(&write_attempting_session(&spec.name)).unwrap();
+
+        // The mount is what denies this, not a later layer: these are the user's
+        // own dotfiles and credentials on the user's own disk, reached by an
+        // agent the box exists to run with every permission granted.
+        assert!(appeared_within_deadline(&spec.workdir.join(REFUSAL_WITNESS)));
         runtime.teardown(&spec.name).unwrap();
     }
 

@@ -16,12 +16,13 @@ use crate::domain::error::HortError;
 use crate::domain::model::{
     AnchorPid, BranchName, Capabilities, LivenessToken, MountNsInode, SandboxName, SandboxRecord,
 };
+use crate::domain::mounts::MountSourceFacts;
 use crate::domain::preconditions::{ConfiguredShell, RootfsFacts};
 use crate::ports::{
     Clock, Confirmer, ContainerRegistry, ContainerRuntime, CorruptEntry, DbForward,
     EnvironmentProbe, LivenessProbe, MetadataStore, NetworkProvider, NetworkSpec, Notifier,
-    OciSpec, RegistryEntry, ResourceLimits, SandboxLock, Session, SessionProbe, SessionSpec,
-    Worktree, WorktreeProvider,
+    OciSpec, RegistryEntry, ResourceLimits, SandboxLock, SandboxMount, Session, SessionProbe,
+    SessionSpec, Worktree, WorktreeProvider,
 };
 
 /// The shared teardown-order witness threaded through the fakes that perform a
@@ -103,6 +104,7 @@ pub struct FakeRuntime {
     started_env: RefCell<Vec<(String, String)>>,
     started_rootfs: RefCell<PathBuf>,
     started_workdir: RefCell<PathBuf>,
+    started_mounts: RefCell<Vec<SandboxMount>>,
     started_resources: RefCell<Option<ResourceLimits>>,
     sessions: RefCell<Vec<SessionSpec>>,
     teardowns: RefCell<Vec<SandboxName>>,
@@ -120,6 +122,7 @@ impl FakeRuntime {
             started_env: RefCell::new(Vec::new()),
             started_rootfs: RefCell::new(PathBuf::new()),
             started_workdir: RefCell::new(PathBuf::new()),
+            started_mounts: RefCell::new(Vec::new()),
             started_resources: RefCell::new(None),
             sessions: RefCell::new(Vec::new()),
             teardowns: RefCell::new(Vec::new()),
@@ -154,6 +157,12 @@ impl FakeRuntime {
     /// `/workdir`.
     pub fn started_workdir(&self) -> PathBuf {
         self.started_workdir.borrow().clone()
+    }
+
+    /// The host paths the spec the last `start_anchor` was handed carries into
+    /// the sandbox, in order.
+    pub fn started_mounts(&self) -> Vec<SandboxMount> {
+        self.started_mounts.borrow().clone()
     }
 
     /// The memory ceiling of the spec the last `start_anchor` was handed.
@@ -201,6 +210,7 @@ impl ContainerRuntime for FakeRuntime {
         self.started_env.borrow_mut().clone_from(&spec.env);
         self.started_rootfs.borrow_mut().clone_from(&spec.rootfs);
         self.started_workdir.borrow_mut().clone_from(&spec.workdir);
+        self.started_mounts.borrow_mut().clone_from(&spec.mounts);
         *self.started_resources.borrow_mut() = spec
             .resources
             .as_ref()
@@ -389,18 +399,30 @@ impl Clock for ScriptedClock {
 pub struct FakeCapabilities {
     capabilities: Capabilities,
     rootfs_present: bool,
+    mount_sources_present: bool,
     inspections: RefCell<Vec<(PathBuf, Option<String>)>>,
 }
 
 impl FakeCapabilities {
     pub fn new(capabilities: Capabilities) -> Self {
-        Self { capabilities, rootfs_present: true, inspections: RefCell::new(Vec::new()) }
+        Self {
+            capabilities,
+            rootfs_present: true,
+            mount_sources_present: true,
+            inspections: RefCell::new(Vec::new()),
+        }
     }
 
     /// Script the configured rootfs as absent from the host: a directory that is
     /// not there provides nothing, so every fact about it reads false.
     pub fn with_missing_rootfs(mut self) -> Self {
         self.rootfs_present = false;
+        self
+    }
+
+    /// Script every declared mount source as absent from the host.
+    pub fn with_missing_mount_sources(mut self) -> Self {
+        self.mount_sources_present = false;
         self
     }
 
@@ -429,6 +451,15 @@ impl EnvironmentProbe for FakeCapabilities {
             }),
             workdir_writable: self.rootfs_present,
         }
+    }
+
+    /// One fact per path asked about, every source there unless they were
+    /// scripted absent.
+    fn inspect_mount_sources(&self, paths: &[PathBuf]) -> Vec<MountSourceFacts> {
+        paths
+            .iter()
+            .map(|path| MountSourceFacts { path: path.clone(), exists: self.mount_sources_present })
+            .collect()
     }
 }
 

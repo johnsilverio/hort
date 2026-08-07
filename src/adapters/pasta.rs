@@ -687,6 +687,7 @@ mod privileged_tests {
             overlay: state_root.join("sandboxes/demo/overlay"),
             workdir,
             env: vec![("HORT_SANDBOX".to_string(), "demo".to_string())],
+            mounts: Vec::new(),
             resources: None,
         }
     }
