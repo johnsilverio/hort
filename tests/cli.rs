@@ -655,7 +655,7 @@ fn cli_down_without_git_leaves_the_project_folder() {
 
 #[test]
 #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
-fn cli_up_leaves_the_pasta_pid_file_under_the_runtime_root() {
+fn cli_the_runtime_root_holds_the_pasta_pid_file_until_the_sandbox_goes_down() {
     let Some(rootfs) = prepared_rootfs() else { return };
     let xdg = TempDir::new().unwrap();
     let xdg_root = xdg.path().canonicalize().unwrap();
