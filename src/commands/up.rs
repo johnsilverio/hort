@@ -236,6 +236,7 @@ impl UpCommand<'_> {
                     timestamp.clone(),
                     timestamp,
                     None,
+                    project_dir.clone(),
                 );
                 self.store.put(&fresh)?;
                 fresh
@@ -1434,5 +1435,66 @@ mod tests {
 
         assert!(result.is_err());
         assert!(runtime.started_env().is_empty());
+    }
+
+    #[test]
+    fn up_records_the_project_the_sandbox_was_built_from() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // With git the worktree is one hort made under its own state root, so
+        // the record is the only place the project the sandbox came from is
+        // written down, and the cache of that project is keyed by it.
+        let persisted = store.get(&SandboxName::new("demo").unwrap()).unwrap().unwrap();
+        assert_eq!(persisted.project_path(), Some(Path::new("/project")));
+    }
+
+    #[test]
+    fn up_records_the_project_without_git() {
+        let project = PathBuf::from("/home/tester/project");
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new().no_git();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let command = UpCommand {
+            project_dir: Some(project.clone()),
+            current_dir: project.clone(),
+            ..up_command(
+                &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
+                &cache, &config,
+            )
+        };
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // Here the project folder is also the worktree, so writing it twice
+        // looks redundant. It is not: a reader that had to know which mode a
+        // record is in before it could find the project would be a second rule,
+        // and the guard that reads this field treats a record that cannot answer
+        // as one to protect against.
+        let persisted = store.get(&SandboxName::new("demo").unwrap()).unwrap().unwrap();
+        assert_eq!(persisted.project_path(), Some(project.as_path()));
     }
 }

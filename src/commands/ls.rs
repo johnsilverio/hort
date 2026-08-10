@@ -311,6 +311,7 @@ mod tests {
             "2026-06-11T12:00:00Z".to_string(),
             "2026-06-11T12:30:00Z".to_string(),
             None,
+            PathBuf::from("/home/tester/projects/demo"),
         )
         .with_token(canned_token());
         let store = InMemoryMetadataStore::new();
@@ -354,6 +355,7 @@ mod tests {
             "not a timestamp".to_string(),
             "not a timestamp".to_string(),
             None,
+            PathBuf::from("/home/tester/projects/demo"),
         )
         .with_token(canned_token());
         let store = InMemoryMetadataStore::new();
@@ -438,6 +440,7 @@ mod tests {
             "2026-06-11T12:00:00Z".to_string(),
             "2026-06-11T12:00:00Z".to_string(),
             None,
+            PathBuf::from("/home/tester/projects/demo"),
         )
         .with_token(canned_token());
         let store = InMemoryMetadataStore::new();

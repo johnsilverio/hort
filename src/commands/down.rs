@@ -159,6 +159,7 @@ mod tests {
             "2026-06-11T12:00:00Z".to_string(),
             "2026-06-11T12:00:00Z".to_string(),
             None,
+            PathBuf::from("/home/tester/project"),
         );
         let trace = Rc::new(RefCell::new(Vec::new()));
         let store = InMemoryMetadataStore::new().with_trace(trace.clone());

@@ -68,6 +68,7 @@ mod tests {
             "2026-06-10T12:00:00Z".to_string(),
             "2026-06-10T12:00:00Z".to_string(),
             None,
+            PathBuf::from("/home/tester/projects/demo"),
         )
     }
 

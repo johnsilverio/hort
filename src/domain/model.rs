@@ -168,6 +168,7 @@ pub struct SandboxRecord {
     notify_channel: Option<String>,
     watcher_pid: Option<u32>,
     token: Option<LivenessToken>,
+    project_path: Option<PathBuf>,
 }
 
 impl SandboxRecord {
@@ -176,6 +177,12 @@ impl SandboxRecord {
     /// worktree. The liveness token starts `None` because the anchor has not been
     /// started yet; call [`with_token`](SandboxRecord::with_token) once it is
     /// running.
+    ///
+    /// The project is a plain path and never an option: hort refuses to build a
+    /// sandbox out of a directory that declares no project, so a record it writes
+    /// can always say which one it came from. The `None` the accessor can return
+    /// means a record older than the field, which is a different answer.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: SandboxName,
         branch: Option<BranchName>,
@@ -184,6 +191,7 @@ impl SandboxRecord {
         created_at: String,
         last_attach_at: String,
         notify_channel: Option<String>,
+        project_path: PathBuf,
     ) -> Self {
         Self {
             schema_version: 1,
@@ -196,6 +204,7 @@ impl SandboxRecord {
             notify_channel,
             watcher_pid: None,
             token: None,
+            project_path: Some(project_path),
         }
     }
 
@@ -232,6 +241,12 @@ impl SandboxRecord {
     /// The host path of this sandbox's worktree.
     pub fn worktree_path(&self) -> &Path {
         &self.worktree_path
+    }
+
+    /// The project this sandbox was built from, or `None` when the record was
+    /// written before hort remembered it and cannot say.
+    pub fn project_path(&self) -> Option<&Path> {
+        self.project_path.as_deref()
     }
 
     /// The RFC 3339 creation timestamp, as persisted.
@@ -348,6 +363,7 @@ mod tests {
             "2026-06-10T12:00:00Z".to_string(),
             "2026-06-10T12:00:00Z".to_string(),
             None,
+            PathBuf::from("/home/tester/projects/demo"),
         );
 
         assert_eq!(record.liveness_token(), None);

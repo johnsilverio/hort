@@ -4,17 +4,18 @@
 //!
 //! It reconciles the records against the live anchors and the worktrees still on
 //! disk, gathers the corrupt dirs and the stored caches, observes idle, worktree
-//! risk and project presence, and runs the pure selection. Every question about a
-//! worktree is asked at that candidate's own path on disk, because `prune` is
-//! global and the repository the user happens to be standing in knows nothing
-//! about the other projects' sandboxes; the same holds for a cache, asked at the
-//! project path its key decodes to. An empty removal set never prompts;
+//! risk, project presence and which projects a running container is standing on,
+//! and runs the pure selection. Every question about a worktree is asked at that
+//! candidate's own path on disk, because `prune` is global and the repository the
+//! user happens to be standing in knows nothing about the other projects'
+//! sandboxes; the same holds for a cache, asked at the project path its key
+//! decodes to. An empty removal set never prompts;
 //! otherwise, without `--force`, a non-TTY stdin refuses and a TTY prompts with
 //! every candidate name listed first. Each chosen removal follows the mandatory
 //! teardown order, the caches coming last of all, and a single stale-registration
 //! sweep runs at the end of every non-refused, non-declined run.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::commands::present_worktrees;
@@ -23,10 +24,10 @@ use crate::domain::error::HortError;
 use crate::domain::idle::{IdleState, idle, parse_timestamp};
 use crate::domain::model::{SandboxName, SandboxRecord};
 use crate::domain::prune::{
-    CacheInput, CacheRisk, CorruptInput, PruneInput, PrunePlan, PruneSkip, WorktreeRisk,
+    CacheHold, CacheInput, CacheRisk, CorruptInput, PruneInput, PrunePlan, PruneSkip, WorktreeRisk,
     prune_selection,
 };
-use crate::domain::reconcile::reconcile_all;
+use crate::domain::reconcile::{SandboxState, reconcile_all};
 use crate::domain::teardown::{TeardownStep, teardown_plan};
 use crate::ports::{
     CacheProvider, Clock, Confirmer, ContainerRegistry, ContainerRuntime, MetadataStore,
@@ -104,7 +105,10 @@ impl PruneCommand<'_> {
 
         let present = present_worktrees(self.worktrees, &records);
 
-        let inputs: Vec<PruneInput> = reconcile_all(&records, &live, &present)
+        let verdicts = reconcile_all(&records, &live, &present);
+        let live_sandboxes = LiveSandboxes::reconciled(&verdicts, &records);
+
+        let inputs: Vec<PruneInput> = verdicts
             .into_iter()
             .filter_map(|(name, state)| {
                 let record = records.iter().find(|record| record.name() == &name)?;
@@ -122,7 +126,7 @@ impl PruneCommand<'_> {
             })
             .collect();
 
-        let cache_inputs = self.cache_inputs()?;
+        let cache_inputs = self.cache_inputs(&live_sandboxes)?;
 
         let plan = prune_selection(&inputs, &corrupt_inputs, &cache_inputs, idle_threshold, force);
 
@@ -194,16 +198,20 @@ impl PruneCommand<'_> {
         Ok(PruneReport { removed, removed_caches, skipped: plan.skipped })
     }
 
-    /// Every stored cache with the presence of the project that filled it. The
-    /// listing is the port's; the question is asked once per key, of the disk.
-    fn cache_inputs(&self) -> Result<Vec<CacheInput>, HortError> {
+    /// Every stored cache with the two questions the selection asks of it: is the
+    /// project that fills it still there, and is a container standing on it right
+    /// now. The listing is the port's; both questions are asked once per key,
+    /// against the project its key decodes to.
+    fn cache_inputs(&self, live: &LiveSandboxes) -> Result<Vec<CacheInput>, HortError> {
         Ok(self
             .caches
             .list()?
             .into_iter()
             .map(|key| {
-                let risk = self.cache_risk(&key);
-                CacheInput { key, risk }
+                let project = project_from_cache_key(&key);
+                let risk = self.cache_risk(&project);
+                let hold = live.hold_on(&project);
+                CacheInput { key, risk, hold }
             })
             .collect())
     }
@@ -214,12 +222,11 @@ impl PruneCommand<'_> {
     /// removing a directory somebody else put there is the expensive way to be
     /// wrong. A presence read that failed says nothing about the project either,
     /// so both stay unknown, and unknown protects.
-    fn cache_risk(&self, key: &str) -> CacheRisk {
-        let project = project_from_cache_key(key);
+    fn cache_risk(&self, project: &Path) -> CacheRisk {
         if !project.is_absolute() {
             return CacheRisk::Unknown;
         }
-        match self.caches.project_exists(&project) {
+        match self.caches.project_exists(project) {
             Ok(true) => CacheRisk::ProjectLives,
             Ok(false) => CacheRisk::NothingAtRisk,
             Err(_) => CacheRisk::Unknown,
@@ -282,6 +289,60 @@ impl PruneCommand<'_> {
 
     fn corrupt_worktree_path(&self, name: &str) -> PathBuf {
         self.state_root.join("sandboxes").join(name).join(format!("worktree-{name}"))
+    }
+}
+
+/// The containers standing on the machine right now, as far as the run could
+/// place them: the projects a standing sandbox was built from, and whether any
+/// live anchor could not be placed at all.
+///
+/// It reads off the reconciliation the sandbox arm already ran, because a cache's
+/// holder is not something left to ask the world about.
+struct LiveSandboxes {
+    projects: Vec<PathBuf>,
+    unplaceable: bool,
+}
+
+impl LiveSandboxes {
+    /// Read the verdicts once. Every sandbox whose anchor is up contributes the
+    /// project it names, whether or not its worktree is still on disk: the
+    /// container stands either way and keeps every bind it was born with. One
+    /// that cannot name its project, written before hort remembered, and a live
+    /// anchor with no record at all both leave hort holding a container it cannot
+    /// attribute to anything.
+    fn reconciled(verdicts: &[(SandboxName, SandboxState)], records: &[SandboxRecord]) -> Self {
+        let mut live = Self { projects: Vec::new(), unplaceable: false };
+        for (name, state) in verdicts {
+            match state {
+                SandboxState::Live | SandboxState::Inconsistent => {
+                    let project = records
+                        .iter()
+                        .find(|record| record.name() == name)
+                        .and_then(SandboxRecord::project_path);
+                    match project {
+                        Some(project) => live.projects.push(project.to_path_buf()),
+                        None => live.unplaceable = true,
+                    }
+                }
+                SandboxState::LostRecord => live.unplaceable = true,
+                SandboxState::Orphaned => {}
+            }
+        }
+        live
+    }
+
+    /// What is standing on this project's cache. A container hort could not place
+    /// answers first and for every cache in the run, because it might be the one
+    /// on this directory, and "down that box and run again" is not advice hort can
+    /// give about a box it cannot name.
+    fn hold_on(&self, project: &Path) -> CacheHold {
+        if self.unplaceable {
+            return CacheHold::Unknown;
+        }
+        if self.projects.iter().any(|held| held == project) {
+            return CacheHold::HeldByLiveSandbox;
+        }
+        CacheHold::NoLiveSandbox
     }
 }
 
@@ -776,6 +837,7 @@ mod tests {
             "2026-06-12T12:00:00Z".to_string(),
             "2026-06-12T12:00:00Z".to_string(),
             None,
+            PathBuf::from("/home/tester/projects/demo"),
         );
         let store = InMemoryMetadataStore::new();
         store.put(&record).unwrap();
@@ -833,6 +895,7 @@ mod tests {
             "2026-06-12T12:00:00Z".to_string(),
             "2026-06-12T12:00:00Z".to_string(),
             None,
+            PathBuf::from("/home/tester/projects/demo"),
         )
         .with_token(canned_token());
         let store = InMemoryMetadataStore::new();
@@ -864,6 +927,37 @@ mod tests {
     /// The stored address of a project the user still works on, and that project.
     const LIVE_CACHE_KEY: &str = "%2Fhome%2Ftester%2Fprojects%2Fhort";
     const LIVE_PROJECT: &str = "/home/tester/projects/hort";
+
+    /// A git-mode record of a sandbox built from this project.
+    fn record_of_project(name: &SandboxName, project: &str) -> SandboxRecord {
+        SandboxRecord::new(
+            name.clone(),
+            Some(BranchName::new(name.as_str()).unwrap()),
+            PathBuf::from(format!("/state/sandboxes/{0}/worktree-{0}", name.as_str())),
+            PathBuf::from(format!("/state/sandboxes/{}/overlay", name.as_str())),
+            "2026-06-12T12:00:00Z".to_string(),
+            "2026-06-12T12:00:00Z".to_string(),
+            None,
+            PathBuf::from(project),
+        )
+    }
+
+    /// A record left by a hort that did not yet remember which project a sandbox
+    /// was built from: schema version 1, a live anchor, and no project of its own
+    /// to name. It is written as JSON because that is the only way one arrives,
+    /// off the disk of a machine that ran an older build.
+    const RECORD_WITHOUT_PROJECT: &str = r#"{
+        "schemaVersion": 1,
+        "name": "demo",
+        "branch": "demo",
+        "worktreePath": "/state/sandboxes/demo/worktree-demo",
+        "overlayPath": "/state/sandboxes/demo/overlay",
+        "createdAt": "2026-06-12T12:00:00Z",
+        "lastAttachAt": "2026-06-12T12:00:00Z",
+        "notifyChannel": null,
+        "watcherPid": null,
+        "token": { "pid": 1234, "mntNsInode": 5678 }
+    }"#;
 
     #[test]
     fn prune_removes_the_cache_directory_of_a_gone_project() {
@@ -1077,5 +1171,187 @@ mod tests {
             "cache.remove".to_string(),
         ];
         assert_eq!(*trace.borrow(), expected);
+    }
+
+    #[test]
+    fn prune_holds_a_cache_whose_project_has_a_live_sandbox() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&record_of_project(&name, LIVE_PROJECT).with_token(canned_token())).unwrap();
+        let registry = FakeRegistry::new(vec![(name.clone(), canned_token())]);
+        let worktrees = FakeWorktreeProvider::new().with_present_worktree(&name);
+        // Nothing is running inside the box, which is the whole point: a guard
+        // built on activity would spare the box somebody is typing in and take
+        // the cache out from under the idle one waiting to be come back to. The
+        // container holds its mounts either way, for as long as its anchor
+        // stands.
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new()
+            .with_stored_key(LIVE_CACHE_KEY)
+            .with_live_project(Path::new(LIVE_PROJECT));
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
+        );
+
+        let report = command.run(None, true, false).unwrap();
+
+        assert!(caches.removed().is_empty());
+        assert_eq!(
+            report.skipped,
+            vec![PruneSkip { name: LIVE_PROJECT.to_string(), reason: SkipReason::LiveSandbox }]
+        );
+    }
+
+    #[test]
+    fn prune_holds_a_cache_whose_sandbox_is_inconsistent() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&record_of_project(&name, LIVE_PROJECT).with_token(canned_token())).unwrap();
+        let registry = FakeRegistry::new(vec![(name.clone(), canned_token())]);
+        // The anchor is up and the worktree is gone from disk. The container is
+        // still standing, so it still holds every bind it was born with, cache
+        // mounts included.
+        let worktrees = FakeWorktreeProvider::new();
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new()
+            .with_stored_key(LIVE_CACHE_KEY)
+            .with_live_project(Path::new(LIVE_PROJECT));
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
+        );
+
+        let report = command.run(None, true, false).unwrap();
+
+        // This run takes the box down and leaves the cache where it is; the next
+        // one collects it. The other order unlinks a writable bind source while
+        // the container that mounted it is still up.
+        assert!(caches.removed().is_empty());
+        assert_eq!(
+            report.skipped,
+            vec![PruneSkip { name: LIVE_PROJECT.to_string(), reason: SkipReason::LiveSandbox }]
+        );
+    }
+
+    #[test]
+    fn prune_holds_every_cache_while_a_live_record_cannot_name_its_project() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&serde_json::from_str::<SandboxRecord>(RECORD_WITHOUT_PROJECT).unwrap()).unwrap();
+        let registry = FakeRegistry::new(vec![(name.clone(), canned_token())]);
+        let worktrees = FakeWorktreeProvider::new().with_present_worktree(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new().with_stored_key(GONE_CACHE_KEY);
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
+        );
+
+        let report = command.run(None, true, false).unwrap();
+
+        // A box that cannot say which project it belongs to might belong to this
+        // one, and it is standing on whatever it mounted. The old record is the
+        // price of not bumping the schema version, and this is where that price
+        // is paid: nothing collected until the box is down.
+        assert!(caches.removed().is_empty());
+        assert_eq!(
+            report.skipped,
+            vec![PruneSkip { name: GONE_PROJECT.to_string(), reason: SkipReason::UnknownSandbox }]
+        );
+    }
+
+    #[test]
+    fn prune_holds_every_cache_while_an_anchor_has_no_record() {
+        let ghost = SandboxName::new("ghost").unwrap();
+        let store = InMemoryMetadataStore::new();
+        let registry = FakeRegistry::new(vec![(ghost, canned_token())]);
+        let worktrees = FakeWorktreeProvider::new();
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new().with_stored_key(GONE_CACHE_KEY);
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
+        );
+
+        let report = command.run(None, true, false).unwrap();
+
+        // A live anchor hort has no record of might be standing on any cache on
+        // the machine, so every one of them is unknown until the user adopts or
+        // clears it, which is the offer `ls` already makes.
+        assert!(caches.removed().is_empty());
+        assert_eq!(
+            report.skipped,
+            vec![PruneSkip { name: GONE_PROJECT.to_string(), reason: SkipReason::UnknownSandbox }]
+        );
+    }
+
+    #[test]
+    fn prune_collects_a_cache_whose_sandbox_is_orphaned() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&record_of_project(&name, GONE_PROJECT).with_token(canned_token())).unwrap();
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new().with_stored_key(GONE_CACHE_KEY);
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
+        );
+
+        command.run(None, false, true).unwrap();
+
+        // A record of this project exists, but its anchor is dead, so nothing is
+        // mounted on anything. A guard that stopped at "there is a record" would
+        // protect debris forever and prune would never collect a cache again.
+        assert_eq!(caches.removed(), vec![GONE_CACHE_KEY.to_string()]);
+    }
+
+    #[test]
+    fn prune_collects_a_cache_while_a_live_sandbox_of_another_project_runs() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&record_of_project(&name, LIVE_PROJECT).with_token(canned_token())).unwrap();
+        let registry = FakeRegistry::new(vec![(name.clone(), canned_token())]);
+        let worktrees = FakeWorktreeProvider::new().with_present_worktree(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new().with_stored_key(GONE_CACHE_KEY);
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
+        );
+
+        command.run(None, false, true).unwrap();
+
+        // The cheap way to close this hole is to call every cache unknown while
+        // any box is up. That box stands on its own project and on nothing else,
+        // and a guard that cannot tell the two apart never collects anything on
+        // a machine that is being used.
+        assert_eq!(caches.removed(), vec![GONE_CACHE_KEY.to_string()]);
     }
 }

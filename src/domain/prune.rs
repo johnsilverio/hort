@@ -6,7 +6,9 @@
 //! lost record is never prune's to remove. Every candidate then passes a
 //! fail-closed guard: without `--force` only a worktree proven to hold nothing
 //! and a cache whose project is proven gone are removed, and one hort could not
-//! read is skipped with a reason of its own.
+//! read is skipped with a reason of its own. A cache answers one thing before any
+//! of that, and `--force` is not passed to it: a directory a running container is
+//! standing on is not a candidate at all.
 
 use std::time::Duration;
 
@@ -57,8 +59,21 @@ pub enum CacheRisk {
     Unknown,
 }
 
+/// Whether a running container is standing on a stored cache right now, as far
+/// as hort was able to place the live sandboxes on the machine.
+///
+/// The question is live and never active: what holds the bind is the container,
+/// and the container stands as long as its anchor does, with or without a session
+/// running inside it.
+pub enum CacheHold {
+    HeldByLiveSandbox,
+    NoLiveSandbox,
+    Unknown,
+}
+
 /// One stored cache as the selection sees it: the on-disk directory name it is
-/// addressed by, and whether the project it belongs to is still there.
+/// addressed by, whether the project it belongs to is still there, and whether a
+/// live sandbox is standing on it.
 ///
 /// Removal is by whole directory rather than by entry, because listing a
 /// project's entries needs that project's configuration, and the configuration of
@@ -66,6 +81,7 @@ pub enum CacheRisk {
 pub struct CacheInput {
     pub key: String,
     pub risk: CacheRisk,
+    pub hold: CacheHold,
 }
 
 /// Why a candidate was skipped instead of removed.
@@ -81,6 +97,8 @@ pub enum SkipReason {
     Unknown,
     LiveProject,
     UnknownProject,
+    LiveSandbox,
+    UnknownSandbox,
 }
 
 /// A candidate the selection chose not to remove, with the reason.
@@ -135,7 +153,11 @@ pub fn prune_selection(
     }
 
     for input in caches {
-        match cache_protected(&input.risk, force) {
+        // Physics before value: a cache a container is standing on is not a
+        // candidate at all, so the force the gate below reads never reaches it.
+        let held_back =
+            cache_candidate(&input.hold).or_else(|| cache_protected(&input.risk, force));
+        match held_back {
             // A key is the address hort stores a cache under; the project is what
             // the user recognizes as theirs, and this line is the last one read
             // before deciding whether to force.
@@ -183,6 +205,25 @@ fn protected(risk: &WorktreeRisk, force: bool) -> Option<SkipReason> {
         WorktreeRisk::HoldsWork => Some(SkipReason::Dirty),
         WorktreeRisk::Unknown => Some(SkipReason::Unknown),
         WorktreeRisk::NothingAtRisk => None,
+    }
+}
+
+/// Why a stored cache is not up for collection at all, or `None` when the
+/// question of value below may be asked about it.
+///
+/// It takes no `force`, and that absence is the guarantee: the flag buys value,
+/// never physics. A cache is a writable bind source, and unlinking one while a
+/// container is standing on it leaves that container reading and writing into
+/// nothing. Whoever wants the directory downs the box first, and the next run
+/// collects it. Unlike the sandbox arm, a cache held back here still reports the
+/// skip, because prune's default selection does include orphaned caches: one that
+/// quietly failed to go would read as a bug and send the user reaching for
+/// `--force`, which is the one thing that cannot help.
+pub fn cache_candidate(hold: &CacheHold) -> Option<SkipReason> {
+    match hold {
+        CacheHold::HeldByLiveSandbox => Some(SkipReason::LiveSandbox),
+        CacheHold::Unknown => Some(SkipReason::UnknownSandbox),
+        CacheHold::NoLiveSandbox => None,
     }
 }
 
@@ -427,6 +468,7 @@ mod tests {
         let caches = vec![CacheInput {
             key: "%2Fhome%2Ftester%2Fprojects%2Fgone".to_string(),
             risk: CacheRisk::NothingAtRisk,
+            hold: CacheHold::NoLiveSandbox,
         }];
 
         let plan = prune_selection(&[], &[], &caches, None, false);
@@ -443,6 +485,7 @@ mod tests {
         let caches = vec![CacheInput {
             key: "%2Fhome%2Ftester%2Fprojects%2Fhort".to_string(),
             risk: CacheRisk::ProjectLives,
+            hold: CacheHold::NoLiveSandbox,
         }];
 
         let plan = prune_selection(&[], &[], &caches, None, false);
@@ -465,6 +508,7 @@ mod tests {
         let caches = vec![CacheInput {
             key: "%2Fhome%2Ftester%2Fprojects%2Fhort".to_string(),
             risk: CacheRisk::Unknown,
+            hold: CacheHold::NoLiveSandbox,
         }];
 
         let plan = prune_selection(&[], &[], &caches, None, false);
@@ -487,11 +531,107 @@ mod tests {
         let caches = vec![CacheInput {
             key: "%2Fhome%2Ftester%2Fprojects%2Fhort".to_string(),
             risk: CacheRisk::ProjectLives,
+            hold: CacheHold::NoLiveSandbox,
         }];
 
         let plan = prune_selection(&[], &[], &caches, None, true);
 
         assert_eq!(plan.caches, vec!["%2Fhome%2Ftester%2Fprojects%2Fhort".to_string()]);
         assert!(plan.skipped.is_empty());
+    }
+
+    #[test]
+    fn prune_spares_a_cache_a_live_sandbox_holds() {
+        let caches = vec![CacheInput {
+            key: "%2Fhome%2Ftester%2Fprojects%2Fgone".to_string(),
+            risk: CacheRisk::NothingAtRisk,
+            hold: CacheHold::HeldByLiveSandbox,
+        }];
+
+        let plan = prune_selection(&[], &[], &caches, None, false);
+
+        // Everything about the project says collect it: it is gone from disk and
+        // will never fill this directory again. What forbids it is the container
+        // still standing on the directory, which is a writable bind source and
+        // stops answering reads and writes the moment the host unlinks it.
+        assert!(plan.caches.is_empty());
+        assert_eq!(
+            plan.skipped,
+            vec![PruneSkip {
+                name: "/home/tester/projects/gone".to_string(),
+                reason: SkipReason::LiveSandbox,
+            }]
+        );
+    }
+
+    #[test]
+    fn prune_force_does_not_take_a_cache_a_live_sandbox_holds() {
+        let caches = vec![CacheInput {
+            key: "%2Fhome%2Ftester%2Fprojects%2Fhort".to_string(),
+            risk: CacheRisk::ProjectLives,
+            hold: CacheHold::HeldByLiveSandbox,
+        }];
+
+        let plan = prune_selection(&[], &[], &caches, None, true);
+
+        // The flag buys value: it says spend the four minutes of installing
+        // again. It cannot buy physics. A running box holding this directory
+        // survives the run and watches its own writable mount go, which is the
+        // one thing the teardown order exists to forbid.
+        assert!(plan.caches.is_empty());
+        assert_eq!(
+            plan.skipped,
+            vec![PruneSkip {
+                name: "/home/tester/projects/hort".to_string(),
+                reason: SkipReason::LiveSandbox,
+            }]
+        );
+    }
+
+    #[test]
+    fn prune_spares_a_cache_when_it_cannot_place_a_live_sandbox() {
+        let caches = vec![CacheInput {
+            key: "%2Fhome%2Ftester%2Fprojects%2Fgone".to_string(),
+            risk: CacheRisk::NothingAtRisk,
+            hold: CacheHold::Unknown,
+        }];
+
+        let plan = prune_selection(&[], &[], &caches, None, false);
+
+        // An anchor hort cannot place might be standing on any cache on the
+        // machine, so not knowing who holds this one is not evidence that
+        // nobody does.
+        assert!(plan.caches.is_empty());
+        assert_eq!(
+            plan.skipped,
+            vec![PruneSkip {
+                name: "/home/tester/projects/gone".to_string(),
+                reason: SkipReason::UnknownSandbox,
+            }]
+        );
+    }
+
+    #[test]
+    fn prune_force_does_not_take_a_cache_it_cannot_place() {
+        let caches = vec![CacheInput {
+            key: "%2Fhome%2Ftester%2Fprojects%2Fgone".to_string(),
+            risk: CacheRisk::NothingAtRisk,
+            hold: CacheHold::Unknown,
+        }];
+
+        let plan = prune_selection(&[], &[], &caches, None, true);
+
+        // A project hort could not read is released by --force, because the
+        // question there is only whether the user still wants what is stored. A
+        // sandbox hort could not place is not, because the answer decides
+        // whether a process is standing on the directory right now.
+        assert!(plan.caches.is_empty());
+        assert_eq!(
+            plan.skipped,
+            vec![PruneSkip {
+                name: "/home/tester/projects/gone".to_string(),
+                reason: SkipReason::UnknownSandbox,
+            }]
+        );
     }
 }

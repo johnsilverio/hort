@@ -420,14 +420,20 @@ fn render_line(entry: &LsEntry) -> String {
 
 /// Each reason in the words that send the reader to the right place. A cache skip
 /// that read like a worktree skip would have them hunting for uncommitted changes
-/// in a directory that holds none, which is why the two questions never share a
-/// label.
+/// in a directory that holds none, which is why no two of the three questions
+/// share a label. The last two matter most: they are the only reasons `--force`
+/// does not clear, so a reader told the same thing it tells them about a live
+/// project would pass the flag, watch nothing happen, and find no line explaining
+/// why. Their own two words are apart for the same reason, since downing a named
+/// box and going to look at `ls` are different things to do next.
 fn skip_reason_label(reason: &SkipReason) -> &'static str {
     match reason {
         SkipReason::Dirty => "dirty",
         SkipReason::Unknown => "unknown",
         SkipReason::LiveProject => "project on disk",
         SkipReason::UnknownProject => "project unreadable",
+        SkipReason::LiveSandbox => "sandbox running",
+        SkipReason::UnknownSandbox => "sandbox unaccounted for",
     }
 }
 
@@ -605,6 +611,49 @@ mod tests {
         // folder. Rendered with the same word they are one value again, and the
         // reader goes to the wrong place.
         assert_ne!(render_prune(&worktree), render_prune(&project));
+    }
+
+    #[test]
+    fn render_prune_tells_a_held_cache_from_a_live_project() {
+        let held = cache_skip_report(SkipReason::LiveSandbox);
+        let live_project = cache_skip_report(SkipReason::LiveProject);
+
+        // Told the project is still on disk, a user passes --force and gets what
+        // they asked for. Told the same thing about a cache a running box is
+        // standing on, they pass --force, nothing happens, and no line on the
+        // screen explains why.
+        assert_ne!(render_prune(&held), render_prune(&live_project));
+    }
+
+    #[test]
+    fn render_prune_tells_an_unplaceable_sandbox_from_an_unreadable_project() {
+        let unplaceable = cache_skip_report(SkipReason::UnknownSandbox);
+        let unreadable = cache_skip_report(SkipReason::UnknownProject);
+
+        // Same trap, the other half of it: --force releases a project hort could
+        // not read and never releases a sandbox it could not place.
+        assert_ne!(render_prune(&unplaceable), render_prune(&unreadable));
+    }
+
+    #[test]
+    fn render_prune_tells_a_held_cache_from_one_it_cannot_place() {
+        let held = cache_skip_report(SkipReason::LiveSandbox);
+        let unplaceable = cache_skip_report(SkipReason::UnknownSandbox);
+
+        // Neither is cleared by --force, so what is left to tell the user is
+        // what to do, and the two answers are different: down that box and run
+        // again, or go look at what `ls` says is running.
+        assert_ne!(render_prune(&held), render_prune(&unplaceable));
+    }
+
+    /// A report of one skipped cache, named by its project as every line a
+    /// person reads is.
+    fn cache_skip_report(reason: SkipReason) -> PruneReport {
+        PruneReport {
+            removed: Vec::new(),
+            removed_caches: Vec::new(),
+            skipped: vec![PruneSkip { name: "/home/tester/projects/hort".to_string(), reason }],
+        }
     }
 
     #[test]

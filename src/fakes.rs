@@ -829,6 +829,7 @@ pub fn sample_record(name: &str) -> SandboxRecord {
         "2026-06-11T12:00:00Z".to_string(),
         "2026-06-11T12:00:00Z".to_string(),
         None,
+        PathBuf::from(format!("/home/tester/projects/{name}")),
     )
 }
 

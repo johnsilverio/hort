@@ -370,6 +370,50 @@ mod tests {
     }
 
     #[test]
+    fn file_store_remembers_the_project_a_sandbox_was_built_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileMetadataStore::new(dir.path().to_path_buf());
+        store.put(&sample_record("demo")).unwrap();
+
+        let loaded = store.get(&SandboxName::new("demo").unwrap()).unwrap().unwrap();
+
+        // In git mode the worktree lives under hort's own state root, so nothing
+        // else on the record can say which project the sandbox came from, and a
+        // later run has to ask exactly that before it collects that project's
+        // cache.
+        assert_eq!(loaded.project_path(), Some(Path::new("/home/tester/projects/demo")));
+    }
+
+    #[test]
+    fn file_store_reads_a_record_written_before_the_project_was_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileMetadataStore::new(dir.path().to_path_buf());
+        write_metadata(
+            dir.path(),
+            "demo",
+            r#"{
+                "schemaVersion": 1,
+                "name": "demo",
+                "branch": "demo",
+                "worktreePath": "/state/sandboxes/demo/worktree-demo",
+                "overlayPath": "/state/sandboxes/demo/overlay",
+                "createdAt": "2026-06-11T12:00:00Z",
+                "lastAttachAt": "2026-06-11T12:00:00Z",
+                "notifyChannel": null,
+                "watcherPid": null,
+                "token": null
+            }"#,
+        );
+
+        let loaded = store.get(&SandboxName::new("demo").unwrap()).unwrap();
+
+        // Every sandbox on the machine was recorded by the build before this
+        // field existed. A record that answered anything but "I cannot say" here
+        // would be read as corrupt, and prune offers to delete corrupt entries.
+        assert_eq!(loaded.unwrap().project_path(), None);
+    }
+
+    #[test]
     fn file_store_get_errs_on_unknown_schema_version() {
         let dir = tempfile::tempdir().unwrap();
         let store = FileMetadataStore::new(dir.path().to_path_buf());
