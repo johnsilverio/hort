@@ -19,7 +19,7 @@ use crate::domain::model::{
 use crate::domain::mounts::MountSourceFacts;
 use crate::domain::preconditions::{ConfiguredShell, RootfsFacts};
 use crate::ports::{
-    Clock, Confirmer, ContainerRegistry, ContainerRuntime, CorruptEntry, DbForward,
+    CacheProvider, Clock, Confirmer, ContainerRegistry, ContainerRuntime, CorruptEntry, DbForward,
     EnvironmentProbe, LivenessProbe, MetadataStore, NetworkProvider, NetworkSpec, Notifier,
     OciSpec, RegistryEntry, ResourceLimits, SandboxLock, SandboxMount, Session, SessionProbe,
     SessionSpec, Worktree, WorktreeProvider,
@@ -647,6 +647,30 @@ impl ContainerRegistry for FakeRegistry {
             .iter()
             .map(|(id, token)| RegistryEntry { id: id.clone(), token: *token })
             .collect())
+    }
+}
+
+/// Remembers the cache directories it was asked to create, creating nothing.
+#[derive(Default)]
+pub struct FakeCacheProvider {
+    ensured: RefCell<Vec<PathBuf>>,
+}
+
+impl FakeCacheProvider {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every directory it was asked to create, in order.
+    pub fn ensured(&self) -> Vec<PathBuf> {
+        self.ensured.borrow().clone()
+    }
+}
+
+impl CacheProvider for FakeCacheProvider {
+    fn ensure(&self, sources: &[PathBuf]) -> Result<(), HortError> {
+        self.ensured.borrow_mut().extend(sources.iter().cloned());
+        Ok(())
     }
 }
 

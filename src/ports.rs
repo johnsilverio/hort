@@ -133,6 +133,15 @@ pub trait WorktreeProvider {
     fn prune_stale(&self) -> Result<(), HortError>;
 }
 
+/// The persistent directories a project's dependency cache lives in. hort owns
+/// these: it chose where they sit and keys them by project, so one that is not
+/// there yet is this project's first run rather than something the user removed.
+/// A mount source hort creates and later collects, like the worktrees.
+pub trait CacheProvider {
+    /// Create every cache directory in `sources` that is not already there.
+    fn ensure(&self, sources: &[PathBuf]) -> Result<(), HortError>;
+}
+
 /// Serializes the build of a single sandbox name so two concurrent `up`
 /// invocations cannot both clear the duplicate-name check and race to create the
 /// same sandbox. The lock is released once the build completes, before any
@@ -229,12 +238,22 @@ pub struct OciSpec {
     pub resources: Option<ResourceLimits>,
 }
 
-/// One host path carried into the sandbox: where it comes from and where the
-/// box finds it.
+/// One host path carried into the sandbox: where it comes from, where the box
+/// finds it, and whether the box may write through it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxMount {
     pub source: PathBuf,
     pub target: PathBuf,
+    pub access: MountAccess,
+}
+
+/// Whether a carried host path is writable from inside the sandbox. An enum
+/// rather than a flag because a name that means one of its own values reads as
+/// a fact about the mount everywhere it is not that value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountAccess {
+    ReadOnly,
+    ReadWrite,
 }
 
 /// Everything `join_session` needs to open one session inside a running

@@ -2,6 +2,7 @@
 //! and must never `use` an adapter, `libcontainer`, `git`, or `std::fs` state
 //! (architecture.md red flags). Carries the bulk of the tests (testing.md §4.1).
 
+pub mod cache;
 pub mod config;
 pub mod egress;
 pub mod error;

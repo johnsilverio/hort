@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
+use crate::adapters::cache::FileCacheProvider;
 use crate::adapters::clock::SystemClock;
 use crate::adapters::config::{ConfigResolver, find_project_dir};
 use crate::adapters::confirm::StdinConfirmer;
@@ -106,6 +107,7 @@ pub struct RealDeps {
     clock: SystemClock,
     confirmer: StdinConfirmer,
     env: HostEnvironmentProbe,
+    cache: FileCacheProvider,
     config: ConfigResolver,
     /// Kept so `prune` can derive a corrupt entry's canonical worktree path,
     /// which has no record to read it from.
@@ -170,6 +172,7 @@ impl RealDeps {
             clock: SystemClock,
             confirmer: StdinConfirmer,
             env: HostEnvironmentProbe,
+            cache: FileCacheProvider,
             config: ConfigResolver::new(resolve_config_root()?, adapters_dir, host_home.clone()),
             state_root,
             project_dir,
@@ -256,6 +259,7 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<u8, HortError> {
                 &deps.network,
                 &deps.clock,
                 &deps.env,
+                &deps.cache,
                 deps.state_root.clone(),
                 deps.project_dir.clone(),
                 deps.current_dir.clone(),

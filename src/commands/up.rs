@@ -9,18 +9,20 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::domain::cache::project_cache_key;
 use crate::domain::config::ResolvedConfig;
 use crate::domain::egress::{EgressPolicy, egress_degradation_warning};
 use crate::domain::error::HortError;
 use crate::domain::model::{BranchName, SandboxName, SandboxRecord, Warning};
-use crate::domain::mounts::{declared_read_only_sources, read_only_mount_plan};
+use crate::domain::mounts::{cache_mount_plan, declared_read_only_sources, read_only_mount_plan};
 use crate::domain::policy::{BranchIntent, up_error};
 use crate::domain::preconditions::up_precondition_error;
 use crate::domain::reconcile::SandboxState;
 use crate::domain::resources::resource_limits;
 use crate::ports::{
-    Clock, ContainerRegistry, ContainerRuntime, DbForward, EnvironmentProbe, LivenessProbe,
-    MetadataStore, NetworkProvider, NetworkSpec, OciSpec, SandboxLock, WorktreeProvider,
+    CacheProvider, Clock, ContainerRegistry, ContainerRuntime, DbForward, EnvironmentProbe,
+    LivenessProbe, MetadataStore, NetworkProvider, NetworkSpec, OciSpec, SandboxLock,
+    WorktreeProvider,
 };
 
 /// Coordinates building (or resuming) the sandbox named `<name>` over the ports
@@ -36,6 +38,7 @@ pub struct UpCommand<'a> {
     network: &'a dyn NetworkProvider,
     clock: &'a dyn Clock,
     env: &'a dyn EnvironmentProbe,
+    cache: &'a dyn CacheProvider,
     state_root: PathBuf,
     /// The project a marker declares, `None` when nothing up the chain declares
     /// one. Without git this directory is what backs `/workdir`, and its absence
@@ -62,6 +65,7 @@ impl<'a> UpCommand<'a> {
         network: &'a dyn NetworkProvider,
         clock: &'a dyn Clock,
         env: &'a dyn EnvironmentProbe,
+        cache: &'a dyn CacheProvider,
         state_root: PathBuf,
         project_dir: Option<PathBuf>,
         current_dir: PathBuf,
@@ -78,6 +82,7 @@ impl<'a> UpCommand<'a> {
             network,
             clock,
             env,
+            cache,
             state_root,
             project_dir,
             current_dir,
@@ -129,9 +134,16 @@ impl UpCommand<'_> {
         warnings.extend(egress_degradation_warning(&egress, host.landlock_abi));
 
         let declared = declared_read_only_sources(self.config);
-        let (mounts, mount_warnings) =
+        let (mut mounts, mount_warnings) =
             read_only_mount_plan(&self.env.inspect_mount_sources(&declared), &self.host_home);
         warnings.extend(mount_warnings);
+        // Planned after the read-only paths and mounted after them: the list is
+        // applied in order, so a cache addressed inside a read-only tree wins,
+        // and a cache the box cannot write to is worse than no cache at all.
+        let caches = cache_mount_plan(
+            self.config,
+            &self.state_root.join("cache").join(project_cache_key(project_dir)),
+        );
 
         if !self.lock.try_acquire(&name)? {
             return Err(HortError::UpInProgress { name: name.as_str().to_string() });
@@ -203,6 +215,12 @@ impl UpCommand<'_> {
             self.worktrees.create(&name, target)?;
         }
 
+        // The other mount source hort owns rather than finds, made here for the
+        // same reason the worktree is: a bind whose source is missing takes the
+        // whole container down, and nothing else on the machine creates these.
+        self.cache.ensure(&caches.iter().map(|cache| cache.source.clone()).collect::<Vec<_>>())?;
+        mounts.extend(caches);
+
         // Persist the record before the anchor starts: if the container then fails
         // to come up, the half-built sandbox stays recorded so a later run can
         // reconcile and clean it, instead of leaking a worktree nothing tracks.
@@ -262,14 +280,14 @@ mod tests {
 
     use std::time::SystemTime;
 
-    use crate::domain::config::{Cache, Egress, Mounts, Network, Resources};
+    use crate::domain::config::{Cache, CacheDir, Egress, Mounts, Network, Resources};
     use crate::domain::model::{AnchorPid, Capabilities, CgroupCaps, LivenessToken, MountNsInode};
-    use crate::ports::SandboxMount;
+    use crate::ports::{MountAccess, SandboxMount};
 
     use crate::fakes::{
-        FakeCapabilities, FakeNetwork, FakeRegistry, FakeRuntime, FakeSandboxLock,
-        FakeWorktreeProvider, InMemoryMetadataStore, ScriptedClock, ScriptedLivenessProbe,
-        sample_record,
+        FakeCacheProvider, FakeCapabilities, FakeNetwork, FakeRegistry, FakeRuntime,
+        FakeSandboxLock, FakeWorktreeProvider, InMemoryMetadataStore, ScriptedClock,
+        ScriptedLivenessProbe, sample_record,
     };
 
     fn canned_token() -> LivenessToken {
@@ -314,6 +332,7 @@ mod tests {
         network: &'a FakeNetwork,
         clock: &'a ScriptedClock,
         env: &'a FakeCapabilities,
+        cache: &'a FakeCacheProvider,
         config: &'a ResolvedConfig,
     ) -> UpCommand<'a> {
         UpCommand {
@@ -326,6 +345,7 @@ mod tests {
             network,
             clock,
             env,
+            cache,
             state_root: PathBuf::from("/state"),
             project_dir: Some(PathBuf::from("/project")),
             current_dir: PathBuf::from("/project"),
@@ -346,8 +366,10 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -368,8 +390,10 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -391,8 +415,10 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -416,8 +442,10 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -442,8 +470,10 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -468,8 +498,10 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -492,8 +524,10 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -513,8 +547,10 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -536,8 +572,10 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -559,8 +597,10 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -580,8 +620,10 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -601,8 +643,10 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         let result = command
@@ -626,8 +670,10 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         let result = command
@@ -648,8 +694,10 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         let result = command
@@ -676,8 +724,10 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -698,8 +748,10 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(Capabilities { user_ns: false, ..ready_host() });
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -722,8 +774,10 @@ mod tests {
             egress: Some(Egress::Allowlist { allow: vec!["api.anthropic.com".to_string()] }),
             ..healthy_config()
         };
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -743,8 +797,10 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host()).with_missing_rootfs();
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -765,8 +821,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config =
             ResolvedConfig { shell: Some("/usr/bin/fish".to_string()), ..healthy_config() };
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -789,8 +847,10 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -813,8 +873,10 @@ mod tests {
             resources: Some(Resources { memory: Some("4g".to_string()), cpus: Some(2.0) }),
             ..healthy_config()
         };
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -838,8 +900,10 @@ mod tests {
             mounts: Mounts { read_only: vec!["/home/tester/.config/fish".to_string()] },
             ..healthy_config()
         };
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -852,7 +916,136 @@ mod tests {
             vec![SandboxMount {
                 source: PathBuf::from("/home/tester/.config/fish"),
                 target: PathBuf::from("/home/hort/.config/fish"),
+                access: MountAccess::ReadOnly,
             }]
+        );
+    }
+
+    #[test]
+    fn two_sandboxes_of_one_project_share_a_cache_dir() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = ResolvedConfig {
+            cache: Cache { dirs: vec![CacheDir::Path("node_modules".to_string())] },
+            ..healthy_config()
+        };
+        let cache = FakeCacheProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
+        );
+        let shared = SandboxMount {
+            source: PathBuf::from("/state/cache/%2Fproject/node_modules"),
+            target: PathBuf::from("/workdir/node_modules"),
+            access: MountAccess::ReadWrite,
+        };
+
+        command.run(SandboxName::new("first").unwrap(), None).unwrap();
+        let first = runtime.started_mounts();
+        command.run(SandboxName::new("second").unwrap(), None).unwrap();
+
+        // The cache belongs to the project, not to the box: what took four
+        // minutes to populate is the reason to throw a sandbox away without
+        // thinking twice, and a cache keyed by sandbox would make the second box
+        // of a project pay that price over again. The address is the witness,
+        // because keying it by anything else is invisible until someone waits.
+        assert_eq!(first, vec![shared.clone()]);
+        assert_eq!(runtime.started_mounts(), vec![shared]);
+    }
+
+    #[test]
+    fn up_creates_the_cache_directories_before_the_container_starts() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::failing_start(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = ResolvedConfig {
+            cache: Cache { dirs: vec![CacheDir::Path("node_modules".to_string())] },
+            ..healthy_config()
+        };
+        let cache = FakeCacheProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
+        );
+
+        let result = command.run(SandboxName::new("demo").unwrap(), None);
+
+        // A bind whose source is not on the host takes the whole container down,
+        // and this source is one hort chose the address of and nobody else ever
+        // creates, so the first run of every project would be the run that never
+        // boots. The container failing to start is what dates the creation: it
+        // happened, and it happened before there was a container.
+        assert!(result.is_err());
+        assert_eq!(cache.ensured(), vec![PathBuf::from("/state/cache/%2Fproject/node_modules")]);
+    }
+
+    #[test]
+    fn a_cache_comes_after_the_read_only_mount_it_lands_inside() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        // The whole configuration directory carried in read-only, and one
+        // directory inside it declared a cache, which is what a user does for a
+        // tool that writes into its own configuration directory and wants those
+        // writes to outlive the box.
+        let config = ResolvedConfig {
+            mounts: Mounts { read_only: vec!["/home/tester/.config".to_string()] },
+            cache: Cache {
+                dirs: vec![CacheDir::Named {
+                    name: "fish".to_string(),
+                    target: "~/.config/fish".to_string(),
+                }],
+            },
+            ..healthy_config()
+        };
+        let cache = FakeCacheProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // The mount list is applied in order, so of two mounts whose
+        // destinations overlap the box only ever sees the later one. Carried the
+        // other way round, the read-only bind lands on top of the cache and the
+        // box gets a cache it cannot write to, which is worse than having no
+        // cache at all: the tool now fails where it used to merely reinstall.
+        // Nothing else in the build decides this, since the two plans are made
+        // apart and never see each other.
+        assert_eq!(
+            runtime.started_mounts(),
+            vec![
+                SandboxMount {
+                    source: PathBuf::from("/home/tester/.config"),
+                    target: PathBuf::from("/home/hort/.config"),
+                    access: MountAccess::ReadOnly,
+                },
+                SandboxMount {
+                    source: PathBuf::from("/state/cache/%2Fproject/fish"),
+                    target: PathBuf::from("/home/hort/.config/fish"),
+                    access: MountAccess::ReadWrite,
+                },
+            ]
         );
     }
 
@@ -871,8 +1064,10 @@ mod tests {
             mounts: Mounts { read_only: vec!["/home/tester/.tmux.conf".to_string()] },
             ..healthy_config()
         };
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         let warnings = command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -903,8 +1098,10 @@ mod tests {
             resources: Some(Resources { memory: Some("4g".to_string()), cpus: None }),
             ..healthy_config()
         };
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         let warnings = command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -927,8 +1124,10 @@ mod tests {
             egress: Some(Egress::Allowlist { allow: vec!["api.anthropic.com".to_string()] }),
             ..healthy_config()
         };
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         let warnings = command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -955,8 +1154,10 @@ mod tests {
             egress: Some(Egress::Allowlist { allow: vec!["api.anthropic.com".to_string()] }),
             ..healthy_config()
         };
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         let warnings = command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -982,8 +1183,10 @@ mod tests {
             egress: Some(Egress::Allowlist { allow: vec!["api.anthropic.com".to_string()] }),
             ..healthy_config()
         };
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -1012,8 +1215,10 @@ mod tests {
             }],
             ..healthy_config()
         };
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -1034,12 +1239,13 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = UpCommand {
             project_dir: Some(project.clone()),
             current_dir: project.clone(),
             ..up_command(
                 &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
-                &config,
+                &cache, &config,
             )
         };
 
@@ -1061,12 +1267,13 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = UpCommand {
             project_dir: Some(project.clone()),
             current_dir: project,
             ..up_command(
                 &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
-                &config,
+                &cache, &config,
             )
         };
 
@@ -1092,12 +1299,13 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = UpCommand {
             project_dir: Some(project.clone()),
             current_dir: project,
             ..up_command(
                 &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
-                &config,
+                &cache, &config,
             )
         };
 
@@ -1118,12 +1326,13 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = UpCommand {
             project_dir: None,
             current_dir: PathBuf::from("/home/tester/Downloads"),
             ..up_command(
                 &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
-                &config,
+                &cache, &config,
             )
         };
 
@@ -1151,12 +1360,13 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = UpCommand {
             project_dir: Some(project.clone()),
             current_dir: project,
             ..up_command(
                 &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
-                &config,
+                &cache, &config,
             )
         };
 
@@ -1178,12 +1388,13 @@ mod tests {
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
+        let cache = FakeCacheProvider::new();
         let command = UpCommand {
             project_dir: None,
             current_dir: PathBuf::from("/home/tester/Downloads"),
             ..up_command(
                 &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
-                &config,
+                &cache, &config,
             )
         };
 
@@ -1213,8 +1424,10 @@ mod tests {
             egress: Some(Egress::Allowlist { allow: vec!["not a host!".to_string()] }),
             ..healthy_config()
         };
+        let cache = FakeCacheProvider::new();
         let command = up_command(
-            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &config,
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);

@@ -1,6 +1,7 @@
 //! Adapters: the only code that touches the world (kernel, `/proc`, git, the
 //! filesystem, external binaries). Each implements a port from `ports`.
 
+pub mod cache;
 pub mod clock;
 pub mod config;
 pub mod confirm;

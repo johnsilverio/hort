@@ -68,10 +68,10 @@ use crate::adapters::namespaces::{enter, owning_user_namespace};
 use crate::adapters::streams::{open_sandbox_log, sandbox_log_path};
 use crate::domain::error::HortError;
 use crate::domain::model::{AnchorPid, LivenessToken, MountNsInode, SandboxName};
-use crate::domain::mounts::SANDBOX_HOME;
+use crate::domain::mounts::{SANDBOX_HOME, WORKDIR};
 use crate::ports::{
-    ContainerRegistry, ContainerRuntime, OciSpec, RegistryEntry, ResourceLimits, SandboxMount,
-    Session, SessionProbe, SessionSpec,
+    ContainerRegistry, ContainerRuntime, MountAccess, OciSpec, RegistryEntry, ResourceLimits,
+    SandboxMount, Session, SessionProbe, SessionSpec,
 };
 
 const SANDBOXES_DIR: &str = "sandboxes";
@@ -82,7 +82,6 @@ const CONFIG_FILE: &str = "config.json";
 const UPPER_LAYER: &str = "upper";
 const WORK_LAYER: &str = "work";
 const MERGED_ROOT: &str = "merged";
-const WORKDIR: &str = "/workdir";
 const SANDBOX_TMP: &str = "/tmp";
 const DEV_NULL: &str = "/dev/null";
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -903,7 +902,7 @@ fn merged_root(overlay: &Path) -> Root {
 /// instead of mounting a fresh one, which a user namespace that does not own the
 /// network namespace may not do, and it drops the terminal group id, which is
 /// not mapped inside the sandbox.
-fn sandbox_mounts(workdir: &Path, read_only: &[SandboxMount]) -> Vec<Mount> {
+fn sandbox_mounts(workdir: &Path, declared: &[SandboxMount]) -> Vec<Mount> {
     let mut mounts = get_rootless_mounts();
     let mut worktree = Mount::default();
     worktree.set_destination(PathBuf::from(WORKDIR));
@@ -913,20 +912,24 @@ fn sandbox_mounts(workdir: &Path, read_only: &[SandboxMount]) -> Vec<Mount> {
     mounts.push(worktree);
     mounts.push(ephemeral_tmpfs(SANDBOX_HOME, "0700"));
     mounts.push(ephemeral_tmpfs(SANDBOX_TMP, "1777"));
-    // Last, because the list is applied in order and most of these live inside
-    // the home: a tmpfs laid over them afterwards would cover every one.
-    mounts.extend(read_only.iter().map(read_only_bind));
+    // Last, because the list is applied in order and these land inside the
+    // worktree or the home: anything laid over them afterwards covers them.
+    mounts.extend(declared.iter().map(declared_bind));
     mounts
 }
 
-/// A host path the sandbox reads and cannot write. The sandbox holds no
-/// capability to remount anything, so what this option denies stays denied.
-fn read_only_bind(mount: &SandboxMount) -> Mount {
+/// A host path the sandbox carries. Read-only stays denied for the life of the
+/// box: the sandbox holds no capability to remount anything.
+fn declared_bind(mount: &SandboxMount) -> Mount {
     let mut bind = Mount::default();
     bind.set_destination(mount.target.clone());
     bind.set_typ(Some("bind".to_string()));
     bind.set_source(Some(mount.source.clone()));
-    bind.set_options(Some(vec!["rbind".to_string(), "ro".to_string()]));
+    let access = match mount.access {
+        MountAccess::ReadOnly => "ro",
+        MountAccess::ReadWrite => "rw",
+    };
+    bind.set_options(Some(vec!["rbind".to_string(), access.to_string()]));
     bind
 }
 
@@ -1067,7 +1070,7 @@ mod tests {
     };
 
     use crate::adapters::liveness::ProcLivenessProbe;
-    use crate::ports::{LivenessProbe, ResourceLimits, SandboxMount};
+    use crate::ports::{LivenessProbe, MountAccess, ResourceLimits, SandboxMount};
 
     fn sandbox_spec() -> OciSpec {
         OciSpec {
@@ -1091,7 +1094,34 @@ mod tests {
             mounts: vec![SandboxMount {
                 source: PathBuf::from("/home/tester/.config/fish"),
                 target: PathBuf::from("/home/hort/.config/fish"),
+                access: MountAccess::ReadOnly,
             }],
+            ..sandbox_spec()
+        }
+    }
+
+    /// A sandbox carrying both families at once: the user's own configuration,
+    /// which it may only read, and two caches of the project it is a sandbox of,
+    /// one addressed inside the worktree and one inside the home.
+    fn spec_mounting_a_dotfile_and_two_caches() -> OciSpec {
+        OciSpec {
+            mounts: vec![
+                SandboxMount {
+                    source: PathBuf::from("/home/tester/.config/fish"),
+                    target: PathBuf::from("/home/hort/.config/fish"),
+                    access: MountAccess::ReadOnly,
+                },
+                SandboxMount {
+                    source: PathBuf::from("/state/cache/%2Fproject/node_modules"),
+                    target: PathBuf::from("/workdir/node_modules"),
+                    access: MountAccess::ReadWrite,
+                },
+                SandboxMount {
+                    source: PathBuf::from("/state/cache/%2Fproject/pip"),
+                    target: PathBuf::from("/home/hort/.cache/pip"),
+                    access: MountAccess::ReadWrite,
+                },
+            ],
             ..sandbox_spec()
         }
     }
@@ -1305,16 +1335,47 @@ mod tests {
     }
 
     #[test]
-    fn read_only_mounts_come_after_every_tmpfs_that_would_hide_them() {
-        let assembled = anchor_spec(&spec_mounting_a_dotfile());
+    fn spec_mounts_a_cache_path_writable() {
+        let assembled = anchor_spec(&spec_mounting_a_dotfile_and_two_caches());
+
+        // A cache exists to be filled from inside the box: read-only it holds
+        // whatever the first run put there and refuses every install after it,
+        // which is worse than having no cache at all, because the box now fails
+        // where a box without one merely waited.
+        let mounts = assembled.mounts().as_ref().unwrap();
+        let cache = &mounts[mount_index(&assembled, "/workdir/node_modules")];
+        assert_eq!(cache.source(), &Some(PathBuf::from("/state/cache/%2Fproject/node_modules")));
+        assert!(!cache.options().as_ref().unwrap().contains(&"ro".to_string()));
+    }
+
+    #[test]
+    fn declared_mounts_come_after_every_tmpfs_that_would_hide_them() {
+        let assembled = anchor_spec(&spec_mounting_a_dotfile_and_two_caches());
 
         // The mount list is applied in order, so a tmpfs laid down after a bind
         // that lands underneath it covers that bind: the box comes up missing
         // what the user declared, no error anywhere, and a shell that silently
-        // behaves like nobody's. The home is not the only one that can do it,
-        // because a declared source outside the user's own home keeps its
-        // absolute path and can therefore land under any of them.
-        assert!(last_tmpfs_index(&assembled) < mount_index(&assembled, "/home/hort/.config/fish"));
+        // behaves like nobody's. Which family the bind came from decides
+        // nothing: a cache addressed inside the home is swallowed exactly like a
+        // dotfile is, and a declared source outside the user's own home keeps
+        // its absolute path and can land under any of them.
+        let last_tmpfs = last_tmpfs_index(&assembled);
+        assert!(last_tmpfs < mount_index(&assembled, "/home/hort/.config/fish"));
+        assert!(last_tmpfs < mount_index(&assembled, "/home/hort/.cache/pip"));
+    }
+
+    #[test]
+    fn a_cache_bind_comes_after_the_worktree_that_holds_it() {
+        let assembled = anchor_spec(&spec_mounting_a_dotfile_and_two_caches());
+
+        // The other mount that swallows one, and a different one: a cache named
+        // bare is addressed inside the worktree, so the bind that carries the
+        // worktree covers it if it lands second. What the box would see at that
+        // path is then the project's own empty directory, and every install
+        // would go back to writing into the sandbox it dies with.
+        assert!(
+            mount_index(&assembled, "/workdir") < mount_index(&assembled, "/workdir/node_modules")
+        );
     }
 
     #[test]
@@ -1622,7 +1683,9 @@ mod privileged_tests {
     use crate::adapters::streams::sandbox_log_path;
     use crate::domain::egress::{EgressPolicy, HostPattern};
     use crate::domain::model::Domain;
-    use crate::ports::{DbForward, EnvironmentProbe, NetworkProvider, NetworkSpec, SandboxMount};
+    use crate::ports::{
+        DbForward, EnvironmentProbe, MountAccess, NetworkProvider, NetworkSpec, SandboxMount,
+    };
 
     const ANCHOR_DEADLINE: Duration = Duration::from_secs(5);
     /// How long a session is given to exec and dial, and therefore also how long
@@ -1789,7 +1852,11 @@ mod privileged_tests {
         let source = state_root.join("dotfiles").join("fish");
         fs::create_dir_all(&source).unwrap();
         fs::write(source.join(DOTFILE), DOTFILE_CONTENT).unwrap();
-        SandboxMount { source, target: PathBuf::from(MOUNTED_DOTFILE_DIR) }
+        SandboxMount {
+            source,
+            target: PathBuf::from(MOUNTED_DOTFILE_DIR),
+            access: MountAccess::ReadOnly,
+        }
     }
 
     /// A session that reads the mounted dotfile and reports into `/workdir`

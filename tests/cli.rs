@@ -669,6 +669,54 @@ fn cli_up_reports_a_configuration_advisory_on_stderr() {
 
 #[test]
 #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_a_declared_cache_dir_survives_the_sandbox_that_wrote_it() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let state_root = xdg_root.join("hort");
+    let runtime = TempDir::new().unwrap();
+    let runtime_root = runtime.path().canonicalize().unwrap();
+    let (_config, config_home) = temp_config_home(&format!(
+        r#"{{ "rootfs": "{rootfs}", "cache": {{ "dirs": ["node_modules"] }} }}"#
+    ));
+    let (_repo, repo_path) = temp_git_repo();
+    // Worked out here rather than asked of hort, so what this reads back is an
+    // address the test arrived at on its own and not one it was handed.
+    let key = repo_path.display().to_string().replace('%', "%25").replace('/', "%2F");
+    let cached = state_root.join("cache").join(key).join("node_modules").join("installed");
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .current_dir(&repo_path)
+        .args(["up", "cachedemo"])
+        .write_stdin("mkdir -p /workdir/node_modules && echo four-minutes-of-installing > /workdir/node_modules/installed\n")
+        .assert()
+        .success();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .current_dir(&repo_path)
+        .args(["down", "cachedemo"])
+        .assert()
+        .success();
+
+    // Read after the sandbox is gone, because outliving it is the entire point:
+    // a box is disposable and what it took four minutes to install is not. Every
+    // other suite can be green with this broken, since the address, the creation
+    // of the directory, the writable bind and the wiring that carries them into
+    // a real container are settled in four different places and only a run that
+    // uses all four can say they agree.
+    assert_eq!(fs::read_to_string(&cached).ok().as_deref(), Some("four-minutes-of-installing\n"));
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
 fn cli_down_without_git_leaves_the_project_folder() {
     let Some(rootfs) = prepared_rootfs() else { return };
     let xdg = TempDir::new().unwrap();
