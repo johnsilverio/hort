@@ -108,6 +108,19 @@ fn temp_config_home(global: &str) -> (TempDir, PathBuf) {
     (dir, path)
 }
 
+/// A throwaway home directory, returned with its canonicalized path. Under the
+/// user's real home rather than under `/tmp`, because a path hort derives from a
+/// home is only as faithful as the home it was handed, and two defects have
+/// already shipped past a green suite from a scratch directory that did not
+/// carry a property of the path it stood in for. It holds only what the test
+/// puts in it, so the guard takes back everything it made.
+fn temp_host_home() -> (TempDir, PathBuf) {
+    let real_home = std::env::home_dir().expect("the test runner has a home directory");
+    let dir = TempDir::new_in(real_home).unwrap();
+    let path = dir.path().canonicalize().unwrap();
+    (dir, path)
+}
+
 /// The prepared rootfs the end-to-end test builds a sandbox from, or `None`
 /// after saying what is missing, so a host without one reports why it skipped
 /// instead of failing.
@@ -512,6 +525,57 @@ fn cli_up_without_detach_opens_a_session_in_the_sandbox_it_built() {
         .env("XDG_RUNTIME_DIR", &runtime_root)
         .current_dir(&repo_path)
         .args(["down", "shelldemo"])
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_up_carries_a_declared_dotfile_into_the_sandbox_home() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let runtime = TempDir::new().unwrap();
+    let runtime_root = runtime.path().canonicalize().unwrap();
+    let (_home, home_path) = temp_host_home();
+    let declared = home_path.join(".config").join("hortwitness");
+    fs::create_dir_all(&declared).unwrap();
+    fs::write(declared.join("settings"), "carried-from-the-host\n").unwrap();
+    let (_config, config_home) = temp_config_home(&format!(
+        r#"{{ "rootfs": "{rootfs}", "mounts": {{ "readOnly": ["{}"] }} }}"#,
+        declared.display()
+    ));
+    let (_repo, repo_path) = temp_git_repo();
+
+    // Read back where the box looks for it, never where the host keeps it. A
+    // build that lost the home it measures a declared path against mounts the
+    // directory just the same and succeeds just the same, at the host's own
+    // absolute path, an address nothing inside the box ever visits: the failure
+    // is a sandbox that carries nothing and says so nowhere, and only the
+    // destination tells the two apart. Which home and which roots reach the
+    // adapters is settled where hort wires itself up, so nothing below that
+    // wiring can witness this.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("HOME", &home_path)
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .current_dir(&repo_path)
+        .args(["up", "mountdemo"])
+        .write_stdin("cat /home/hort/.config/hortwitness/settings\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("carried-from-the-host"));
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("HOME", &home_path)
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .current_dir(&repo_path)
+        .args(["down", "mountdemo"])
         .assert()
         .success();
 }
