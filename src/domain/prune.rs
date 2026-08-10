@@ -1,15 +1,16 @@
 //! Prune selection: the pure decision of what `prune` removes, skips, or leaves
-//! alone, over reconciled sandboxes and corrupt metadata dirs. Orphaned and
-//! inconsistent sandboxes are debris and always candidates; a live sandbox is a
-//! candidate only when an idle threshold is set and it has been idle at least
-//! that long; an active or unknown-idle sandbox is never selected, and a lost
-//! record is never prune's to remove. Every candidate, sandbox or corrupt dir
-//! alike, then passes a fail-closed guard: without `--force` only a worktree
-//! proven to hold nothing is removed, and one hort could not read is skipped
-//! with a reason of its own.
+//! alone, over reconciled sandboxes, corrupt metadata dirs and stored caches.
+//! Orphaned and inconsistent sandboxes are debris and always candidates; a live
+//! sandbox is a candidate only when an idle threshold is set and it has been idle
+//! at least that long; an active or unknown-idle sandbox is never selected, and a
+//! lost record is never prune's to remove. Every candidate then passes a
+//! fail-closed guard: without `--force` only a worktree proven to hold nothing
+//! and a cache whose project is proven gone are removed, and one hort could not
+//! read is skipped with a reason of its own.
 
 use std::time::Duration;
 
+use crate::domain::cache::project_from_cache_key;
 use crate::domain::idle::IdleState;
 use crate::domain::model::SandboxName;
 use crate::domain::reconcile::SandboxState;
@@ -43,16 +44,43 @@ pub struct CorruptInput {
     pub risk: WorktreeRisk,
 }
 
-/// Why a candidate was skipped instead of removed. A closed set today; it grows
-/// when live-project caches arrive.
+/// Whether the project a stored cache belongs to is still there, as far as hort
+/// was able to determine.
+///
+/// It mirrors `WorktreeRisk` on purpose, so the same reading serves both, and it
+/// names the question rather than one of its own answers. `ProjectLives` is the
+/// protected state: a cache is only worth removing once the project that fills
+/// it is gone.
+pub enum CacheRisk {
+    ProjectLives,
+    NothingAtRisk,
+    Unknown,
+}
+
+/// One stored cache as the selection sees it: the on-disk directory name it is
+/// addressed by, and whether the project it belongs to is still there.
+///
+/// Removal is by whole directory rather than by entry, because listing a
+/// project's entries needs that project's configuration, and the configuration of
+/// a project that no longer exists cannot be read at all.
+pub struct CacheInput {
+    pub key: String,
+    pub risk: CacheRisk,
+}
+
+/// Why a candidate was skipped instead of removed.
 ///
 /// `Unknown` is not cosmetic: reporting a box as dirty when its repository is
 /// gone sends the user hunting for uncommitted changes git can no longer
-/// enumerate, and that report is what they read before deciding to force.
+/// enumerate, and that report is what they read before deciding to force. The
+/// cache reasons are separate from it for the same reason they exist at all: one
+/// word for both questions sends that reader to the wrong place.
 #[derive(Debug, PartialEq)]
 pub enum SkipReason {
     Dirty,
     Unknown,
+    LiveProject,
+    UnknownProject,
 }
 
 /// A candidate the selection chose not to remove, with the reason.
@@ -63,23 +91,31 @@ pub struct PruneSkip {
 }
 
 /// The selection's verdict: record-backed removals (executed via the teardown
-/// plan), corrupt metadata dirs (executed in the fixed teardown order), and the
-/// candidates skipped with their reason.
+/// plan), corrupt metadata dirs (executed in the fixed teardown order), the keys
+/// of the caches to collect, and the candidates skipped with their reason.
 pub struct PrunePlan {
     pub sandboxes: Vec<SandboxName>,
     pub corrupt: Vec<String>,
+    pub caches: Vec<String>,
     pub skipped: Vec<PruneSkip>,
 }
 
 /// Decide what `prune` removes, given the reconciled sandboxes, the corrupt
-/// metadata dirs, the optional idle threshold, and whether `--force` was passed.
+/// metadata dirs, the stored caches, the optional idle threshold, and whether
+/// `--force` was passed.
 pub fn prune_selection(
     sandboxes: &[PruneInput],
     corrupt: &[CorruptInput],
+    caches: &[CacheInput],
     idle_threshold: Option<Duration>,
     force: bool,
 ) -> PrunePlan {
-    let mut plan = PrunePlan { sandboxes: Vec::new(), corrupt: Vec::new(), skipped: Vec::new() };
+    let mut plan = PrunePlan {
+        sandboxes: Vec::new(),
+        corrupt: Vec::new(),
+        caches: Vec::new(),
+        skipped: Vec::new(),
+    };
 
     for input in sandboxes {
         if !is_candidate(input, idle_threshold) {
@@ -95,6 +131,19 @@ pub fn prune_selection(
         match protected(&input.risk, force) {
             Some(reason) => plan.skipped.push(skip(&input.name, reason)),
             None => plan.corrupt.push(input.name.clone()),
+        }
+    }
+
+    for input in caches {
+        match cache_protected(&input.risk, force) {
+            // A key is the address hort stores a cache under; the project is what
+            // the user recognizes as theirs, and this line is the last one read
+            // before deciding whether to force.
+            Some(reason) => {
+                let project = project_from_cache_key(&input.key);
+                plan.skipped.push(skip(&project.display().to_string(), reason));
+            }
+            None => plan.caches.push(input.key.clone()),
         }
     }
 
@@ -137,6 +186,23 @@ fn protected(risk: &WorktreeRisk, force: bool) -> Option<SkipReason> {
     }
 }
 
+/// Why a stored cache is held back, or `None` when it may be collected. Same
+/// permission gate as the worktrees, asked of a different question: only a
+/// project hort proved is gone from disk releases its cache without `--force`,
+/// and a presence read that failed protects. Failing that way round leaves a
+/// directory behind; failing the other way collects the cache of every project on
+/// a machine where that read happens to be failing.
+fn cache_protected(risk: &CacheRisk, force: bool) -> Option<SkipReason> {
+    if force {
+        return None;
+    }
+    match risk {
+        CacheRisk::ProjectLives => Some(SkipReason::LiveProject),
+        CacheRisk::Unknown => Some(SkipReason::UnknownProject),
+        CacheRisk::NothingAtRisk => None,
+    }
+}
+
 fn skip(name: &str, reason: SkipReason) -> PruneSkip {
     PruneSkip { name: name.to_string(), reason }
 }
@@ -158,7 +224,7 @@ mod tests {
             risk: WorktreeRisk::NothingAtRisk,
         }];
 
-        let plan = prune_selection(&inputs, &[], None, false);
+        let plan = prune_selection(&inputs, &[], &[], None, false);
 
         assert_eq!(plan.sandboxes, vec![name("demo")]);
         assert!(plan.skipped.is_empty());
@@ -173,7 +239,7 @@ mod tests {
             risk: WorktreeRisk::NothingAtRisk,
         }];
 
-        let plan = prune_selection(&inputs, &[], None, false);
+        let plan = prune_selection(&inputs, &[], &[], None, false);
 
         assert_eq!(plan.sandboxes, vec![name("demo")]);
     }
@@ -187,7 +253,7 @@ mod tests {
             risk: WorktreeRisk::NothingAtRisk,
         }];
 
-        let plan = prune_selection(&inputs, &[], None, false);
+        let plan = prune_selection(&inputs, &[], &[], None, false);
 
         assert!(plan.sandboxes.is_empty());
         assert!(plan.skipped.is_empty());
@@ -202,7 +268,7 @@ mod tests {
             risk: WorktreeRisk::NothingAtRisk,
         }];
 
-        let plan = prune_selection(&inputs, &[], Some(Duration::from_secs(1800)), false);
+        let plan = prune_selection(&inputs, &[], &[], Some(Duration::from_secs(1800)), false);
 
         assert!(plan.sandboxes.is_empty());
         assert!(plan.skipped.is_empty());
@@ -217,7 +283,7 @@ mod tests {
             risk: WorktreeRisk::NothingAtRisk,
         }];
 
-        let plan = prune_selection(&inputs, &[], Some(Duration::from_secs(1800)), false);
+        let plan = prune_selection(&inputs, &[], &[], Some(Duration::from_secs(1800)), false);
 
         assert_eq!(plan.sandboxes, vec![name("demo")]);
     }
@@ -231,7 +297,7 @@ mod tests {
             risk: WorktreeRisk::NothingAtRisk,
         }];
 
-        let plan = prune_selection(&inputs, &[], Some(Duration::from_secs(1800)), false);
+        let plan = prune_selection(&inputs, &[], &[], Some(Duration::from_secs(1800)), false);
 
         assert!(plan.sandboxes.is_empty());
     }
@@ -245,7 +311,7 @@ mod tests {
             risk: WorktreeRisk::NothingAtRisk,
         }];
 
-        let plan = prune_selection(&inputs, &[], Some(Duration::from_secs(1800)), true);
+        let plan = prune_selection(&inputs, &[], &[], Some(Duration::from_secs(1800)), true);
 
         assert!(plan.sandboxes.is_empty());
     }
@@ -259,7 +325,7 @@ mod tests {
             risk: WorktreeRisk::NothingAtRisk,
         }];
 
-        let plan = prune_selection(&inputs, &[], Some(Duration::from_secs(1800)), false);
+        let plan = prune_selection(&inputs, &[], &[], Some(Duration::from_secs(1800)), false);
 
         assert!(plan.sandboxes.is_empty());
     }
@@ -273,7 +339,7 @@ mod tests {
             risk: WorktreeRisk::HoldsWork,
         }];
 
-        let plan = prune_selection(&inputs, &[], None, false);
+        let plan = prune_selection(&inputs, &[], &[], None, false);
 
         assert!(plan.sandboxes.is_empty());
         assert_eq!(
@@ -291,7 +357,7 @@ mod tests {
             risk: WorktreeRisk::HoldsWork,
         }];
 
-        let plan = prune_selection(&inputs, &[], None, true);
+        let plan = prune_selection(&inputs, &[], &[], None, true);
 
         assert_eq!(plan.sandboxes, vec![name("demo")]);
         assert!(plan.skipped.is_empty());
@@ -302,7 +368,7 @@ mod tests {
         let corrupt =
             vec![CorruptInput { name: "rotten".to_string(), risk: WorktreeRisk::NothingAtRisk }];
 
-        let plan = prune_selection(&[], &corrupt, None, false);
+        let plan = prune_selection(&[], &corrupt, &[], None, false);
 
         assert_eq!(plan.corrupt, vec!["rotten".to_string()]);
     }
@@ -316,7 +382,7 @@ mod tests {
             risk: WorktreeRisk::Unknown,
         }];
 
-        let plan = prune_selection(&inputs, &[], None, false);
+        let plan = prune_selection(&inputs, &[], &[], None, false);
 
         // Not knowing what a worktree holds is not evidence that it holds
         // nothing, and the guard exists to protect uncommitted work.
@@ -336,7 +402,7 @@ mod tests {
             risk: WorktreeRisk::Unknown,
         }];
 
-        let plan = prune_selection(&inputs, &[], None, true);
+        let plan = prune_selection(&inputs, &[], &[], None, true);
 
         assert_eq!(plan.sandboxes, vec![name("demo")]);
         assert!(plan.skipped.is_empty());
@@ -347,12 +413,85 @@ mod tests {
         let corrupt =
             vec![CorruptInput { name: "rotten".to_string(), risk: WorktreeRisk::HoldsWork }];
 
-        let plan = prune_selection(&[], &corrupt, None, false);
+        let plan = prune_selection(&[], &corrupt, &[], None, false);
 
         assert!(plan.corrupt.is_empty());
         assert_eq!(
             plan.skipped,
             vec![PruneSkip { name: "rotten".to_string(), reason: SkipReason::Dirty }]
         );
+    }
+
+    #[test]
+    fn prune_selects_a_cache_whose_project_is_gone() {
+        let caches = vec![CacheInput {
+            key: "%2Fhome%2Ftester%2Fprojects%2Fgone".to_string(),
+            risk: CacheRisk::NothingAtRisk,
+        }];
+
+        let plan = prune_selection(&[], &[], &caches, None, false);
+
+        // The whole reason the key is a reversible encoding and not a hash: a
+        // stored cache can say which project filled it, and a project that is
+        // gone from disk will never fill it again.
+        assert_eq!(plan.caches, vec!["%2Fhome%2Ftester%2Fprojects%2Fgone".to_string()]);
+        assert!(plan.skipped.is_empty());
+    }
+
+    #[test]
+    fn prune_skips_a_cache_of_a_live_project_with_reason() {
+        let caches = vec![CacheInput {
+            key: "%2Fhome%2Ftester%2Fprojects%2Fhort".to_string(),
+            risk: CacheRisk::ProjectLives,
+        }];
+
+        let plan = prune_selection(&[], &[], &caches, None, false);
+
+        // The line a skip produces is the last thing read before deciding to
+        // pass --force, so it names the project the user recognizes and not the
+        // address hort invented to store it under.
+        assert!(plan.caches.is_empty());
+        assert_eq!(
+            plan.skipped,
+            vec![PruneSkip {
+                name: "/home/tester/projects/hort".to_string(),
+                reason: SkipReason::LiveProject,
+            }]
+        );
+    }
+
+    #[test]
+    fn prune_skips_a_cache_whose_project_cannot_be_read() {
+        let caches = vec![CacheInput {
+            key: "%2Fhome%2Ftester%2Fprojects%2Fhort".to_string(),
+            risk: CacheRisk::Unknown,
+        }];
+
+        let plan = prune_selection(&[], &[], &caches, None, false);
+
+        // Printing the worktree word here would send the user looking for
+        // uncommitted changes in a directory that holds none by construction,
+        // which is the wrong place to look right before deciding to force.
+        assert!(plan.caches.is_empty());
+        assert_eq!(
+            plan.skipped,
+            vec![PruneSkip {
+                name: "/home/tester/projects/hort".to_string(),
+                reason: SkipReason::UnknownProject,
+            }]
+        );
+    }
+
+    #[test]
+    fn prune_force_includes_a_cache_of_a_live_project() {
+        let caches = vec![CacheInput {
+            key: "%2Fhome%2Ftester%2Fprojects%2Fhort".to_string(),
+            risk: CacheRisk::ProjectLives,
+        }];
+
+        let plan = prune_selection(&[], &[], &caches, None, true);
+
+        assert_eq!(plan.caches, vec!["%2Fhome%2Ftester%2Fprojects%2Fhort".to_string()]);
+        assert!(plan.skipped.is_empty());
     }
 }

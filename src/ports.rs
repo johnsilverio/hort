@@ -140,6 +140,20 @@ pub trait WorktreeProvider {
 pub trait CacheProvider {
     /// Create every cache directory in `sources` that is not already there.
     fn ensure(&self, sources: &[PathBuf]) -> Result<(), HortError>;
+    /// The stored key of every project that has a cache here. A store that was
+    /// never written to reads empty, since a user who has never declared a cache
+    /// still runs `prune`.
+    fn list(&self) -> Result<Vec<String>, HortError>;
+    /// Whether the project a stored cache was keyed by is still on disk.
+    ///
+    /// It answers with a `Result` rather than a plain `bool` because the caller
+    /// gates a deletion on it: "not there" and "could not tell" have to stay
+    /// distinguishable, and one value carrying both leaves the gate to resolve
+    /// the ambiguity toward removal.
+    fn project_exists(&self, project: &Path) -> Result<bool, HortError>;
+    /// Remove one project's whole cache directory. Idempotent: a key that is not
+    /// there is already in the state asked for.
+    fn remove(&self, key: &str) -> Result<(), HortError>;
 }
 
 /// Serializes the build of a single sandbox name so two concurrent `up`

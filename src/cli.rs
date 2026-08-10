@@ -172,7 +172,7 @@ impl RealDeps {
             clock: SystemClock,
             confirmer: StdinConfirmer,
             env: HostEnvironmentProbe,
-            cache: FileCacheProvider,
+            cache: FileCacheProvider::new(state_root.clone()),
             config: ConfigResolver::new(resolve_config_root()?, adapters_dir, host_home.clone()),
             state_root,
             project_dir,
@@ -317,6 +317,7 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<u8, HortError> {
                 &deps.confirmer,
                 &deps.runtime,
                 &deps.network,
+                &deps.cache,
                 deps.state_root.clone(),
             );
             let report = command.run(idle, force, std::io::stdin().is_terminal())?;
@@ -361,16 +362,19 @@ pub fn render_ls(entries: &[LsEntry]) -> String {
     entries.iter().map(|entry| format!("{}\n", render_line(entry))).collect()
 }
 
-/// Render the `prune` report for the terminal: the names it removed and the names
-/// it skipped with the reason for each. Layout is free; only the presence of the
+/// Render the `prune` report for the terminal: the sandboxes it removed, the
+/// caches it collected named by the project each belonged to, and the names it
+/// skipped with the reason for each. Layout is free; only the presence of the
 /// names and reasons is a contract.
 pub fn render_prune(report: &PruneReport) -> String {
     let removed = report.removed.iter().map(|name| format!("removed {name}\n"));
+    let caches =
+        report.removed_caches.iter().map(|project| format!("removed cache of {project}\n"));
     let skipped = report
         .skipped
         .iter()
         .map(|skip| format!("skipped {} ({})\n", skip.name, skip_reason_label(&skip.reason)));
-    removed.chain(skipped).collect()
+    removed.chain(caches).chain(skipped).collect()
 }
 
 /// Render the advisories a build produced for the terminal: what resolving the
@@ -414,10 +418,16 @@ fn render_line(entry: &LsEntry) -> String {
     )
 }
 
+/// Each reason in the words that send the reader to the right place. A cache skip
+/// that read like a worktree skip would have them hunting for uncommitted changes
+/// in a directory that holds none, which is why the two questions never share a
+/// label.
 fn skip_reason_label(reason: &SkipReason) -> &'static str {
     match reason {
         SkipReason::Dirty => "dirty",
         SkipReason::Unknown => "unknown",
+        SkipReason::LiveProject => "project on disk",
+        SkipReason::UnknownProject => "project unreadable",
     }
 }
 
@@ -532,6 +542,7 @@ mod tests {
     fn render_prune_lists_removed_and_skipped() {
         let report = PruneReport {
             removed: vec!["demo".to_string()],
+            removed_caches: Vec::new(),
             skipped: vec![PruneSkip { name: "rotten".to_string(), reason: SkipReason::Dirty }],
         };
 
@@ -546,6 +557,7 @@ mod tests {
     fn render_prune_reports_an_unknown_worktree_state_as_its_own_reason() {
         let report = PruneReport {
             removed: Vec::new(),
+            removed_caches: Vec::new(),
             skipped: vec![PruneSkip { name: "demo".to_string(), reason: SkipReason::Unknown }],
         };
 
@@ -555,6 +567,44 @@ mod tests {
         // --force, and "dirty" would send them looking for uncommitted changes
         // in a worktree whose repository is gone.
         assert!(rendered.contains("unknown"));
+    }
+
+    #[test]
+    fn render_prune_names_the_cache_it_removed() {
+        let report = PruneReport {
+            removed: Vec::new(),
+            removed_caches: vec!["/home/tester/projects/gone".to_string()],
+            skipped: Vec::new(),
+        };
+
+        let rendered = render_prune(&report);
+
+        // A collected cache that nothing prints is a directory the user watches
+        // disappear with no line of output saying it did.
+        assert!(rendered.contains("/home/tester/projects/gone"));
+    }
+
+    #[test]
+    fn render_prune_tells_an_unreadable_project_from_an_unreadable_worktree() {
+        let worktree = PruneReport {
+            removed: Vec::new(),
+            removed_caches: Vec::new(),
+            skipped: vec![PruneSkip { name: "demo".to_string(), reason: SkipReason::Unknown }],
+        };
+        let project = PruneReport {
+            removed: Vec::new(),
+            removed_caches: Vec::new(),
+            skipped: vec![PruneSkip {
+                name: "demo".to_string(),
+                reason: SkipReason::UnknownProject,
+            }],
+        };
+
+        // The two reasons exist as separate values for exactly one purpose: one
+        // sends the reader to look at a worktree and the other at a project
+        // folder. Rendered with the same word they are one value again, and the
+        // reader goes to the wrong place.
+        assert_ne!(render_prune(&worktree), render_prune(&project));
     }
 
     #[test]

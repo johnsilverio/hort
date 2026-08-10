@@ -1,37 +1,47 @@
 //! `prune`: explicit, confirmed cleanup of idle sandboxes and abrupt-death
-//! debris (orphaned and inconsistent sandboxes, plus corrupt metadata dirs).
+//! debris (orphaned and inconsistent sandboxes, corrupt metadata dirs, and the
+//! caches of projects that are gone).
 //!
 //! It reconciles the records against the live anchors and the worktrees still on
-//! disk, gathers the corrupt dirs, observes idle and worktree risk, and runs the
-//! pure selection. Every question about a worktree is asked at that candidate's
-//! own path on disk, because `prune` is global and the repository the user
-//! happens to be standing in knows nothing about the other projects' sandboxes.
-//! An empty removal set never prompts; otherwise, without `--force`, a non-TTY
-//! stdin refuses and a TTY prompts with every candidate name listed first. Each
-//! chosen removal follows the mandatory teardown order, and a single
-//! stale-registration sweep runs at the end of every non-refused, non-declined
-//! run.
+//! disk, gathers the corrupt dirs and the stored caches, observes idle, worktree
+//! risk and project presence, and runs the pure selection. Every question about a
+//! worktree is asked at that candidate's own path on disk, because `prune` is
+//! global and the repository the user happens to be standing in knows nothing
+//! about the other projects' sandboxes; the same holds for a cache, asked at the
+//! project path its key decodes to. An empty removal set never prompts;
+//! otherwise, without `--force`, a non-TTY stdin refuses and a TTY prompts with
+//! every candidate name listed first. Each chosen removal follows the mandatory
+//! teardown order, the caches coming last of all, and a single stale-registration
+//! sweep runs at the end of every non-refused, non-declined run.
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use crate::commands::present_worktrees;
+use crate::domain::cache::project_from_cache_key;
 use crate::domain::error::HortError;
 use crate::domain::idle::{IdleState, idle, parse_timestamp};
 use crate::domain::model::{SandboxName, SandboxRecord};
 use crate::domain::prune::{
-    CorruptInput, PruneInput, PrunePlan, PruneSkip, WorktreeRisk, prune_selection,
+    CacheInput, CacheRisk, CorruptInput, PruneInput, PrunePlan, PruneSkip, WorktreeRisk,
+    prune_selection,
 };
 use crate::domain::reconcile::reconcile_all;
 use crate::domain::teardown::{TeardownStep, teardown_plan};
 use crate::ports::{
-    Clock, Confirmer, ContainerRegistry, ContainerRuntime, MetadataStore, NetworkProvider,
-    SessionProbe, WorktreeProvider,
+    CacheProvider, Clock, Confirmer, ContainerRegistry, ContainerRuntime, MetadataStore,
+    NetworkProvider, SessionProbe, WorktreeProvider,
 };
 
 /// What a `prune` run removed and what it skipped, with the reason for each skip.
+///
+/// Collected caches are a list of their own, and they name the project each one
+/// belonged to rather than the key it is stored under: a project path and a
+/// sandbox name in one list cannot be told apart by whoever reads the output, and
+/// the key is an internal address while the project is what the user recognizes.
 pub struct PruneReport {
     pub removed: Vec<String>,
+    pub removed_caches: Vec<String>,
     pub skipped: Vec<PruneSkip>,
 }
 
@@ -47,6 +57,7 @@ pub struct PruneCommand<'a> {
     confirmer: &'a dyn Confirmer,
     runtime: &'a dyn ContainerRuntime,
     network: &'a dyn NetworkProvider,
+    caches: &'a dyn CacheProvider,
     state_root: PathBuf,
 }
 
@@ -61,6 +72,7 @@ impl<'a> PruneCommand<'a> {
         confirmer: &'a dyn Confirmer,
         runtime: &'a dyn ContainerRuntime,
         network: &'a dyn NetworkProvider,
+        caches: &'a dyn CacheProvider,
         state_root: PathBuf,
     ) -> Self {
         Self {
@@ -72,6 +84,7 @@ impl<'a> PruneCommand<'a> {
             confirmer,
             runtime,
             network,
+            caches,
             state_root,
         }
     }
@@ -109,11 +122,20 @@ impl PruneCommand<'_> {
             })
             .collect();
 
-        let plan = prune_selection(&inputs, &corrupt_inputs, idle_threshold, force);
+        let cache_inputs = self.cache_inputs()?;
 
-        if plan.sandboxes.is_empty() && plan.corrupt.is_empty() {
+        let plan = prune_selection(&inputs, &corrupt_inputs, &cache_inputs, idle_threshold, force);
+
+        // A cache counts as work. Left out of this question, a run whose only
+        // candidate is an orphaned cache leaves without asking and without
+        // removing, reporting that it found nothing.
+        if plan.sandboxes.is_empty() && plan.corrupt.is_empty() && plan.caches.is_empty() {
             self.worktrees.prune_stale()?;
-            return Ok(PruneReport { removed: Vec::new(), skipped: plan.skipped });
+            return Ok(PruneReport {
+                removed: Vec::new(),
+                removed_caches: Vec::new(),
+                skipped: plan.skipped,
+            });
         }
 
         if !force {
@@ -121,7 +143,11 @@ impl PruneCommand<'_> {
                 return Err(HortError::RefusedWithoutConfirmation { command: "prune".to_string() });
             }
             if !self.confirmer.confirm(&confirmation_message(&plan))? {
-                return Ok(PruneReport { removed: Vec::new(), skipped: Vec::new() });
+                return Ok(PruneReport {
+                    removed: Vec::new(),
+                    removed_caches: Vec::new(),
+                    skipped: Vec::new(),
+                });
             }
         }
 
@@ -153,8 +179,51 @@ impl PruneCommand<'_> {
             removed.push(name.clone());
         }
 
+        // Last, after every sandbox is down. A cache is a writable bind source,
+        // so collecting one while a container still holds it pulls the ground out
+        // from under a live mount; and a removal that fails here must not have
+        // left the metadata behind, or the sandbox comes back as a candidate for
+        // every run after this one.
+        let mut removed_caches = Vec::new();
+        for key in &plan.caches {
+            self.caches.remove(key)?;
+            removed_caches.push(decoded_project(key));
+        }
+
         self.worktrees.prune_stale()?;
-        Ok(PruneReport { removed, skipped: plan.skipped })
+        Ok(PruneReport { removed, removed_caches, skipped: plan.skipped })
+    }
+
+    /// Every stored cache with the presence of the project that filled it. The
+    /// listing is the port's; the question is asked once per key, of the disk.
+    fn cache_inputs(&self) -> Result<Vec<CacheInput>, HortError> {
+        Ok(self
+            .caches
+            .list()?
+            .into_iter()
+            .map(|key| {
+                let risk = self.cache_risk(&key);
+                CacheInput { key, risk }
+            })
+            .collect())
+    }
+
+    /// Whether a stored cache's project is still on disk, in the shape the guard
+    /// reads. A key that decodes to anything but an absolute path was not written
+    /// by hort, which addresses every cache by its project's absolute path, and
+    /// removing a directory somebody else put there is the expensive way to be
+    /// wrong. A presence read that failed says nothing about the project either,
+    /// so both stay unknown, and unknown protects.
+    fn cache_risk(&self, key: &str) -> CacheRisk {
+        let project = project_from_cache_key(key);
+        if !project.is_absolute() {
+            return CacheRisk::Unknown;
+        }
+        match self.caches.project_exists(&project) {
+            Ok(true) => CacheRisk::ProjectLives,
+            Ok(false) => CacheRisk::NothingAtRisk,
+            Err(_) => CacheRisk::Unknown,
+        }
     }
 
     /// The idle state of a record, derived exactly as `ls` does it: a session
@@ -216,13 +285,22 @@ impl PruneCommand<'_> {
     }
 }
 
-/// A confirmation message naming every candidate, sandbox and corrupt dir alike,
-/// so the user sees what would be removed. The wording is not a product
-/// guarantee; only that the names are present.
+/// A confirmation message naming every candidate: sandboxes, corrupt dirs, and
+/// the caches by the project each one belongs to. The wording is not a product
+/// guarantee; only that the names are present. A prompt that named less than the
+/// run removes is a yes the user never gave for the rest.
 fn confirmation_message(plan: &PrunePlan) -> String {
-    let mut names: Vec<&str> = plan.sandboxes.iter().map(SandboxName::as_str).collect();
-    names.extend(plan.corrupt.iter().map(String::as_str));
-    format!("prune {}? this removes the worktree and metadata", names.join(", "))
+    let mut names: Vec<String> =
+        plan.sandboxes.iter().map(|name| name.as_str().to_string()).collect();
+    names.extend(plan.corrupt.iter().cloned());
+    names.extend(plan.caches.iter().map(|key| decoded_project(key)));
+    format!("prune {}? this removes their worktrees, metadata and caches", names.join(", "))
+}
+
+/// The project a stored cache belongs to, which is what every line a person reads
+/// names. The key is only ever an address to remove by.
+fn decoded_project(key: &str) -> String {
+    project_from_cache_key(key).display().to_string()
 }
 
 #[cfg(test)]
@@ -230,7 +308,7 @@ mod tests {
     use super::*;
 
     use std::cell::RefCell;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::time::Duration;
 
@@ -239,7 +317,7 @@ mod tests {
     };
     use crate::domain::prune::SkipReason;
     use crate::fakes::{
-        FakeConfirmer, FakeNetwork, FakeRegistry, FakeRuntime, FakeSessionProbe,
+        FakeCacheProvider, FakeConfirmer, FakeNetwork, FakeRegistry, FakeRuntime, FakeSessionProbe,
         FakeWorktreeProvider, InMemoryMetadataStore, ScriptedClock, sample_record,
     };
 
@@ -261,6 +339,7 @@ mod tests {
         confirmer: &'a FakeConfirmer,
         runtime: &'a FakeRuntime,
         network: &'a FakeNetwork,
+        caches: &'a FakeCacheProvider,
     ) -> PruneCommand<'a> {
         PruneCommand {
             store,
@@ -271,6 +350,7 @@ mod tests {
             confirmer,
             runtime,
             network,
+            caches,
             state_root: state_root(),
         }
     }
@@ -287,8 +367,10 @@ mod tests {
         let confirmer = FakeConfirmer::yes();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
         );
 
         let report = command.run(None, true, false).unwrap();
@@ -315,8 +397,10 @@ mod tests {
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token()).with_trace(trace.clone());
         let network = FakeNetwork::new().with_trace(trace.clone());
+        let caches = FakeCacheProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
         );
 
         command.run(None, true, false).unwrap();
@@ -345,8 +429,10 @@ mod tests {
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token()).with_trace(trace.clone());
         let network = FakeNetwork::new().with_trace(trace.clone());
+        let caches = FakeCacheProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
         );
 
         command.run(None, true, false).unwrap();
@@ -370,8 +456,10 @@ mod tests {
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
         );
 
         let report = command.run(None, true, false).unwrap();
@@ -392,8 +480,10 @@ mod tests {
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
         );
 
         let report = command.run(None, false, false).unwrap();
@@ -417,8 +507,10 @@ mod tests {
         let confirmer = FakeConfirmer::yes();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
         );
 
         command.run(None, false, true).unwrap();
@@ -441,8 +533,10 @@ mod tests {
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
         );
 
         let result = command.run(None, false, false);
@@ -466,8 +560,10 @@ mod tests {
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
         );
 
         command.run(None, true, false).unwrap();
@@ -490,8 +586,10 @@ mod tests {
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token()).with_trace(trace.clone());
         let network = FakeNetwork::new().with_trace(trace.clone());
+        let caches = FakeCacheProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
         );
 
         let report = command.run(None, false, true).unwrap();
@@ -512,8 +610,10 @@ mod tests {
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
         );
 
         let report = command.run(None, false, false).unwrap();
@@ -536,8 +636,10 @@ mod tests {
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
         );
 
         let report = command.run(None, false, false).unwrap();
@@ -562,8 +664,10 @@ mod tests {
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
         );
 
         let report = command.run(None, false, false).unwrap();
@@ -590,8 +694,10 @@ mod tests {
         let confirmer = FakeConfirmer::yes();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
         );
 
         let report = command.run(None, false, true).unwrap();
@@ -618,8 +724,10 @@ mod tests {
         let confirmer = FakeConfirmer::yes();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
         );
 
         let report = command.run(None, false, true).unwrap();
@@ -642,8 +750,10 @@ mod tests {
         let confirmer = FakeConfirmer::yes();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
         );
 
         command.run(None, false, true).unwrap();
@@ -678,8 +788,10 @@ mod tests {
         let confirmer = FakeConfirmer::yes();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
         );
 
         command.run(None, false, true).unwrap();
@@ -699,8 +811,10 @@ mod tests {
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
         );
 
         command.run(None, false, false).unwrap();
@@ -731,12 +845,237 @@ mod tests {
         let confirmer = FakeConfirmer::no();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
         );
 
         command.run(Some(Duration::from_secs(1800)), true, false).unwrap();
 
         assert_eq!(store.get(&name).unwrap(), None);
+    }
+
+    /// The stored address of a project that is no longer on disk, and the project
+    /// it decodes back to.
+    const GONE_CACHE_KEY: &str = "%2Fhome%2Ftester%2Fprojects%2Fgone";
+    const GONE_PROJECT: &str = "/home/tester/projects/gone";
+
+    /// The stored address of a project the user still works on, and that project.
+    const LIVE_CACHE_KEY: &str = "%2Fhome%2Ftester%2Fprojects%2Fhort";
+    const LIVE_PROJECT: &str = "/home/tester/projects/hort";
+
+    #[test]
+    fn prune_removes_the_cache_directory_of_a_gone_project() {
+        let store = InMemoryMetadataStore::new();
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new().with_stored_key(GONE_CACHE_KEY);
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
+        );
+
+        command.run(None, true, false).unwrap();
+
+        // Nothing else on the machine ever collects these, so a run whose only
+        // work is a cache has to do it: the directory hort left behind belongs
+        // to a project that will never fill it again.
+        assert_eq!(caches.removed(), vec![GONE_CACHE_KEY.to_string()]);
+    }
+
+    #[test]
+    fn prune_reports_the_cache_it_removed() {
+        let store = InMemoryMetadataStore::new();
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new().with_stored_key(GONE_CACHE_KEY);
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
+        );
+
+        let report = command.run(None, true, false).unwrap();
+
+        // The key is an address hort invented; the project is the thing the
+        // person reading this line recognizes as theirs.
+        assert_eq!(report.removed_caches, vec![GONE_PROJECT.to_string()]);
+    }
+
+    #[test]
+    fn prune_prompts_before_removing_a_cache_alone() {
+        let store = InMemoryMetadataStore::new();
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::no();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new().with_stored_key(GONE_CACHE_KEY);
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
+        );
+
+        command.run(None, false, true).unwrap();
+
+        // A run with no sandbox and no corrupt dir still has work to do, and one
+        // that leaves early takes the confirmation with it: the user is told
+        // nothing was found while a directory sat there waiting to be collected.
+        assert_eq!(confirmer.prompts().len(), 1);
+    }
+
+    #[test]
+    fn prune_names_the_cache_it_would_remove_in_the_confirmation_prompt() {
+        let store = InMemoryMetadataStore::new();
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::no();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new().with_stored_key(GONE_CACHE_KEY);
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
+        );
+
+        command.run(None, false, true).unwrap();
+
+        // Listing what would go is what the confirmation is for. A prompt that
+        // asks about nothing in particular is a yes the user never really gave.
+        assert!(confirmer.prompts().concat().contains("gone"));
+    }
+
+    #[test]
+    fn prune_spares_the_cache_of_a_project_that_is_still_there() {
+        let store = InMemoryMetadataStore::new();
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new()
+            .with_stored_key(LIVE_CACHE_KEY)
+            .with_live_project(Path::new(LIVE_PROJECT));
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
+        );
+
+        let report = command.run(None, false, true).unwrap();
+
+        // This is the arm that costs the user four minutes of installing every
+        // time it is wrong, and it is wrong for every project on the machine at
+        // once if the presence read is read backwards.
+        assert!(caches.removed().is_empty());
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].reason, SkipReason::LiveProject);
+    }
+
+    #[test]
+    fn prune_skips_a_cache_directory_it_did_not_write() {
+        let store = InMemoryMetadataStore::new();
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        // hort addresses a cache by the encoded absolute path of its project, so
+        // a name that decodes to anything else is a directory somebody else put
+        // under hort's state, and removing what you did not write is the
+        // expensive way to be wrong.
+        let caches = FakeCacheProvider::new().with_stored_key("scratch");
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
+        );
+
+        let report = command.run(None, false, true).unwrap();
+
+        assert!(caches.removed().is_empty());
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].reason, SkipReason::UnknownProject);
+    }
+
+    #[test]
+    fn prune_spares_a_cache_it_could_not_ask_the_disk_about() {
+        let store = InMemoryMetadataStore::new();
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new()
+            .with_stored_key(LIVE_CACHE_KEY)
+            .with_failing_project_probe(Path::new(LIVE_PROJECT));
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
+        );
+
+        let report = command.run(None, false, true).unwrap();
+
+        // A read that failed says nothing about whether the project is there, and
+        // the cheap way to be wrong here is to let the failure fall through to
+        // the removable answer, which collects the cache of every project on a
+        // machine where the read happens to be failing.
+        assert!(caches.removed().is_empty());
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].reason, SkipReason::UnknownProject);
+    }
+
+    #[test]
+    fn prune_removes_a_cache_only_after_the_sandbox_teardowns() {
+        let name = SandboxName::new("demo").unwrap();
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let store = InMemoryMetadataStore::new().with_trace(trace.clone());
+        store.put(&sample_record("demo")).unwrap();
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees =
+            FakeWorktreeProvider::new().with_listed_worktree(&name).with_trace(trace.clone());
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token()).with_trace(trace.clone());
+        let network = FakeNetwork::new().with_trace(trace.clone());
+        let caches =
+            FakeCacheProvider::new().with_stored_key(GONE_CACHE_KEY).with_trace(trace.clone());
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches,
+        );
+
+        command.run(None, true, false).unwrap();
+
+        // A cache is a writable bind source, so a run that collects it before the
+        // container holding it is gone pulls the ground out from under a live
+        // mount, which is the one thing the teardown order exists to forbid.
+        let expected = vec![
+            "network.teardown".to_string(),
+            "runtime.teardown".to_string(),
+            "worktrees.remove".to_string(),
+            "store.remove".to_string(),
+            "cache.remove".to_string(),
+        ];
+        assert_eq!(*trace.borrow(), expected);
     }
 }

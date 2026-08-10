@@ -650,10 +650,18 @@ impl ContainerRegistry for FakeRegistry {
     }
 }
 
-/// Remembers the cache directories it was asked to create, creating nothing.
+/// Remembers the cache directories it was asked to create, creating nothing, and
+/// answers about a scripted set of stored keys and living projects. A project it
+/// was told nothing about is gone, which is the state a cache has to be in before
+/// anything removes it.
 #[derive(Default)]
 pub struct FakeCacheProvider {
     ensured: RefCell<Vec<PathBuf>>,
+    stored_keys: Vec<String>,
+    live_projects: Vec<PathBuf>,
+    failing_projects: Vec<PathBuf>,
+    removed: RefCell<Vec<String>>,
+    trace: Option<TeardownTrace>,
 }
 
 impl FakeCacheProvider {
@@ -661,15 +669,66 @@ impl FakeCacheProvider {
         Self::default()
     }
 
+    /// Record the `cache.remove` step on the shared teardown trace.
+    pub fn with_trace(mut self, trace: TeardownTrace) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+
+    /// Script a stored cache of this key, which `list` reports.
+    pub fn with_stored_key(mut self, key: &str) -> Self {
+        self.stored_keys.push(key.to_string());
+        self
+    }
+
+    /// Script this project as still on disk: `project_exists` answers `Ok(true)`.
+    pub fn with_live_project(mut self, project: &Path) -> Self {
+        self.live_projects.push(project.to_path_buf());
+        self
+    }
+
+    /// Script this project's presence read as failing: `project_exists` answers
+    /// `Err`, standing in for a path hort could not ask the disk about.
+    pub fn with_failing_project_probe(mut self, project: &Path) -> Self {
+        self.failing_projects.push(project.to_path_buf());
+        self
+    }
+
     /// Every directory it was asked to create, in order.
     pub fn ensured(&self) -> Vec<PathBuf> {
         self.ensured.borrow().clone()
+    }
+
+    /// Every key it was asked to remove, in order.
+    pub fn removed(&self) -> Vec<String> {
+        self.removed.borrow().clone()
     }
 }
 
 impl CacheProvider for FakeCacheProvider {
     fn ensure(&self, sources: &[PathBuf]) -> Result<(), HortError> {
         self.ensured.borrow_mut().extend(sources.iter().cloned());
+        Ok(())
+    }
+
+    fn list(&self) -> Result<Vec<String>, HortError> {
+        Ok(self.stored_keys.clone())
+    }
+
+    fn project_exists(&self, project: &Path) -> Result<bool, HortError> {
+        if self.failing_projects.iter().any(|failing| failing == project) {
+            return Err(HortError::StateIo {
+                detail: format!("could not read {}", project.display()),
+            });
+        }
+        Ok(self.live_projects.iter().any(|live| live == project))
+    }
+
+    fn remove(&self, key: &str) -> Result<(), HortError> {
+        if let Some(trace) = &self.trace {
+            trace.borrow_mut().push("cache.remove".to_string());
+        }
+        self.removed.borrow_mut().push(key.to_string());
         Ok(())
     }
 }
