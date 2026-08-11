@@ -1,14 +1,15 @@
 //! `up <name>`: build a sandbox, or resume a half-built one of the same name.
 //!
 //! Refuses a directory no marker declares a project, checks the host and rootfs
-//! preconditions before it takes anything, acquires the per-name build lock,
-//! decides admission against the recorded and live state, creates or reuses the
-//! worktree (or mounts the project folder itself where there is no git),
-//! persists the metadata record before the container starts, then records the
-//! anchor's liveness token and provisions networking. A failure once the anchor
-//! is standing undoes the build, stopping the host-side helpers and then the
-//! container while leaving the worktree and the record for the next run. Always
-//! detached.
+//! preconditions, and refuses a cache aimed at a path the read-only mount
+//! covering it does not have, all before it takes anything. Then it acquires
+//! the per-name build lock, decides admission against the recorded and live
+//! state, creates or reuses the worktree (or mounts the project folder itself
+//! where there is no git), and persists the metadata record before the
+//! container starts, then records the anchor's liveness token and provisions
+//! networking. A failure once the anchor is standing undoes the build, stopping
+//! the host-side helpers and then the container while leaving the worktree and
+//! the record for the next run. Always detached.
 
 use std::path::{Path, PathBuf};
 
@@ -17,7 +18,10 @@ use crate::domain::config::ResolvedConfig;
 use crate::domain::egress::{EgressPolicy, egress_degradation_warning};
 use crate::domain::error::HortError;
 use crate::domain::model::{BranchName, SandboxName, SandboxRecord, Warning};
-use crate::domain::mounts::{cache_mount_plan, declared_read_only_sources, read_only_mount_plan};
+use crate::domain::mounts::{
+    cache_landing_error, cache_landings, cache_mount_plan, declared_read_only_sources,
+    read_only_mount_plan,
+};
 use crate::domain::policy::{BranchIntent, up_error};
 use crate::domain::preconditions::up_precondition_error;
 use crate::domain::reconcile::SandboxState;
@@ -148,6 +152,18 @@ impl UpCommand<'_> {
             self.config,
             &self.state_root.join("cache").join(project_cache_key(project_dir)),
         );
+        // Asked here, above the lock and everything it guards, because the answer
+        // is about what the configuration says and nothing built yet is part of
+        // it: a refusal that arrived after the worktree would leave a directory
+        // git has registered, no record names, and no sweep collects.
+        let landings = cache_landings(&mounts, &caches);
+        let landing_paths: Vec<PathBuf> =
+            landings.iter().map(|landing| landing.host_path.clone()).collect();
+        if let Some(error) =
+            cache_landing_error(&landings, &self.env.inspect_mount_sources(&landing_paths))
+        {
+            return Err(error);
+        }
 
         if !self.lock.try_acquire(&name)? {
             return Err(HortError::UpInProgress { name: name.as_str().to_string() });
@@ -1090,6 +1106,130 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn up_rejects_a_cache_that_cannot_land_before_starting_the_container() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        // The host has the configuration directory the user carries in, and does
+        // not have the one directory inside it the cache is aimed at.
+        let env = FakeCapabilities::new(ready_host())
+            .with_missing_mount_source("/home/tester/.config/fish");
+        let config = ResolvedConfig {
+            mounts: Mounts { read_only: vec!["/home/tester/.config".to_string()] },
+            cache: Cache {
+                dirs: vec![CacheDir::Named {
+                    name: "fish".to_string(),
+                    target: "~/.config/fish".to_string(),
+                }],
+            },
+            ..healthy_config()
+        };
+        let cache = FakeCacheProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
+        );
+
+        let result = command.run(SandboxName::new("demo").unwrap(), None);
+
+        // Two declarations that cannot both hold. Let through, they kill the
+        // build with a message about the rootfs, which is the one part of the
+        // arrangement nobody declared, so the person reading it goes and rebuilds
+        // a rootfs that was fine. Refusing up front names both declarations and
+        // the two ways out, and it costs nothing because nothing was built yet.
+        assert_eq!(
+            result,
+            Err(HortError::CacheTargetMissing {
+                name: "fish".to_string(),
+                target: "/home/hort/.config/fish".to_string(),
+                source: "/home/tester/.config".to_string(),
+            })
+        );
+        assert!(runtime.started_env().is_empty());
+    }
+
+    #[test]
+    fn up_creates_no_worktree_when_it_refuses_a_cache() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host())
+            .with_missing_mount_source("/home/tester/.config/fish");
+        let config = ResolvedConfig {
+            mounts: Mounts { read_only: vec!["/home/tester/.config".to_string()] },
+            cache: Cache {
+                dirs: vec![CacheDir::Named {
+                    name: "fish".to_string(),
+                    target: "~/.config/fish".to_string(),
+                }],
+            },
+            ..healthy_config()
+        };
+        let cache = FakeCacheProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
+        );
+
+        let _ = command.run(SandboxName::new("demo").unwrap(), None);
+
+        // A refusal over what the configuration says has to happen before hort
+        // takes anything, and the worktree is the sharpest thing it takes: git
+        // registers it, the record that would make it findable is written later,
+        // and a directory that exists is one `git worktree prune` keeps. So a
+        // check placed a few lines lower leaves a worktree nothing lists and
+        // nothing collects.
+        assert!(worktrees.creates().is_empty());
+    }
+
+    #[test]
+    fn up_builds_when_the_read_only_mount_covering_a_cache_is_not_on_the_host() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host()).with_missing_mount_sources();
+        let config = ResolvedConfig {
+            mounts: Mounts { read_only: vec!["/home/tester/.config".to_string()] },
+            cache: Cache {
+                dirs: vec![CacheDir::Named {
+                    name: "fish".to_string(),
+                    target: "~/.config/fish".to_string(),
+                }],
+            },
+            ..healthy_config()
+        };
+        let cache = FakeCacheProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
+        );
+
+        let result = command.run(SandboxName::new("demo").unwrap(), None);
+
+        // A dotfile directory the user stopped keeping is dropped with a warning
+        // and the box boots without it, so nothing read-only covers that target
+        // any more and the cache lands where every other cache does. Deciding
+        // this from what the user declared rather than from what hort is going to
+        // mount would refuse a build that has nothing wrong with it.
+        assert!(result.is_ok());
     }
 
     #[test]

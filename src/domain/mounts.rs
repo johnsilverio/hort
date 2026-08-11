@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::domain::config::{CacheDir, ResolvedConfig};
+use crate::domain::error::HortError;
 use crate::domain::model::Warning;
 use crate::ports::{MountAccess, SandboxMount};
 
@@ -79,6 +80,87 @@ pub fn cache_mount_plan(config: &ResolvedConfig, cache_root: &Path) -> Vec<Sandb
             SandboxMount { source: cache_root.join(name), target, access: MountAccess::ReadWrite }
         })
         .collect()
+}
+
+/// A planned cache whose target lands inside a planned read-only mount, and the
+/// host path its mountpoint would have to be created at. It carries what the
+/// refusal names alongside the path the host is asked about, so the two cannot
+/// be paired wrong later.
+pub struct CacheLanding {
+    pub name: String,
+    pub target: PathBuf,
+    pub source: PathBuf,
+    pub host_path: PathBuf,
+}
+
+/// Where each planned cache lands inside a planned read-only mount. Reads the
+/// two plans and never the configuration, so a read-only mount the host does
+/// not have, and which therefore never made it into the plan, cannot make a
+/// cache illegal.
+pub fn cache_landings(read_only: &[SandboxMount], caches: &[SandboxMount]) -> Vec<CacheLanding> {
+    caches
+        .iter()
+        .filter_map(|cache| {
+            let (covering, suffix) = covering_mount(read_only, &cache.target)?;
+            Some(CacheLanding {
+                name: entry_name(&cache.source),
+                target: cache.target.clone(),
+                source: covering.source.clone(),
+                host_path: landing_path(&covering.source, suffix),
+            })
+        })
+        .collect()
+}
+
+/// The refusal a cache earns when the host does not have the path its
+/// mountpoint would be created at, given what the host said about the landings.
+pub fn cache_landing_error(
+    landings: &[CacheLanding],
+    sources: &[MountSourceFacts],
+) -> Option<HortError> {
+    let missing = landings.iter().find(|landing| !host_has(sources, &landing.host_path))?;
+    Some(HortError::CacheTargetMissing {
+        name: missing.name.clone(),
+        target: missing.target.display().to_string(),
+        source: missing.source.display().to_string(),
+    })
+}
+
+/// The read-only mount a cache aimed at `target` lands inside, and how deep it
+/// lands, or nothing when no read-only mount covers it. Of several that cover
+/// one target the last is the answer: the mounts are applied in order, so the
+/// later one is what the box shows at that path and therefore the tree the
+/// mountpoint would have to be created in.
+fn covering_mount<'a>(
+    read_only: &'a [SandboxMount],
+    target: &'a Path,
+) -> Option<(&'a SandboxMount, &'a Path)> {
+    read_only.iter().rev().find_map(|mount| Some((mount, target.strip_prefix(&mount.target).ok()?)))
+}
+
+/// Where a cache landing sits on the host: the source of the mount covering it,
+/// walked down by how deep the cache lands inside that mount.
+fn landing_path(source: &Path, depth: &Path) -> PathBuf {
+    // Joining a cache that covers the whole mount, and so lands no deeper than
+    // it, leaves a trailing separator, and a path spelled that way is one the
+    // host reports absent unless it is a directory.
+    match depth.as_os_str().is_empty() {
+        true => source.to_path_buf(),
+        false => source.join(depth),
+    }
+}
+
+/// Whether the host has a landing's path, read from the fact carrying that same
+/// path. A path nothing answered for counts as absent, so an answer hort cannot
+/// pair up refuses the build rather than letting it through to the kernel.
+fn host_has(sources: &[MountSourceFacts], path: &Path) -> bool {
+    sources.iter().find(|fact| fact.path == path).is_some_and(|fact| fact.exists)
+}
+
+/// What the user called a cache, read back from the directory hort keeps it in,
+/// which is the entry's own name under this project's cache root.
+fn entry_name(source: &Path) -> String {
+    source.file_name().unwrap_or_default().to_string_lossy().into_owned()
 }
 
 /// Where the box finds a host path. A path under the user's own home is a
@@ -172,6 +254,28 @@ mod tests {
             target: PathBuf::from(target),
             access: MountAccess::ReadWrite,
         }
+    }
+
+    /// The host paths these landings need, which is everything the check asks
+    /// the host about.
+    fn landing_paths(landings: &[CacheLanding]) -> Vec<PathBuf> {
+        landings.iter().map(|landing| landing.host_path.clone()).collect()
+    }
+
+    /// A host that has every path the landings need.
+    fn every_path_present(landings: &[CacheLanding]) -> Vec<MountSourceFacts> {
+        landings
+            .iter()
+            .map(|landing| MountSourceFacts { path: landing.host_path.clone(), exists: true })
+            .collect()
+    }
+
+    /// A host that has none of them.
+    fn every_path_absent(landings: &[CacheLanding]) -> Vec<MountSourceFacts> {
+        landings
+            .iter()
+            .map(|landing| MountSourceFacts { path: landing.host_path.clone(), exists: false })
+            .collect()
     }
 
     #[test]
@@ -300,6 +404,88 @@ mod tests {
                 "/var/cache/pip"
             )]
         );
+    }
+
+    #[test]
+    fn a_cache_inside_a_read_only_mount_is_checked_against_the_host_path_behind_it() {
+        let read_only = vec![read_only_mount("/home/tester/.config", "/home/hort/.config")];
+        let caches = vec![writable_mount(&format!("{CACHE_ROOT}/fish"), "/home/hort/.config/fish")];
+
+        let landings = cache_landings(&read_only, &caches);
+
+        // What the box shows at that target is the read-only source, so the
+        // directory the cache needs to be mounted over is the one behind it on
+        // the host. Asking about anything else asks about a path the mount
+        // never touches.
+        assert_eq!(landing_paths(&landings), vec![PathBuf::from("/home/tester/.config/fish")]);
+    }
+
+    #[test]
+    fn a_cache_outside_every_read_only_mount_asks_the_host_nothing() {
+        let read_only = vec![read_only_mount("/home/tester/.config", "/home/hort/.config")];
+        let caches =
+            vec![writable_mount(&format!("{CACHE_ROOT}/node_modules"), "/workdir/node_modules")];
+
+        let landings = cache_landings(&read_only, &caches);
+
+        // The common cache sits in the worktree, which is a writable bind of its
+        // own: nothing is read-only there, and a question asked about it could
+        // only ever refuse a configuration that works.
+        assert!(landing_paths(&landings).is_empty());
+    }
+
+    #[test]
+    fn a_cache_whose_path_is_missing_inside_the_read_only_mount_is_refused() {
+        let read_only = vec![read_only_mount("/home/tester/.config", "/home/hort/.config")];
+        let caches = vec![writable_mount(&format!("{CACHE_ROOT}/fish"), "/home/hort/.config/fish")];
+        let landings = cache_landings(&read_only, &caches);
+
+        let refusal = cache_landing_error(&landings, &every_path_absent(&landings));
+
+        // Mounting there means creating the mountpoint inside a tree the same
+        // user declared read-only, which cannot be done, and the container dies
+        // naming the rootfs, the one piece that has nothing to do with it.
+        // Dropping the cache instead would be invisible from inside the box: the
+        // dependency reinstalls every run and nothing anywhere says why.
+        assert_eq!(
+            refusal,
+            Some(HortError::CacheTargetMissing {
+                name: "fish".to_string(),
+                target: "/home/hort/.config/fish".to_string(),
+                source: "/home/tester/.config".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_cache_whose_path_exists_inside_the_read_only_mount_is_permitted() {
+        let read_only = vec![read_only_mount("/home/tester/.config", "/home/hort/.config")];
+        let caches = vec![writable_mount(&format!("{CACHE_ROOT}/fish"), "/home/hort/.config/fish")];
+        let landings = cache_landings(&read_only, &caches);
+
+        let refusal = cache_landing_error(&landings, &every_path_present(&landings));
+
+        // Measured, and it is what keeps this rule narrow: with the directory
+        // there the box boots and the cache is a writable island inside the
+        // read-only tree, because the mounts are applied in order and the cache
+        // wins at that path. A rule that refused every cache inside a read-only
+        // mount would refuse this.
+        assert_eq!(refusal, None);
+    }
+
+    #[test]
+    fn a_cache_that_shadows_a_read_only_mount_entirely_is_permitted() {
+        let read_only = vec![read_only_mount("/home/tester/.cache/pip", "/home/hort/.cache/pip")];
+        let caches = vec![writable_mount(&format!("{CACHE_ROOT}/pip"), "/home/hort/.cache/pip")];
+        let landings = cache_landings(&read_only, &caches);
+
+        let refusal = cache_landing_error(&landings, &every_path_present(&landings));
+
+        // Two declarations of the same address, where the writable one wins and
+        // covers the read-only one whole. There is no path to create inside
+        // anything: what the box needs is the read-only source itself, and hort
+        // is mounting it, so it is there.
+        assert_eq!(refusal, None);
     }
 
     #[test]

@@ -444,6 +444,7 @@ pub struct FakeCapabilities {
     capabilities: Capabilities,
     rootfs_present: bool,
     mount_sources_present: bool,
+    absent_mount_sources: Vec<PathBuf>,
     inspections: RefCell<Vec<(PathBuf, Option<String>)>>,
 }
 
@@ -453,6 +454,7 @@ impl FakeCapabilities {
             capabilities,
             rootfs_present: true,
             mount_sources_present: true,
+            absent_mount_sources: Vec::new(),
             inspections: RefCell::new(Vec::new()),
         }
     }
@@ -467,6 +469,13 @@ impl FakeCapabilities {
     /// Script every declared mount source as absent from the host.
     pub fn with_missing_mount_sources(mut self) -> Self {
         self.mount_sources_present = false;
+        self
+    }
+
+    /// Script one path as absent while the rest are there: the host that has a
+    /// directory but not something inside it.
+    pub fn with_missing_mount_source(mut self, path: &str) -> Self {
+        self.absent_mount_sources.push(PathBuf::from(path));
         self
     }
 
@@ -497,12 +506,15 @@ impl EnvironmentProbe for FakeCapabilities {
         }
     }
 
-    /// One fact per path asked about, every source there unless they were
-    /// scripted absent.
+    /// One fact per path asked about, every source there unless it was scripted
+    /// absent on its own or they all were.
     fn inspect_mount_sources(&self, paths: &[PathBuf]) -> Vec<MountSourceFacts> {
         paths
             .iter()
-            .map(|path| MountSourceFacts { path: path.clone(), exists: self.mount_sources_present })
+            .map(|path| MountSourceFacts {
+                path: path.clone(),
+                exists: self.mount_sources_present && !self.absent_mount_sources.contains(path),
+            })
             .collect()
     }
 }

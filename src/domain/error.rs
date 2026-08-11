@@ -50,6 +50,11 @@ pub enum HortError {
     /// `up`: the directory is neither a git repository nor marked as a project,
     /// so nothing there authorizes hort to hand it to a sandbox.
     NotAProject { path: String },
+    /// `up`: a declared cache is aimed at a path that is not there inside the
+    /// read-only mount covering it, so its mountpoint would have to be created
+    /// on a read-only tree. A cache inside a read-only mount is otherwise legal
+    /// and lands as a writable island.
+    CacheTargetMissing { name: String, target: String, source: String },
     /// `attach`: the name has metadata but no live anchor.
     SandboxNotRunning { name: String },
     /// `attach`: no sandbox of this name is known ("what's alive" wording).
@@ -166,6 +171,10 @@ impl fmt::Display for HortError {
             HortError::NotAProject { path } => write!(
                 f,
                 "'{path}' is not a project — run hort from a git repository, or add a .hort.json there to sandbox the directory itself"
+            ),
+            HortError::CacheTargetMissing { name, target, source } => write!(
+                f,
+                "cache '{name}' targets '{target}', which does not exist inside the read-only mount '{source}' — point the cache elsewhere, or create it on the host first"
             ),
             HortError::SandboxNotRunning { name } => write!(
                 f,
@@ -294,6 +303,20 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "'/home/tester/Downloads' is not a project — run hort from a git repository, or add a .hort.json there to sandbox the directory itself"
+        );
+    }
+
+    #[test]
+    fn cache_target_missing_error_renders_canonical_string() {
+        let error = HortError::CacheTargetMissing {
+            name: "fish".to_string(),
+            target: "/home/hort/.config/fish".to_string(),
+            source: "/home/tester/.config".to_string(),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "cache 'fish' targets '/home/hort/.config/fish', which does not exist inside the read-only mount '/home/tester/.config' — point the cache elsewhere, or create it on the host first"
         );
     }
 
