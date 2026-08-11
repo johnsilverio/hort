@@ -5,7 +5,10 @@
 //! decides admission against the recorded and live state, creates or reuses the
 //! worktree (or mounts the project folder itself where there is no git),
 //! persists the metadata record before the container starts, then records the
-//! anchor's liveness token and provisions networking. Always detached.
+//! anchor's liveness token and provisions networking. A failure once the anchor
+//! is standing undoes the build, stopping the host-side helpers and then the
+//! container while leaving the worktree and the record for the next run. Always
+//! detached.
 
 use std::path::{Path, PathBuf};
 
@@ -19,6 +22,7 @@ use crate::domain::policy::{BranchIntent, up_error};
 use crate::domain::preconditions::up_precondition_error;
 use crate::domain::reconcile::SandboxState;
 use crate::domain::resources::resource_limits;
+use crate::domain::teardown::{TeardownStep, rollback_plan};
 use crate::ports::{
     CacheProvider, Clock, ContainerRegistry, ContainerRuntime, DbForward, EnvironmentProbe,
     LivenessProbe, MetadataStore, NetworkProvider, NetworkSpec, OciSpec, SandboxLock,
@@ -256,9 +260,14 @@ impl UpCommand<'_> {
             mounts,
             resources: limits,
         })?;
-        self.store.put(&record.with_token(token))?;
 
-        self.network.provision(&NetworkSpec {
+        // Past here the anchor is standing, so a failure leaves a container that
+        // is alive, reaches nothing and reports itself healthy, which is worse
+        // than an orphan. What decides the undo is that state, never which of the
+        // remaining steps was the one that broke, and the failure that comes back
+        // is the one that caused it rather than anything the undo produced.
+        let running = record.with_token(token);
+        let network_spec = NetworkSpec {
             name: name.clone(),
             netns: PathBuf::from(format!("/proc/{}/ns/net", token.pid.0)),
             egress,
@@ -268,10 +277,41 @@ impl UpCommand<'_> {
                 .iter()
                 .map(|database| DbForward { host: database.host.clone(), port: database.port })
                 .collect(),
-        })?;
+        };
+        let built = self.store.put(&running).and_then(|()| self.network.provision(&network_spec));
+        if let Err(failure) = built {
+            self.rollback(&running);
+            return Err(failure);
+        }
 
         self.lock.release(&name)?;
         Ok(warnings)
+    }
+
+    /// Undo a build that failed with its anchor already standing: the mandatory
+    /// teardown order truncated at the container, so the helpers stop before the
+    /// namespace they are attached to. Every step is attempted whatever the one
+    /// before it did, because a helper that will not die is exactly the
+    /// arrangement where giving up early leaves the container standing. What it
+    /// cannot stop is left to `ls` and `prune`, like any other orphan.
+    fn rollback(&self, record: &SandboxRecord) {
+        for step in rollback_plan(record) {
+            match step {
+                // No watcher pid is persisted yet, so there is nothing to stop;
+                // the watcher-stop seam lands with the notify watcher work.
+                TeardownStep::StopWatcher => {}
+                TeardownStep::StopNetwork => {
+                    let _ = self.network.teardown(record.name());
+                }
+                TeardownStep::StopContainer => {
+                    let _ = self.runtime.teardown(record.name());
+                }
+                // The undo stops processes and touches no disk: the worktree can
+                // hold work from an earlier run, and the record is what the next
+                // run reads to finish or clean this sandbox.
+                TeardownStep::RemoveWorktree | TeardownStep::RemoveMetadata => {}
+            }
+        }
     }
 }
 
@@ -279,6 +319,8 @@ impl UpCommand<'_> {
 mod tests {
     use super::*;
 
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::time::SystemTime;
 
     use crate::domain::config::{Cache, CacheDir, Egress, Mounts, Network, Resources};
@@ -1496,5 +1538,210 @@ mod tests {
         // as one to protect against.
         let persisted = store.get(&SandboxName::new("demo").unwrap()).unwrap().unwrap();
         assert_eq!(persisted.project_path(), Some(project.as_path()));
+    }
+
+    #[test]
+    fn up_undoes_the_helpers_before_the_container_when_provisioning_fails() {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token()).with_trace(trace.clone());
+        let network = FakeNetwork::failing_provision().with_trace(trace.clone());
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
+        );
+
+        let result = command.run(SandboxName::new("demo").unwrap(), None);
+
+        // A build that fails with the anchor already up leaves a box that looks
+        // healthy and reaches nothing, which is worse than an orphan: the first
+        // symptom is the agent's call to its provider. Undoing it obeys the same
+        // physics a teardown does, so the helper the provisioning left running
+        // goes before the container whose namespace it is attached to.
+        assert!(result.is_err());
+        assert_eq!(
+            *trace.borrow(),
+            vec!["network.teardown".to_string(), "runtime.teardown".to_string()]
+        );
+    }
+
+    #[test]
+    fn up_keeps_the_worktree_when_provisioning_fails() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::failing_provision();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
+        );
+
+        let result = command.run(SandboxName::new("demo").unwrap(), None);
+
+        // The undo stops processes and stops there. This directory is the one
+        // thing in the sandbox that can hold work nobody else has a copy of, and
+        // a retry of the same name reaches it again.
+        assert!(result.is_err());
+        assert!(worktrees.exists(Path::new("/state/sandboxes/demo/worktree-demo")));
+    }
+
+    #[test]
+    fn up_keeps_the_record_when_provisioning_fails() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::failing_provision();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
+        );
+
+        let result = command.run(SandboxName::new("demo").unwrap(), None);
+
+        // The record is what the next run reads to finish or clean this sandbox,
+        // so removing it would leave the worktree tracked by nothing, which is
+        // the leak persisting before the container exists to prevent. It keeps
+        // naming the anchor too: rewriting it on a path that is already failing
+        // would make a container the undo could not stop read as gone.
+        assert!(result.is_err());
+        let persisted = store
+            .get(&SandboxName::new("demo").unwrap())
+            .unwrap()
+            .expect("the record survives a failed build");
+        assert_eq!(persisted.liveness_token(), Some(canned_token()));
+    }
+
+    #[test]
+    fn up_reports_the_provisioning_failure_when_the_undo_also_fails() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::failing_provision().with_failing_teardown();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
+        );
+
+        let result = command.run(SandboxName::new("demo").unwrap(), None);
+
+        // What comes back names the cause. The scripted provisioning failure and
+        // the scripted helper stop fail with different variants on purpose, so a
+        // report that swapped one for the other would send the user reading
+        // about a cleanup step instead of about the build that broke.
+        assert!(matches!(result, Err(HortError::InvalidConfig { .. })));
+    }
+
+    #[test]
+    fn up_stops_the_container_even_when_the_helper_stop_fails() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::failing_provision().with_failing_teardown();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
+        );
+
+        let result = command.run(SandboxName::new("demo").unwrap(), None);
+
+        // A helper that will not die is the one arrangement where giving up
+        // early leaves exactly the box this undo exists to kill: alive, and
+        // reaching nothing. What the undo cannot stop is left to ls and prune,
+        // which is a different thing from not trying the rest.
+        assert!(result.is_err());
+        assert_eq!(runtime.teardowns(), vec![SandboxName::new("demo").unwrap()]);
+    }
+
+    #[test]
+    fn up_undoes_the_build_when_the_anchor_cannot_be_recorded() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new().with_failing_token_write();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
+        );
+
+        let result = command.run(SandboxName::new("demo").unwrap(), None);
+
+        // Provisioning is not the only thing that can fail with the anchor
+        // already up, and the box left behind is the same one either way: alive,
+        // and named by nothing that says it is. What decides whether a build is
+        // undone is that the anchor was standing when it broke, never which of
+        // the steps after it happened to be the one that broke.
+        assert!(result.is_err());
+        assert_eq!(runtime.teardowns(), vec![SandboxName::new("demo").unwrap()]);
+    }
+
+    #[test]
+    fn up_undoes_nothing_when_the_build_succeeds() {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token()).with_trace(trace.clone());
+        let network = FakeNetwork::new().with_trace(trace.clone());
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &config,
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // The undo has to be reachable only from the failing path. An
+        // implementation that tears down on the way out of every build would
+        // leave every other witness here green while `up` handed back a sandbox
+        // it had just killed.
+        assert!(trace.borrow().is_empty());
     }
 }

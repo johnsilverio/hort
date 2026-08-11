@@ -45,6 +45,19 @@ pub fn teardown_plan(record: &SandboxRecord) -> Vec<TeardownStep> {
     plan
 }
 
+/// Build the ordered undo for a build that failed once the anchor was already
+/// standing: the same mandatory sequence, up to and including the container, and
+/// nothing after it. The host-side helpers stop first, then the container; the
+/// worktree and the metadata record are left where they are.
+pub fn rollback_plan(record: &SandboxRecord) -> Vec<TeardownStep> {
+    let mut plan = teardown_plan(record);
+    // A plan with no container step truncates to nothing rather than to all of
+    // itself: everything past the container is what the undo must never do.
+    let kept = plan.iter().position(|step| *step == TeardownStep::StopContainer);
+    plan.truncate(kept.map_or(0, |index| index + 1));
+    plan
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +130,16 @@ mod tests {
 
         assert!(!plan.contains(&TeardownStep::StopWatcher));
         assert!(plan.contains(&TeardownStep::StopNetwork));
+    }
+
+    #[test]
+    fn rollback_plan_stops_at_the_container() {
+        let plan = rollback_plan(&git_record());
+
+        // The two steps it leaves out are exactly the two that touch the disk.
+        // A failed build undoes what it started, never what holds work: the
+        // worktree may carry changes from an earlier run, and the record is what
+        // the next run reads to finish or clean this sandbox.
+        assert_eq!(plan, vec![TeardownStep::StopNetwork, TeardownStep::StopContainer]);
     }
 }

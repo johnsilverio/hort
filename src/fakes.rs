@@ -38,6 +38,7 @@ type TeardownTrace = Rc<RefCell<Vec<String>>>;
 pub struct InMemoryMetadataStore {
     records: RefCell<HashMap<SandboxName, SandboxRecord>>,
     corrupt: RefCell<Vec<(String, String)>>,
+    token_write_fails: bool,
     trace: Option<TeardownTrace>,
 }
 
@@ -52,6 +53,14 @@ impl InMemoryMetadataStore {
         self
     }
 
+    /// Script the write that records a running anchor as failing, leaving the
+    /// record that was persisted before the container untouched. It is the other
+    /// way a build fails with its container already standing.
+    pub fn with_failing_token_write(mut self) -> Self {
+        self.token_write_fails = true;
+        self
+    }
+
     /// Script a corrupt metadata dir of this name, returned by `list_corrupt`.
     /// Its same-named entry is cleared by `remove`, the observable witness that
     /// pruning a corrupt dir took it off disk.
@@ -63,6 +72,13 @@ impl InMemoryMetadataStore {
 
 impl MetadataStore for InMemoryMetadataStore {
     fn put(&self, record: &SandboxRecord) -> Result<(), HortError> {
+        if self.token_write_fails && record.liveness_token().is_some() {
+            // An unasserted stand-in error, like the network's scripted
+            // provisioning failure: what a test watches is what `up` undoes.
+            return Err(HortError::StateIo {
+                detail: "fake store: the token write is scripted to fail".to_string(),
+            });
+        }
         self.records.borrow_mut().insert(record.name().clone(), record.clone());
         Ok(())
     }
@@ -251,12 +267,28 @@ impl ContainerRuntime for FakeRuntime {
 pub struct FakeNetwork {
     provisioned: RefCell<Vec<NetworkSpec>>,
     teardowns: RefCell<Vec<SandboxName>>,
+    provision_fails: bool,
+    teardown_fails: bool,
     trace: Option<TeardownTrace>,
 }
 
 impl FakeNetwork {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A provider whose `provision` fails, the state a build reaches with its
+    /// container already standing and no networking around it.
+    pub fn failing_provision() -> Self {
+        Self { provision_fails: true, ..Self::default() }
+    }
+
+    /// Script the helper stop as failing too, standing in for a helper that will
+    /// not go. It fails with a different variant from the provisioning failure,
+    /// so a test can tell which of the two came back.
+    pub fn with_failing_teardown(mut self) -> Self {
+        self.teardown_fails = true;
+        self
     }
 
     /// Record the `network.teardown` step on the shared teardown trace.
@@ -306,6 +338,13 @@ impl NetworkProvider for FakeNetwork {
                 .map(|forward| DbForward { host: forward.host.clone(), port: forward.port })
                 .collect(),
         });
+        if self.provision_fails {
+            // An unasserted stand-in error, like the runtime's scripted start
+            // failure: what a test watches here is what `up` undoes.
+            return Err(HortError::InvalidConfig {
+                detail: "fake network: provision scripted to fail".to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -313,6 +352,11 @@ impl NetworkProvider for FakeNetwork {
         self.teardowns.borrow_mut().push(name.clone());
         if let Some(trace) = &self.trace {
             trace.borrow_mut().push("network.teardown".to_string());
+        }
+        if self.teardown_fails {
+            return Err(HortError::StateIo {
+                detail: "fake network: teardown scripted to fail".to_string(),
+            });
         }
         Ok(())
     }
