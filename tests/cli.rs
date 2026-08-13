@@ -2,15 +2,24 @@
 //! code, stdout, and stderr. Each test points the binary at a throwaway state
 //! root (via `XDG_STATE_HOME`) and a throwaway git repository, so the real user
 //! state is never touched.
+//!
+//! The gated ones go further and raise a real sandbox on the machine running
+//! them, so each of those drives the binary through a `ScratchSandbox`, which
+//! owns the name it is built under and takes it down again whatever the test
+//! did.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as GitCommand;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use assert_cmd::Command;
 use hort::adapters::metadata::FileMetadataStore;
+use hort::adapters::pasta::PastaNetworkProvider;
+use hort::adapters::runtime::LibcontainerRuntime;
 use hort::domain::model::SandboxName;
-use hort::ports::MetadataStore;
+use hort::ports::{ContainerRuntime, MetadataStore, NetworkProvider};
 use predicates::prelude::*;
 use tempfile::TempDir;
 
@@ -134,6 +143,110 @@ fn prepared_rootfs() -> Option<String> {
         return None;
     }
     Some(configured)
+}
+
+/// A sandbox name nothing else on this machine answers to.
+///
+/// A sandbox name is the container id, and the container id names the systemd
+/// scope the cgroup lands in, a namespace shared by everything this user runs.
+/// Two sandboxes under one name therefore share one scope: the second joins the
+/// scope the first made, and the first teardown stops the whole of it. A fixed
+/// name here would reach a sandbox a person is working in and kill its anchor.
+fn a_name_of_its_own() -> SandboxName {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let ordinal = NEXT.fetch_add(1, Ordering::Relaxed);
+    SandboxName::new(&format!("gated-cli-{}-{ordinal}", std::process::id())).unwrap()
+}
+
+/// The two throwaway XDG roots a gated test drives the binary under, the name it
+/// drives it with, and the teardown that runs whether the test reached its own
+/// `down` or died before it.
+///
+/// Declare it after the other fixtures, so that it is the first of them to go:
+/// a sandbox comes down before the directory it binds, and the folder a no-git
+/// run mounts belongs to a fixture of its own.
+struct ScratchSandbox {
+    name: SandboxName,
+    state_home: TempDir,
+    runtime_dir: TempDir,
+}
+
+impl ScratchSandbox {
+    fn new() -> Self {
+        Self {
+            name: a_name_of_its_own(),
+            state_home: TempDir::new().unwrap(),
+            runtime_dir: TempDir::new().unwrap(),
+        }
+    }
+
+    fn name(&self) -> &SandboxName {
+        &self.name
+    }
+
+    fn state_home(&self) -> &Path {
+        self.state_home.path()
+    }
+
+    fn runtime_dir(&self) -> &Path {
+        self.runtime_dir.path()
+    }
+
+    /// Where hort keeps what remembers the sandbox, which is a component deeper
+    /// than the variable that decides it. A teardown handed the variable's own
+    /// value works on an empty directory, finds nothing to stop and says so
+    /// nowhere.
+    fn state_root(&self) -> PathBuf {
+        self.state_home().join("hort")
+    }
+
+    /// Where hort keeps what a restart makes meaningless, one component under
+    /// the variable for the same reason as above.
+    fn runtime_root(&self) -> PathBuf {
+        self.runtime_dir().join("hort")
+    }
+
+    /// This sandbox's memory of itself: the record, the overlay, the worktree.
+    fn state_dir(&self) -> PathBuf {
+        self.state_root().join("sandboxes").join(self.name.as_str())
+    }
+
+    /// Where this sandbox's host-side helpers keep their runtime files: the log,
+    /// the pid files, and the record of the ports a session may reach.
+    fn sandbox_dir(&self) -> PathBuf {
+        self.runtime_root().join("sandboxes").join(self.name.as_str())
+    }
+}
+
+impl Drop for ScratchSandbox {
+    fn drop(&mut self) {
+        // In the order a sandbox has to come down in, and every step attempted
+        // whatever the one before it did, because a helper that will not die is
+        // exactly the case where stopping early leaves the container standing.
+        // Nothing here may fail loudly: a panic raised while a test is already
+        // unwinding aborts the process and takes the failed assertion with it.
+        let runtime_root = self.runtime_root();
+        let _ = PastaNetworkProvider::new(runtime_root.clone()).teardown(&self.name);
+        let _ = LibcontainerRuntime::new(runtime_root).teardown(&self.name);
+        take_back_traversal(self.state_home());
+    }
+}
+
+/// Give the owner back the right to enter and read every directory under this
+/// one, so what is inside can be removed.
+///
+/// Mounting a sandbox's writable layer leaves a work directory behind that the
+/// kernel takes every permission off, its owner included. A recursive remove
+/// stops at one of those, and the one a scratch directory is taken away by
+/// reports nothing when it does, so the directory simply stays on the machine.
+fn take_back_traversal(dir: &Path) {
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            take_back_traversal(&entry.path());
+        }
+    }
 }
 
 #[test]
@@ -415,29 +528,25 @@ fn cli_ls_lists_sandboxes_despite_a_malformed_project_config() {
 #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
 fn cli_up_builds_a_sandbox_the_kernel_is_running() {
     let Some(rootfs) = prepared_rootfs() else { return };
-    let xdg = TempDir::new().unwrap();
-    let xdg_root = xdg.path().canonicalize().unwrap();
-    let state_root = xdg_root.join("hort");
-    let runtime = TempDir::new().unwrap();
-    let runtime_root = runtime.path().canonicalize().unwrap();
     let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
     let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
 
     Command::cargo_bin("hort")
         .unwrap()
-        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_STATE_HOME", sandbox.state_home())
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
         .current_dir(&repo_path)
-        .args(["up", "-d", "clidemo"])
+        .args(["up", "-d", sandbox.name().as_str()])
         .assert()
         .success();
 
     // The one fact a placeholder runtime cannot produce. Everything before it,
     // the resolved config, the branch, the worktree and the record, exists just
     // the same in a build that never started a container.
-    let record = FileMetadataStore::new(state_root.clone())
-        .get(&SandboxName::new("clidemo").unwrap())
+    let record = FileMetadataStore::new(sandbox.state_root())
+        .get(sandbox.name())
         .unwrap()
         .expect("up records the sandbox it built");
     let anchor = record.liveness_token().expect("up records the anchor it started");
@@ -445,11 +554,11 @@ fn cli_up_builds_a_sandbox_the_kernel_is_running() {
 
     Command::cargo_bin("hort")
         .unwrap()
-        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_STATE_HOME", sandbox.state_home())
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
         .current_dir(&repo_path)
-        .args(["down", "clidemo"])
+        .args(["down", sandbox.name().as_str()])
         .assert()
         .success();
 }
@@ -458,12 +567,9 @@ fn cli_up_builds_a_sandbox_the_kernel_is_running() {
 #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
 fn cli_up_with_detach_returns_without_opening_a_session() {
     let Some(rootfs) = prepared_rootfs() else { return };
-    let xdg = TempDir::new().unwrap();
-    let xdg_root = xdg.path().canonicalize().unwrap();
-    let runtime = TempDir::new().unwrap();
-    let runtime_root = runtime.path().canonicalize().unwrap();
     let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
     let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
 
     // Nothing inside the box ever reads this, and that is the assertion: a build
     // that ignored the flag would run a shell that consumed it. Asked for by
@@ -471,11 +577,11 @@ fn cli_up_with_detach_returns_without_opening_a_session() {
     // flag that lies.
     Command::cargo_bin("hort")
         .unwrap()
-        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_STATE_HOME", sandbox.state_home())
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
         .current_dir(&repo_path)
-        .args(["up", "-d", "detacheddemo"])
+        .args(["up", "-d", sandbox.name().as_str()])
         .write_stdin("echo ran-inside-the-sandbox\n")
         .assert()
         .success()
@@ -483,11 +589,11 @@ fn cli_up_with_detach_returns_without_opening_a_session() {
 
     Command::cargo_bin("hort")
         .unwrap()
-        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_STATE_HOME", sandbox.state_home())
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
         .current_dir(&repo_path)
-        .args(["down", "detacheddemo"])
+        .args(["down", sandbox.name().as_str()])
         .assert()
         .success();
 }
@@ -496,23 +602,20 @@ fn cli_up_with_detach_returns_without_opening_a_session() {
 #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
 fn cli_up_without_detach_opens_a_session_in_the_sandbox_it_built() {
     let Some(rootfs) = prepared_rootfs() else { return };
-    let xdg = TempDir::new().unwrap();
-    let xdg_root = xdg.path().canonicalize().unwrap();
-    let runtime = TempDir::new().unwrap();
-    let runtime_root = runtime.path().canonicalize().unwrap();
     let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
     let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
 
     // The sandbox the user asked for is one they are standing in, and a build
     // that returns to the host prompt instead leaves them to work out that a box
     // exists somewhere and has to be entered by name.
     Command::cargo_bin("hort")
         .unwrap()
-        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_STATE_HOME", sandbox.state_home())
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
         .current_dir(&repo_path)
-        .args(["up", "shelldemo"])
+        .args(["up", sandbox.name().as_str()])
         .write_stdin("echo ran-inside-the-sandbox\n")
         .assert()
         .success()
@@ -520,11 +623,11 @@ fn cli_up_without_detach_opens_a_session_in_the_sandbox_it_built() {
 
     Command::cargo_bin("hort")
         .unwrap()
-        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_STATE_HOME", sandbox.state_home())
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
         .current_dir(&repo_path)
-        .args(["down", "shelldemo"])
+        .args(["down", sandbox.name().as_str()])
         .assert()
         .success();
 }
@@ -533,10 +636,6 @@ fn cli_up_without_detach_opens_a_session_in_the_sandbox_it_built() {
 #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
 fn cli_up_carries_a_declared_dotfile_into_the_sandbox_home() {
     let Some(rootfs) = prepared_rootfs() else { return };
-    let xdg = TempDir::new().unwrap();
-    let xdg_root = xdg.path().canonicalize().unwrap();
-    let runtime = TempDir::new().unwrap();
-    let runtime_root = runtime.path().canonicalize().unwrap();
     let (_home, home_path) = temp_host_home();
     let declared = home_path.join(".config").join("hortwitness");
     fs::create_dir_all(&declared).unwrap();
@@ -546,6 +645,7 @@ fn cli_up_carries_a_declared_dotfile_into_the_sandbox_home() {
         declared.display()
     ));
     let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
 
     // Read back where the box looks for it, never where the host keeps it. A
     // build that lost the home it measures a declared path against mounts the
@@ -558,11 +658,11 @@ fn cli_up_carries_a_declared_dotfile_into_the_sandbox_home() {
     Command::cargo_bin("hort")
         .unwrap()
         .env("HOME", &home_path)
-        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_STATE_HOME", sandbox.state_home())
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
         .current_dir(&repo_path)
-        .args(["up", "mountdemo"])
+        .args(["up", sandbox.name().as_str()])
         .write_stdin("cat /home/hort/.config/hortwitness/settings\n")
         .assert()
         .success()
@@ -571,11 +671,11 @@ fn cli_up_carries_a_declared_dotfile_into_the_sandbox_home() {
     Command::cargo_bin("hort")
         .unwrap()
         .env("HOME", &home_path)
-        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_STATE_HOME", sandbox.state_home())
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
         .current_dir(&repo_path)
-        .args(["down", "mountdemo"])
+        .args(["down", sandbox.name().as_str()])
         .assert()
         .success();
 }
@@ -584,20 +684,17 @@ fn cli_up_carries_a_declared_dotfile_into_the_sandbox_home() {
 #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
 fn cli_attach_exits_with_the_status_of_the_session() {
     let Some(rootfs) = prepared_rootfs() else { return };
-    let xdg = TempDir::new().unwrap();
-    let xdg_root = xdg.path().canonicalize().unwrap();
-    let runtime = TempDir::new().unwrap();
-    let runtime_root = runtime.path().canonicalize().unwrap();
     let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
     let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
 
     Command::cargo_bin("hort")
         .unwrap()
-        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_STATE_HOME", sandbox.state_home())
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
         .current_dir(&repo_path)
-        .args(["up", "-d", "statusdemo"])
+        .args(["up", "-d", sandbox.name().as_str()])
         .assert()
         .success();
 
@@ -605,22 +702,22 @@ fn cli_attach_exits_with_the_status_of_the_session() {
     // from hort failing to open the box at all, and both of those are exit 1.
     Command::cargo_bin("hort")
         .unwrap()
-        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_STATE_HOME", sandbox.state_home())
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
         .current_dir(&repo_path)
-        .args(["attach", "statusdemo"])
+        .args(["attach", sandbox.name().as_str()])
         .write_stdin("exit 7\n")
         .assert()
         .code(7);
 
     Command::cargo_bin("hort")
         .unwrap()
-        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_STATE_HOME", sandbox.state_home())
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
         .current_dir(&repo_path)
-        .args(["down", "statusdemo"])
+        .args(["down", sandbox.name().as_str()])
         .assert()
         .success();
 }
@@ -629,10 +726,6 @@ fn cli_attach_exits_with_the_status_of_the_session() {
 #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
 fn cli_up_reports_a_configuration_advisory_on_stderr() {
     let Some(rootfs) = prepared_rootfs() else { return };
-    let xdg = TempDir::new().unwrap();
-    let xdg_root = xdg.path().canonicalize().unwrap();
-    let runtime = TempDir::new().unwrap();
-    let runtime_root = runtime.path().canonicalize().unwrap();
     let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
     let (_repo, repo_path) = temp_git_repo();
     fs::create_dir_all(repo_path.join(".devcontainer")).unwrap();
@@ -641,28 +734,29 @@ fn cli_up_reports_a_configuration_advisory_on_stderr() {
         r#"{ "image": "mcr.microsoft.com/devcontainers/base:bookworm" }"#,
     )
     .unwrap();
+    let sandbox = ScratchSandbox::new();
 
     // Gated because only a build that succeeds reaches the advisory channel, and
     // the configuration half is the one worth the price: it is produced far from
     // the command that prints it, so dropping it is the silent failure.
     Command::cargo_bin("hort")
         .unwrap()
-        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_STATE_HOME", sandbox.state_home())
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
         .current_dir(&repo_path)
-        .args(["up", "cfgdemo"])
+        .args(["up", sandbox.name().as_str()])
         .assert()
         .success()
         .stderr(predicate::str::contains("'image'"));
 
     Command::cargo_bin("hort")
         .unwrap()
-        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_STATE_HOME", sandbox.state_home())
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
         .current_dir(&repo_path)
-        .args(["down", "cfgdemo"])
+        .args(["down", sandbox.name().as_str()])
         .assert()
         .success();
 }
@@ -671,38 +765,35 @@ fn cli_up_reports_a_configuration_advisory_on_stderr() {
 #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
 fn cli_a_declared_cache_dir_survives_the_sandbox_that_wrote_it() {
     let Some(rootfs) = prepared_rootfs() else { return };
-    let xdg = TempDir::new().unwrap();
-    let xdg_root = xdg.path().canonicalize().unwrap();
-    let state_root = xdg_root.join("hort");
-    let runtime = TempDir::new().unwrap();
-    let runtime_root = runtime.path().canonicalize().unwrap();
     let (_config, config_home) = temp_config_home(&format!(
         r#"{{ "rootfs": "{rootfs}", "cache": {{ "dirs": ["node_modules"] }} }}"#
     ));
     let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
     // Worked out here rather than asked of hort, so what this reads back is an
     // address the test arrived at on its own and not one it was handed.
     let key = repo_path.display().to_string().replace('%', "%25").replace('/', "%2F");
-    let cached = state_root.join("cache").join(key).join("node_modules").join("installed");
+    let cached =
+        sandbox.state_root().join("cache").join(key).join("node_modules").join("installed");
 
     Command::cargo_bin("hort")
         .unwrap()
-        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_STATE_HOME", sandbox.state_home())
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
         .current_dir(&repo_path)
-        .args(["up", "cachedemo"])
+        .args(["up", sandbox.name().as_str()])
         .write_stdin("mkdir -p /workdir/node_modules && echo four-minutes-of-installing > /workdir/node_modules/installed\n")
         .assert()
         .success();
 
     Command::cargo_bin("hort")
         .unwrap()
-        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_STATE_HOME", sandbox.state_home())
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
         .current_dir(&repo_path)
-        .args(["down", "cachedemo"])
+        .args(["down", sandbox.name().as_str()])
         .assert()
         .success();
 
@@ -719,30 +810,26 @@ fn cli_a_declared_cache_dir_survives_the_sandbox_that_wrote_it() {
 #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
 fn cli_down_without_git_leaves_the_project_folder() {
     let Some(rootfs) = prepared_rootfs() else { return };
-    let xdg = TempDir::new().unwrap();
-    let xdg_root = xdg.path().canonicalize().unwrap();
-    let state_root = xdg_root.join("hort");
-    let runtime = TempDir::new().unwrap();
-    let runtime_root = runtime.path().canonicalize().unwrap();
     let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
     let project = TempDir::new().unwrap();
     let project_path = project.path().canonicalize().unwrap();
     // No git here: the marker file is the whole of what makes this a project.
     fs::write(project_path.join(".hort.json"), "{}").unwrap();
     fs::write(project_path.join("notes.md"), "work in progress\n").unwrap();
+    let sandbox = ScratchSandbox::new();
 
     Command::cargo_bin("hort")
         .unwrap()
-        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_STATE_HOME", sandbox.state_home())
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
         .current_dir(&project_path)
-        .args(["up", "nogitdemo"])
+        .args(["up", sandbox.name().as_str()])
         .assert()
         .success();
 
-    let record = FileMetadataStore::new(state_root.clone())
-        .get(&SandboxName::new("nogitdemo").unwrap())
+    let record = FileMetadataStore::new(sandbox.state_root())
+        .get(sandbox.name())
         .unwrap()
         .expect("up records the sandbox it built");
     assert_eq!(record.worktree_path(), project_path);
@@ -750,11 +837,11 @@ fn cli_down_without_git_leaves_the_project_folder() {
 
     Command::cargo_bin("hort")
         .unwrap()
-        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_STATE_HOME", sandbox.state_home())
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_RUNTIME_DIR", &runtime_root)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
         .current_dir(&project_path)
-        .args(["down", "nogitdemo"])
+        .args(["down", sandbox.name().as_str()])
         .assert()
         .success();
 
@@ -762,27 +849,24 @@ fn cli_down_without_git_leaves_the_project_folder() {
     // must leave it exactly where it was, contents and all.
     assert!(project_path.join("notes.md").exists());
     assert!(project_path.join(".hort.json").exists());
-    assert!(!state_root.join("sandboxes").join("nogitdemo").exists());
+    assert!(!sandbox.state_dir().exists());
 }
 
 #[test]
 #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
 fn cli_the_runtime_root_holds_the_pasta_pid_file_until_the_sandbox_goes_down() {
     let Some(rootfs) = prepared_rootfs() else { return };
-    let xdg = TempDir::new().unwrap();
-    let xdg_root = xdg.path().canonicalize().unwrap();
-    let runtime = TempDir::new().unwrap();
-    let runtime_root = runtime.path().join("hort");
     let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
     let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
 
     Command::cargo_bin("hort")
         .unwrap()
-        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_STATE_HOME", sandbox.state_home())
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
         .current_dir(&repo_path)
-        .args(["up", "-d", "pastapiddemo"])
+        .args(["up", "-d", sandbox.name().as_str()])
         .assert()
         .success();
 
@@ -790,15 +874,15 @@ fn cli_the_runtime_root_holds_the_pasta_pid_file_until_the_sandbox_goes_down() {
     // up, and no test below that wiring can tell the two apart: an adapter asked
     // about the root it was handed answers the same either way. The two roots
     // point at different directories here for exactly that reason.
-    assert!(runtime_root.join("sandboxes").join("pastapiddemo").join("pasta.pid").exists());
+    assert!(sandbox.sandbox_dir().join("pasta.pid").exists());
 
     Command::cargo_bin("hort")
         .unwrap()
-        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_STATE_HOME", sandbox.state_home())
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
         .current_dir(&repo_path)
-        .args(["down", "pastapiddemo"])
+        .args(["down", sandbox.name().as_str()])
         .assert()
         .success();
 
@@ -807,27 +891,24 @@ fn cli_the_runtime_root_holds_the_pasta_pid_file_until_the_sandbox_goes_down() {
     // the last file does. So an owner that forgot one of its files leaves the
     // whole directory standing, and this one line is what says every one of them
     // did its half.
-    assert!(!runtime_root.join("sandboxes").join("pastapiddemo").exists());
+    assert!(!sandbox.sandbox_dir().exists());
 }
 
 #[test]
 #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
 fn cli_up_writes_no_helper_artifact_into_the_state_root() {
     let Some(rootfs) = prepared_rootfs() else { return };
-    let xdg = TempDir::new().unwrap();
-    let xdg_root = xdg.path().canonicalize().unwrap();
-    let state_root = xdg_root.join("hort");
-    let runtime = TempDir::new().unwrap();
     let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
     let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
 
     Command::cargo_bin("hort")
         .unwrap()
-        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_STATE_HOME", sandbox.state_home())
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
         .current_dir(&repo_path)
-        .args(["up", "-d", "staterootdemo"])
+        .args(["up", "-d", sandbox.name().as_str()])
         .assert()
         .success();
 
@@ -836,20 +917,20 @@ fn cli_up_writes_no_helper_artifact_into_the_state_root() {
     // distribution labels, and the label the state root carries refuses them, so
     // hort would still lose the pid it stops pasta by and the log it explains a
     // dead sandbox from.
-    let sandbox_dir = state_root.join("sandboxes").join("staterootdemo");
+    let state_dir = sandbox.state_dir();
     // Asked first, because two absences under a directory that does not exist are
     // two absences whatever hort did.
-    assert!(sandbox_dir.exists());
-    assert!(!sandbox_dir.join("pasta.pid").exists());
-    assert!(!sandbox_dir.join("output.log").exists());
+    assert!(state_dir.exists());
+    assert!(!state_dir.join("pasta.pid").exists());
+    assert!(!state_dir.join("output.log").exists());
 
     Command::cargo_bin("hort")
         .unwrap()
-        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_STATE_HOME", sandbox.state_home())
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
         .current_dir(&repo_path)
-        .args(["down", "staterootdemo"])
+        .args(["down", sandbox.name().as_str()])
         .assert()
         .success();
 }
