@@ -340,8 +340,19 @@ fn open_session(
     name: SandboxName,
     config: &ResolvedConfig,
 ) -> Result<u8, HortError> {
-    let command = AttachCommand::new(&deps.store, &deps.probe, &deps.runtime, &deps.clock, config);
-    let session = command.run(name, std::io::stdin().is_terminal())?;
+    let command = AttachCommand::new(
+        &deps.store,
+        &deps.probe,
+        &deps.runtime,
+        &deps.clock,
+        &deps.env,
+        &deps.network,
+        config,
+        std::env::var("SHELL").ok(),
+        std::env::vars().collect(),
+    );
+    let (session, warnings) = command.run(name, std::io::stdin().is_terminal())?;
+    eprint!("{}", render_warnings(&[], &warnings));
     Ok(session_exit_code(deps.terminal.relay(session)?))
 }
 

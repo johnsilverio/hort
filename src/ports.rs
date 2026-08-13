@@ -71,6 +71,17 @@ pub trait NetworkProvider {
     fn teardown(&self, name: &SandboxName) -> Result<(), HortError>;
 }
 
+/// Where a sandbox's egress proxy listens, so a session can be told to send its
+/// traffic there.
+///
+/// The only side that can answer is the one that started the proxy, which is why
+/// this sits beside the provisioning port rather than in the record: a port
+/// number is precisely what a restart makes meaningless. A sandbox that never had
+/// a proxy answers `None`, which is what the open posture always looks like.
+pub trait ProxyEndpoint {
+    fn proxy_port(&self, name: &SandboxName) -> Option<u16>;
+}
+
 /// The persisted memory of which sandboxes should exist. A missing record reads
 /// as `Ok(None)`, `put` upserts by name, and `remove` is idempotent. The store
 /// is never the authority on liveness, only on intent.

@@ -26,6 +26,10 @@ pub struct ConfiguredShell {
     pub present: bool,
 }
 
+/// The shell a prepared rootfs is required to carry, which is what makes it the
+/// answer hort can always fall back to.
+const DEFAULT_SHELL: &str = "/bin/sh";
+
 /// Select the precondition error `up` must raise before building anything, or
 /// `None` to proceed. Checks run in order: user namespaces, then pasta, then
 /// `ip` when the egress posture is an allowlist, then the rootfs chain
@@ -76,6 +80,43 @@ pub fn up_precondition_error(
     }
 
     None
+}
+
+/// Select the precondition error `attach` must raise before joining a sandbox,
+/// or `None` to proceed.
+///
+/// It asks about user namespaces and about nothing else. What entering a running
+/// sandbox needs is the namespace join: the host-side helpers are already up and
+/// the container already exists with its root filesystem mounted, so refusing
+/// entry to a live sandbox because pasta left the `PATH` would be hort inventing
+/// an obstacle rather than reporting one.
+pub fn attach_precondition_error(caps: &Capabilities) -> Option<HortError> {
+    (!caps.user_ns).then_some(HortError::UserNamespacesDisabled)
+}
+
+/// The shell a session execs, from the configuration, the shell the user runs on
+/// the host, and whether that host shell resolves inside the sandbox's rootfs.
+///
+/// The configured shell wins as declared, since a build already refused one the
+/// rootfs does not carry. The host shell is taken only when the rootfs provides
+/// it, because a session that execs a shell the box does not have opens nothing.
+/// Everything else lands on the default, which the rootfs contract obliges a
+/// prepared rootfs to carry: a project with no rootfs configured, a rootfs that
+/// has left the disk and a read that could not answer all arrive here, because
+/// entering a sandbox never validates a rootfs and so must not die for failing to
+/// look inside one.
+pub fn session_shell(
+    configured: Option<&str>,
+    host_shell: Option<&str>,
+    host_shell_in_rootfs: bool,
+) -> String {
+    if let Some(shell) = configured {
+        return shell.to_string();
+    }
+    match host_shell {
+        Some(shell) if host_shell_in_rootfs => shell.to_string(),
+        _ => DEFAULT_SHELL.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -253,6 +294,52 @@ mod tests {
         let error = up_precondition_error(&caps, &allowlist(), None);
 
         assert_eq!(error, Some(HortError::IpMissing));
+    }
+
+    #[test]
+    fn attach_preconditions_select_user_namespaces_disabled() {
+        let caps = Capabilities { user_ns: false, ..ready_host() };
+
+        let error = attach_precondition_error(&caps);
+
+        assert_eq!(error, Some(HortError::UserNamespacesDisabled));
+    }
+
+    #[test]
+    fn attach_preconditions_ignore_the_host_tooling_a_build_needs() {
+        let caps = Capabilities { pasta: None, ip: None, ..ready_host() };
+
+        let error = attach_precondition_error(&caps);
+
+        // Both binaries belong to whoever provisions the networking, and by the
+        // time anyone joins a sandbox its helpers are already running. Refusing
+        // to enter a live box over either of them locks the user out of work
+        // that is sitting there uncommitted.
+        assert_eq!(error, None);
+    }
+
+    #[test]
+    fn session_shell_prefers_the_configured_shell_over_the_host_shell() {
+        let shell = session_shell(Some("/usr/bin/fish"), Some("/bin/bash"), true);
+
+        assert_eq!(shell, "/usr/bin/fish");
+    }
+
+    #[test]
+    fn session_shell_takes_the_host_shell_when_the_rootfs_provides_it() {
+        let shell = session_shell(None, Some("/bin/bash"), true);
+
+        assert_eq!(shell, "/bin/bash");
+    }
+
+    #[test]
+    fn session_shell_falls_back_when_the_rootfs_lacks_the_host_shell() {
+        let shell = session_shell(None, Some("/bin/bash"), false);
+
+        // The shell a person runs on their own machine is very often one the
+        // prepared rootfs never had installed, and a session told to exec it
+        // opens nothing at all.
+        assert_eq!(shell, "/bin/sh");
     }
 
     #[test]

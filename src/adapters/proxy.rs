@@ -305,7 +305,7 @@ fn record(log: &File, decision: &str) {
 
 /// Publish where the sandbox reaches its proxy, which is where a session fills
 /// its proxy variables from.
-fn record_port(sandbox_dir: &Path, port: u16) -> Result<(), String> {
+pub fn record_port(sandbox_dir: &Path, port: u16) -> Result<(), String> {
     let port_file = sandbox_dir.join(PORT_FILE);
     fs::write(&port_file, format!("{port}\n"))
         .map_err(|err| format!("writing {}: {err}", port_file.display()))

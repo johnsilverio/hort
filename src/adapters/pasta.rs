@@ -42,7 +42,7 @@ use crate::adapters::{forwarder, landlock, proxy};
 use crate::domain::egress::EgressPolicy;
 use crate::domain::error::HortError;
 use crate::domain::model::SandboxName;
-use crate::ports::{DbForward, NetworkProvider, NetworkSpec};
+use crate::ports::{DbForward, NetworkProvider, NetworkSpec, ProxyEndpoint};
 
 const PASTA: &str = "pasta";
 const IP: &str = "ip";
@@ -172,6 +172,15 @@ impl NetworkProvider for PastaNetworkProvider {
 
     fn teardown(&self, name: &SandboxName) -> Result<(), HortError> {
         self.stop(name).map_err(network_failure)
+    }
+}
+
+/// The side that started the proxy is the side that can say where it listens, so
+/// the two interfaces share one implementation while staying separate to their
+/// callers: a session only ever asks the question, it never provisions.
+impl ProxyEndpoint for PastaNetworkProvider {
+    fn proxy_port(&self, name: &SandboxName) -> Option<u16> {
+        proxy::recorded_port(&self.sandbox_dir(name))
     }
 }
 
@@ -672,6 +681,24 @@ mod tests {
         // standing for the life of the machine, holding a record of the ports a
         // sandbox that no longer exists was reachable on.
         assert!(!sandbox_dir.exists());
+    }
+
+    #[test]
+    fn the_proxy_endpoint_reports_the_port_the_proxy_recorded() {
+        let runtime_root = tempfile::tempdir().unwrap();
+        let sandbox_dir = runtime_root.path().join("sandboxes").join("demo");
+        fs::create_dir_all(&sandbox_dir).unwrap();
+        proxy::record_port(&sandbox_dir, PROXY_PORT).unwrap();
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
+
+        let port = provider.proxy_port(&SandboxName::new("demo").unwrap());
+
+        // A session is told where to send its traffic from this answer, and the
+        // file it comes from lives under the root that a restart empties, never
+        // under the one that remembers the sandbox. Looked for in the wrong
+        // place it is simply never found, and every session under an allowlist
+        // goes out with no proxy set at all.
+        assert_eq!(port, Some(PROXY_PORT));
     }
 }
 

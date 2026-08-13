@@ -21,8 +21,8 @@ use crate::domain::preconditions::{ConfiguredShell, RootfsFacts};
 use crate::ports::{
     CacheProvider, Clock, Confirmer, ContainerRegistry, ContainerRuntime, CorruptEntry, DbForward,
     EnvironmentProbe, LivenessProbe, MetadataStore, NetworkProvider, NetworkSpec, Notifier,
-    OciSpec, RegistryEntry, ResourceLimits, SandboxLock, SandboxMount, Session, SessionProbe,
-    SessionSpec, Worktree, WorktreeProvider,
+    OciSpec, ProxyEndpoint, RegistryEntry, ResourceLimits, SandboxLock, SandboxMount, Session,
+    SessionProbe, SessionSpec, Worktree, WorktreeProvider,
 };
 
 /// The shared teardown-order witness threaded through the fakes that perform a
@@ -381,6 +381,31 @@ fn copy_host_pattern(pattern: &HostPattern) -> HostPattern {
     }
 }
 
+/// Answers with a scripted proxy port, listening on nothing. A sandbox built
+/// without one reports no port, which is what every open-posture sandbox looks
+/// like.
+pub struct FakeProxyEndpoint {
+    port: Option<u16>,
+}
+
+impl FakeProxyEndpoint {
+    /// A sandbox whose proxy answers on `port`.
+    pub fn listening_on(port: u16) -> Self {
+        Self { port: Some(port) }
+    }
+
+    /// A sandbox that never had a proxy started for it.
+    pub fn without_proxy() -> Self {
+        Self { port: None }
+    }
+}
+
+impl ProxyEndpoint for FakeProxyEndpoint {
+    fn proxy_port(&self, _name: &SandboxName) -> Option<u16> {
+        self.port
+    }
+}
+
 /// Answers every liveness check with the same scripted verdict.
 pub struct ScriptedLivenessProbe {
     alive: bool,
@@ -443,6 +468,7 @@ impl Clock for ScriptedClock {
 pub struct FakeCapabilities {
     capabilities: Capabilities,
     rootfs_present: bool,
+    rootfs_shell_present: bool,
     mount_sources_present: bool,
     absent_mount_sources: Vec<PathBuf>,
     inspections: RefCell<Vec<(PathBuf, Option<String>)>>,
@@ -453,6 +479,7 @@ impl FakeCapabilities {
         Self {
             capabilities,
             rootfs_present: true,
+            rootfs_shell_present: true,
             mount_sources_present: true,
             absent_mount_sources: Vec::new(),
             inspections: RefCell::new(Vec::new()),
@@ -463,6 +490,14 @@ impl FakeCapabilities {
     /// not there provides nothing, so every fact about it reads false.
     pub fn with_missing_rootfs(mut self) -> Self {
         self.rootfs_present = false;
+        self
+    }
+
+    /// Script a rootfs that is there but does not carry the shell it was asked
+    /// about, which is the ordinary case for a shell a person installed on their
+    /// own machine.
+    pub fn without_the_shell_asked_about(mut self) -> Self {
+        self.rootfs_shell_present = false;
         self
     }
 
@@ -500,7 +535,7 @@ impl EnvironmentProbe for FakeCapabilities {
             has_default_shell: self.rootfs_present,
             configured_shell: shell.map(|shell| ConfiguredShell {
                 path: shell.to_owned(),
-                present: self.rootfs_present,
+                present: self.rootfs_present && self.rootfs_shell_present,
             }),
             workdir_writable: self.rootfs_present,
         }

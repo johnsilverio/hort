@@ -1,8 +1,8 @@
 //! Command-admission policy: pure error selection over observed sandbox state.
-//! Both `up` and `attach` ask one question, is the same-named anchor alive, and
-//! decide which error to raise (if any) before doing any work. The selection is a
-//! pure function of the reconciled state and the branch intent; the commands run
-//! the effects.
+//! `up` asks one question, is the same-named anchor alive, and decides which
+//! error to raise (if any) before doing any work. The selection is a pure
+//! function of the reconciled state and the branch intent; the command runs the
+//! effects.
 
 use crate::domain::error::HortError;
 use crate::domain::model::{BranchName, SandboxName};
@@ -53,19 +53,6 @@ pub fn up_error(
         BranchIntent::UseExisting { checked_out_elsewhere: false, .. } => None,
         BranchIntent::NoGit { branch_flag: true } => Some(HortError::BranchRequiresGit),
         BranchIntent::NoGit { branch_flag: false } => None,
-    }
-}
-
-/// Select the error `attach` must raise, or `None` to join. A live sandbox is
-/// joinable; an orphaned record is not running; an unknown name has nothing to
-/// join.
-pub fn attach_error(name: &SandboxName, existing: Option<SandboxState>) -> Option<HortError> {
-    match existing {
-        None => Some(HortError::UnknownSandboxOnAttach { name: name.as_str().to_string() }),
-        Some(SandboxState::Orphaned) => {
-            Some(HortError::SandboxNotRunning { name: name.as_str().to_string() })
-        }
-        Some(SandboxState::Live | SandboxState::LostRecord | SandboxState::Inconsistent) => None,
     }
 }
 
@@ -207,32 +194,5 @@ mod tests {
         );
 
         assert_eq!(error, Some(HortError::DuplicateName { name: "demo".to_string() }));
-    }
-
-    #[test]
-    fn attach_selects_not_running_for_orphaned_record() {
-        let name = SandboxName::new("demo").unwrap();
-
-        let error = attach_error(&name, Some(SandboxState::Orphaned));
-
-        assert_eq!(error, Some(HortError::SandboxNotRunning { name: "demo".to_string() }));
-    }
-
-    #[test]
-    fn attach_selects_absent_for_unknown_name() {
-        let name = SandboxName::new("demo").unwrap();
-
-        let error = attach_error(&name, None);
-
-        assert_eq!(error, Some(HortError::UnknownSandboxOnAttach { name: "demo".to_string() }));
-    }
-
-    #[test]
-    fn attach_selects_no_error_for_live_sandbox() {
-        let name = SandboxName::new("demo").unwrap();
-
-        let error = attach_error(&name, Some(SandboxState::Live));
-
-        assert_eq!(error, None);
     }
 }
