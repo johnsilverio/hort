@@ -1674,11 +1674,10 @@ mod privileged_tests {
     use std::time::{Duration, Instant};
 
     use serial_test::serial;
-    use tempfile::TempDir;
 
     use crate::adapters::environment::HostEnvironmentProbe;
+    use crate::adapters::gated::ScratchSandbox;
     use crate::adapters::helper::a_declared_port;
-    use crate::adapters::pasta::PastaNetworkProvider;
     use crate::adapters::proxy;
     use crate::adapters::streams::sandbox_log_path;
     use crate::domain::egress::{EgressPolicy, HostPattern};
@@ -1717,24 +1716,6 @@ mod privileged_tests {
         Some(rootfs)
     }
 
-    fn sandbox_spec(rootfs: PathBuf, state_root: &Path) -> OciSpec {
-        let workdir = state_root.join("sandboxes/demo/worktree-demo");
-        fs::create_dir_all(&workdir).unwrap();
-        OciSpec {
-            name: SandboxName::new("demo").unwrap(),
-            rootfs,
-            overlay: state_root.join("sandboxes/demo/overlay"),
-            env: vec![("HORT_SANDBOX".to_string(), "demo".to_string())],
-            workdir,
-            mounts: Vec::new(),
-            resources: None,
-        }
-    }
-
-    fn runtime_under(runtime_root: &TempDir) -> LibcontainerRuntime {
-        LibcontainerRuntime::new(runtime_root.path().to_path_buf())
-    }
-
     /// A session that stays alive long enough to be read from the host, which is
     /// the only way a test can ask where a session ended up.
     fn session_spec(name: &SandboxName) -> SessionSpec {
@@ -1745,12 +1726,6 @@ mod privileged_tests {
             env: Vec::new(),
             terminal: false,
         }
-    }
-
-    /// The directory the sandbox's helpers keep their runtime files in: the log,
-    /// the pid files, and the record of the ports a session may reach.
-    fn sandbox_dir(runtime_root: &Path) -> PathBuf {
-        runtime_root.join("sandboxes/demo")
     }
 
     /// The file a session leaves in `/workdir` when it finds a terminal on its
@@ -2006,10 +1981,9 @@ mod privileged_tests {
     #[serial]
     fn anchor_starts_and_reports_its_liveness_token() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&runtime_root);
-        let spec = sandbox_spec(rootfs, state_root.path());
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
 
         let token = runtime.start_anchor(&spec).unwrap();
 
@@ -2023,10 +1997,9 @@ mod privileged_tests {
     #[serial]
     fn registry_reports_the_token_the_anchor_was_started_under() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&runtime_root);
-        let spec = sandbox_spec(rootfs, state_root.path());
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
         let started = runtime.start_anchor(&spec).unwrap();
 
         let live = runtime.list_live().unwrap();
@@ -2048,10 +2021,9 @@ mod privileged_tests {
     #[serial]
     fn registry_stops_reporting_a_sandbox_whose_anchor_was_killed() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&runtime_root);
-        let spec = sandbox_spec(rootfs, state_root.path());
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
         let started = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(started.pid.0);
         unsafe { libc::kill(started.pid.0 as libc::pid_t, libc::SIGKILL) };
@@ -2072,10 +2044,9 @@ mod privileged_tests {
     #[serial]
     fn anchor_runs_with_an_empty_capability_set() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&runtime_root);
-        let spec = sandbox_spec(rootfs, state_root.path());
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
 
         let token = runtime.start_anchor(&spec).unwrap();
 
@@ -2094,10 +2065,9 @@ mod privileged_tests {
     #[serial]
     fn anchor_sees_the_worktree_at_workdir() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&runtime_root);
-        let spec = sandbox_spec(rootfs, state_root.path());
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
         fs::write(spec.workdir.join("from-the-host"), "worktree").unwrap();
 
         let token = runtime.start_anchor(&spec).unwrap();
@@ -2114,10 +2084,9 @@ mod privileged_tests {
     #[serial]
     fn anchor_root_is_the_merged_overlay() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&runtime_root);
-        let spec = sandbox_spec(rootfs, state_root.path());
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
         // A file planted in the sandbox's writable layer is visible at the
         // anchor's root only if that root is the overlay merge of the base rootfs
         // and this layer. It exists in neither the base rootfs nor the host root.
@@ -2138,10 +2107,9 @@ mod privileged_tests {
     #[serial]
     fn teardown_stops_the_anchor() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&runtime_root);
-        let spec = sandbox_spec(rootfs, state_root.path());
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
         let token = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(token.pid.0);
 
@@ -2155,10 +2123,9 @@ mod privileged_tests {
     #[serial]
     fn anchor_writes_its_streams_to_the_sandbox_log() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&runtime_root);
-        let spec = sandbox_spec(rootfs, state_root.path());
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
 
         let token = runtime.start_anchor(&spec).unwrap();
 
@@ -2167,7 +2134,7 @@ mod privileged_tests {
         // the sandbox: a piped or redirected invocation never reaches EOF and its
         // reader waits on a `sleep infinity` that will never write.
         wait_for_anchor(token.pid.0);
-        let log = sandbox_log_path(&sandbox_dir(runtime_root.path()));
+        let log = sandbox_log_path(&sandbox.sandbox_dir());
         assert_eq!(fs::read_link(format!("/proc/{}/fd/1", token.pid.0)).unwrap(), log);
         assert_eq!(fs::read_link(format!("/proc/{}/fd/2", token.pid.0)).unwrap(), log);
         runtime.teardown(&spec.name).unwrap();
@@ -2178,10 +2145,9 @@ mod privileged_tests {
     #[serial]
     fn the_state_root_holds_no_sandbox_log() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&runtime_root);
-        let spec = sandbox_spec(rootfs, state_root.path());
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
 
         let token = runtime.start_anchor(&spec).unwrap();
 
@@ -2191,7 +2157,7 @@ mod privileged_tests {
         // Writing it in both places would keep that failure and hand the reader two
         // halves of one account.
         wait_for_anchor(token.pid.0);
-        assert!(!sandbox_log_path(&state_root.path().join("sandboxes/demo")).exists());
+        assert!(!sandbox_log_path(&sandbox.state_dir()).exists());
         runtime.teardown(&spec.name).unwrap();
     }
 
@@ -2200,11 +2166,10 @@ mod privileged_tests {
     #[serial]
     fn the_anchor_reads_from_nothing_rather_than_from_what_invoked_hort() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&runtime_root);
-        let spec = sandbox_spec(rootfs, state_root.path());
-        let invocation_input = state_root.path().join("invocation-input");
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
+        let invocation_input = sandbox.state_root().join("invocation-input");
         fs::write(&invocation_input, b"").unwrap();
         let restore_stdin = redirect_stdin(&invocation_input);
 
@@ -2227,10 +2192,9 @@ mod privileged_tests {
     #[serial]
     fn anchor_runs_as_the_host_user_that_owns_the_worktree() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&runtime_root);
-        let spec = sandbox_spec(rootfs, state_root.path());
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
 
         let token = runtime.start_anchor(&spec).unwrap();
 
@@ -2248,10 +2212,9 @@ mod privileged_tests {
     #[serial]
     fn session_joins_the_sandbox_mount_namespace() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&runtime_root);
-        let spec = sandbox_spec(rootfs, state_root.path());
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
         let token = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(token.pid.0);
 
@@ -2266,10 +2229,9 @@ mod privileged_tests {
     #[serial]
     fn session_runs_in_the_sandbox_network_namespace() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&runtime_root);
-        let spec = sandbox_spec(rootfs, state_root.path());
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
         let token = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(token.pid.0);
 
@@ -2289,10 +2251,9 @@ mod privileged_tests {
     #[serial]
     fn a_session_finds_a_writable_home_at_the_dedicated_path() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&runtime_root);
-        let spec = sandbox_spec(rootfs, state_root.path());
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
         let token = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(token.pid.0);
 
@@ -2313,13 +2274,10 @@ mod privileged_tests {
     #[serial]
     fn a_session_reads_a_dotfile_mounted_from_the_host() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&runtime_root);
-        let spec = OciSpec {
-            mounts: vec![dotfile_mount(state_root.path())],
-            ..sandbox_spec(rootfs, state_root.path())
-        };
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec =
+            OciSpec { mounts: vec![dotfile_mount(sandbox.state_root())], ..sandbox.spec(rootfs) };
         let token = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(token.pid.0);
 
@@ -2339,13 +2297,10 @@ mod privileged_tests {
     #[serial]
     fn a_session_cannot_write_to_a_read_only_mount() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&runtime_root);
-        let spec = OciSpec {
-            mounts: vec![dotfile_mount(state_root.path())],
-            ..sandbox_spec(rootfs, state_root.path())
-        };
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec =
+            OciSpec { mounts: vec![dotfile_mount(sandbox.state_root())], ..sandbox.spec(rootfs) };
         let token = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(token.pid.0);
 
@@ -2363,10 +2318,9 @@ mod privileged_tests {
     #[serial]
     fn a_session_that_asked_for_a_terminal_runs_on_one() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&runtime_root);
-        let spec = sandbox_spec(rootfs, state_root.path());
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
         let token = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(token.pid.0);
 
@@ -2387,10 +2341,9 @@ mod privileged_tests {
     #[serial]
     fn the_master_of_a_session_terminal_reaches_hort() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&runtime_root);
-        let spec = sandbox_spec(rootfs, state_root.path());
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
         let token = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(token.pid.0);
 
@@ -2409,20 +2362,9 @@ mod privileged_tests {
     #[serial]
     fn a_session_gets_its_terminal_under_a_deep_runtime_root() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        // A runtime root as deep as one gets: the variable that names it is the
-        // user's to set, and a session bus or a container tool that points it at a
-        // path of its own is enough. Every test path in this repo lives directly
-        // under /tmp and is therefore short, so nothing else here can tell a socket
-        // address that fits from one that does not.
-        let deep = runtime_root
-            .path()
-            .join("runtime-dir-on-a-long-organisation-path")
-            .join("with-a-nested-hort-root");
-        fs::create_dir_all(&deep).unwrap();
-        let runtime = LibcontainerRuntime::new(deep.clone());
-        let spec = sandbox_spec(rootfs, state_root.path());
+        let sandbox = ScratchSandbox::under_a_deep_runtime_root();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
         let token = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(token.pid.0);
 
@@ -2446,13 +2388,12 @@ mod privileged_tests {
         if !connect_restriction_enforceable() {
             return;
         }
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&runtime_root);
-        let spec = sandbox_spec(rootfs, state_root.path());
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
         let token = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(token.pid.0);
-        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
+        let provider = sandbox.network();
         let declared = a_declared_port();
         let database = TcpListener::bind(("127.0.0.1", declared)).unwrap();
         provider
@@ -2463,7 +2404,7 @@ mod privileged_tests {
         // refusal here can come from nothing but the ruleset, which is the whole
         // point: a port the sandbox cannot reach anyway refuses itself, and a
         // test of that would report this layer as working while it was gone.
-        let sandbox_dir = sandbox_dir(runtime_root.path());
+        let sandbox_dir = sandbox.sandbox_dir();
         let proxy = proxy::recorded_port(&sandbox_dir).expect("a proxy port");
         fs::write(sandbox_dir.join(CONNECT_PORTS_FILE), format!("{proxy}\n")).unwrap();
 
@@ -2479,13 +2420,12 @@ mod privileged_tests {
     #[serial]
     fn a_session_reaches_the_declared_database_on_the_sandbox_loopback() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&runtime_root);
-        let spec = sandbox_spec(rootfs, state_root.path());
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
         let token = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(token.pid.0);
-        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
+        let provider = sandbox.network();
         let declared = a_declared_port();
         let database = TcpListener::bind(("127.0.0.1", declared)).unwrap();
         provider
@@ -2508,13 +2448,12 @@ mod privileged_tests {
     #[serial]
     fn an_open_sandbox_leaves_its_sessions_free_to_connect() {
         let Some(rootfs) = prepared_rootfs() else { return };
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&runtime_root);
-        let spec = sandbox_spec(rootfs, state_root.path());
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
         let token = runtime.start_anchor(&spec).unwrap();
         wait_for_anchor(token.pid.0);
-        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
+        let provider = sandbox.network();
         let port = a_declared_port();
         let listening = TcpListener::bind(("127.0.0.1", port)).unwrap();
         provider.provision(&open_network(&spec.name, token.pid.0)).unwrap();
@@ -2534,11 +2473,10 @@ mod privileged_tests {
     #[ignore = "needs unprivileged user namespaces"]
     #[serial]
     fn start_anchor_fails_with_container_runtime_failed_for_a_missing_rootfs() {
-        let runtime_root = tempfile::tempdir().unwrap();
-        let state_root = tempfile::tempdir().unwrap();
-        let runtime = runtime_under(&runtime_root);
-        let absent = state_root.path().join("no-such-rootfs");
-        let spec = sandbox_spec(absent, state_root.path());
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let absent = sandbox.state_root().join("no-such-rootfs");
+        let spec = sandbox.spec(absent);
 
         let result = runtime.start_anchor(&spec);
 

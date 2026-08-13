@@ -8,6 +8,8 @@ pub mod confirm;
 pub mod console;
 pub mod environment;
 pub mod forwarder;
+#[cfg(all(test, feature = "privileged-tests"))]
+mod gated;
 pub mod helper;
 pub mod landlock;
 pub mod liveness;
