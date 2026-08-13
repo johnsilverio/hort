@@ -247,19 +247,54 @@ fn close_descriptors(first: RawFd, last: RawFd) {
     unsafe { libc::close_range(first as libc::c_uint, last as libc::c_uint, 0) };
 }
 
-/// A port a test can declare a database or a service on, taken from below the
-/// range the kernel hands out on its own. Binding `:0` and letting the listener
-/// go looks like it reserves a port and does not: the number goes straight back
-/// into the pool, and the next `:0` bind anywhere in the suite can be given it,
-/// which turns every test that declares a port into a race against its siblings.
+/// A port a test can declare a database or a service on: one nothing else on the
+/// machine is answering on, and one no other test process will be given for as
+/// long as this one runs. Binding `:0` and letting the listener go looks like it
+/// reserves a port and does not: the number goes straight back into the pool, and
+/// the next `:0` bind anywhere in the suite can be given it, which turns every
+/// test that declares a port into a race against its siblings.
+///
+/// What is held is the number and never the socket, because the two kinds of
+/// caller need opposite things from it: some listen on it themselves, and the
+/// rest need it free for hort's own forwarder to bind.
 #[cfg(test)]
 pub(crate) fn a_declared_port() -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
+    use std::net::TcpStream;
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixListener};
+    use std::sync::Mutex;
 
-    /// Below `net.ipv4.ip_local_port_range`, so nothing the kernel assigns lands
-    /// here, and stepping forward so no two tests in one run declare the same.
-    static NEXT: AtomicU16 = AtomicU16::new(21000);
-    NEXT.fetch_add(1, Ordering::Relaxed)
+    /// Below `net.ipv4.ip_local_port_range`, so nothing the kernel assigns on its
+    /// own lands here.
+    const FIRST: u16 = 21000;
+    const LAST: u16 = 21999;
+    /// What this process is holding, kept until it exits however it exits. A
+    /// number given back earlier is one a sibling process may hand out while the
+    /// test that asked for it is still using it.
+    static HELD: Mutex<Vec<UnixListener>> = Mutex::new(Vec::new());
+
+    /// Hold the number against every other process on the machine. A counter is
+    /// the same guess in every process, and the kernel is the only thing that can
+    /// settle it for processes that cannot see each other; this asks it by a name
+    /// that exists nowhere on disk and that it takes back when the holder dies.
+    fn hold(port: u16) -> Option<UnixListener> {
+        let name = SocketAddr::from_abstract_name(format!("hort-declared-port-{port}")).ok()?;
+        UnixListener::bind_addr(&name).ok()
+    }
+
+    for port in FIRST..=LAST {
+        let Some(held) = hold(port) else { continue };
+        // Asked by binding instead, this holds the port for the moment it takes
+        // to answer, and every helper forked in that moment inherits the listener
+        // and keeps the port it has just called free (measured: 1 red in 5).
+        let answering = TcpStream::connect(("127.0.0.1", port)).is_ok();
+        if answering {
+            continue;
+        }
+        HELD.lock().expect("the ports this process holds").push(held);
+        return port;
+    }
+    panic!("no port between {FIRST} and {LAST} is free to declare");
 }
 
 /// Take back a helper that was started but could not be handed over.
