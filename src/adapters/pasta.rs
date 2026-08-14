@@ -835,17 +835,34 @@ mod privileged_tests {
         false
     }
 
-    /// Whether the process is gone, waiting for it: a signalled process takes a
-    /// moment to leave the process table.
-    fn stopped_within_deadline(pid: u32) -> bool {
+    /// Whether the pid stops being pasta, waiting for it: a signalled process
+    /// takes a moment to leave.
+    ///
+    /// Whether the pid still names pasta is the same question hort answers before
+    /// it signals anything, and it is the only one here that separates a live
+    /// helper from one that died with nobody waiting on it. Such a process keeps
+    /// an entry under /proc whose namespace links still resolve, so asking
+    /// whether those are there reads a corpse as a running helper.
+    fn stopped_being_pasta_within_deadline(pid: u32) -> bool {
         let deadline = Instant::now() + PASTA_DEADLINE;
         while Instant::now() < deadline {
-            if !Path::new(&format!("/proc/{pid}/ns/net")).exists() {
+            if !pid_names_pasta(pid) {
                 return true;
             }
             sleep(Duration::from_millis(50));
         }
         false
+    }
+
+    /// Whether the process's own command line still names pasta, read here rather
+    /// than asked of the predicate teardown uses. Sharing the criterion is the
+    /// point of this question; sharing the code would let a predicate broken into
+    /// answering "not pasta" report the helper it kept teardown from signalling
+    /// as stopped.
+    fn pid_names_pasta(pid: u32) -> bool {
+        let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else { return false };
+        let program = cmdline.split(|byte| *byte == 0).next().unwrap_or_default();
+        Path::new(OsStr::from_bytes(program)).file_name() == Some(OsStr::new("pasta"))
     }
 
     #[test]
@@ -932,7 +949,7 @@ mod privileged_tests {
 
         // pasta never quits on its own once it is told not to watch the namespace
         // file, so a teardown that does not signal it leaves it running for good.
-        assert!(stopped_within_deadline(pasta));
+        assert!(stopped_being_pasta_within_deadline(pasta));
         runtime.teardown(&spec.name).unwrap();
     }
 
@@ -1060,7 +1077,7 @@ mod privileged_tests {
         // also why the one whose anchor died is still running when the same name
         // is built again. Provisioning that only starts things leaves that one
         // running for good and overwrites the only record of it.
-        assert!(stopped_within_deadline(left_behind));
+        assert!(stopped_being_pasta_within_deadline(left_behind));
         provider.teardown(&spec.name).unwrap();
         runtime.teardown(&spec.name).unwrap();
     }
