@@ -11,7 +11,8 @@ use crate::domain::error::HortError;
 use crate::domain::model::SandboxName;
 use crate::domain::teardown::{TeardownStep, teardown_plan};
 use crate::ports::{
-    Confirmer, ContainerRuntime, MetadataStore, NetworkProvider, SessionProbe, WorktreeProvider,
+    Confirmer, ContainerRuntime, MetadataStore, NetworkProvider, NotifyProvider, SessionProbe,
+    WorktreeProvider,
 };
 
 /// Coordinates tearing a sandbox down over the ports it depends on.
@@ -22,6 +23,7 @@ pub struct DownCommand<'a> {
     runtime: &'a dyn ContainerRuntime,
     network: &'a dyn NetworkProvider,
     worktrees: &'a dyn WorktreeProvider,
+    notify: &'a dyn NotifyProvider,
 }
 
 impl<'a> DownCommand<'a> {
@@ -32,8 +34,9 @@ impl<'a> DownCommand<'a> {
         runtime: &'a dyn ContainerRuntime,
         network: &'a dyn NetworkProvider,
         worktrees: &'a dyn WorktreeProvider,
+        notify: &'a dyn NotifyProvider,
     ) -> Self {
-        Self { store, sessions, confirmer, runtime, network, worktrees }
+        Self { store, sessions, confirmer, runtime, network, worktrees, notify }
     }
 }
 
@@ -56,9 +59,7 @@ impl DownCommand<'_> {
 
         for step in teardown_plan(&record) {
             match step {
-                // No watcher pid is persisted yet, so there is nothing to stop;
-                // the watcher-stop seam lands with the notify watcher work.
-                TeardownStep::StopWatcher => {}
+                TeardownStep::StopWatcher => self.notify.teardown(&name)?,
                 TeardownStep::StopNetwork => self.network.teardown(&name)?,
                 TeardownStep::StopContainer => self.runtime.teardown(&name)?,
                 TeardownStep::RemoveWorktree => self.worktrees.remove(&name)?,
@@ -83,8 +84,8 @@ mod tests {
 
     use crate::domain::model::{AnchorPid, LivenessToken, MountNsInode, SandboxRecord};
     use crate::fakes::{
-        FakeConfirmer, FakeNetwork, FakeRuntime, FakeSessionProbe, FakeWorktreeProvider,
-        InMemoryMetadataStore, sample_record,
+        FakeConfirmer, FakeNetwork, FakeNotifyProvider, FakeRuntime, FakeSessionProbe,
+        FakeWorktreeProvider, InMemoryMetadataStore, sample_record,
     };
 
     fn canned_token() -> LivenessToken {
@@ -98,8 +99,9 @@ mod tests {
         runtime: &'a FakeRuntime,
         network: &'a FakeNetwork,
         worktrees: &'a FakeWorktreeProvider,
+        notify: &'a FakeNotifyProvider,
     ) -> DownCommand<'a> {
-        DownCommand { store, sessions, confirmer, runtime, network, worktrees }
+        DownCommand { store, sessions, confirmer, runtime, network, worktrees, notify }
     }
 
     #[test]
@@ -112,7 +114,9 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token()).with_trace(trace.clone());
         let network = FakeNetwork::new().with_trace(trace.clone());
         let worktrees = FakeWorktreeProvider::new().with_trace(trace.clone());
-        let command = down_command(&store, &sessions, &confirmer, &runtime, &network, &worktrees);
+        let notify = FakeNotifyProvider::new();
+        let command =
+            down_command(&store, &sessions, &confirmer, &runtime, &network, &worktrees, &notify);
 
         command.run(SandboxName::new("demo").unwrap(), false, false).unwrap();
 
@@ -126,6 +130,29 @@ mod tests {
     }
 
     #[test]
+    fn down_stops_the_watcher_of_the_sandbox_it_tears_down() {
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo")).unwrap();
+        let sessions = FakeSessionProbe::new(vec![]);
+        let confirmer = FakeConfirmer::no();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let worktrees = FakeWorktreeProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command =
+            down_command(&store, &sessions, &confirmer, &runtime, &network, &worktrees, &notify);
+
+        command.run(SandboxName::new("demo").unwrap(), false, false).unwrap();
+
+        // The watcher is a host-side process outside the box, so nothing that
+        // happens to the container touches it: left running, it holds the channel
+        // of a sandbox that no longer exists and nothing on the machine will ever
+        // stop it. The plan carries the step for every sandbox alike, and this is
+        // one of the three arms that has to answer it.
+        assert_eq!(notify.teardowns(), vec![SandboxName::new("demo").unwrap()]);
+    }
+
+    #[test]
     fn down_refuses_without_tty_confirmation() {
         let trace = Rc::new(RefCell::new(Vec::new()));
         let store = InMemoryMetadataStore::new().with_trace(trace.clone());
@@ -135,7 +162,9 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token()).with_trace(trace.clone());
         let network = FakeNetwork::new().with_trace(trace.clone());
         let worktrees = FakeWorktreeProvider::new().with_trace(trace.clone());
-        let command = down_command(&store, &sessions, &confirmer, &runtime, &network, &worktrees);
+        let notify = FakeNotifyProvider::new();
+        let command =
+            down_command(&store, &sessions, &confirmer, &runtime, &network, &worktrees, &notify);
 
         let result = command.run(SandboxName::new("demo").unwrap(), false, false);
 
@@ -169,7 +198,9 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token()).with_trace(trace.clone());
         let network = FakeNetwork::new().with_trace(trace.clone());
         let worktrees = FakeWorktreeProvider::new().with_trace(trace.clone());
-        let command = down_command(&store, &sessions, &confirmer, &runtime, &network, &worktrees);
+        let notify = FakeNotifyProvider::new();
+        let command =
+            down_command(&store, &sessions, &confirmer, &runtime, &network, &worktrees, &notify);
 
         command.run(SandboxName::new("demo").unwrap(), false, false).unwrap();
 
@@ -190,7 +221,9 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token()).with_trace(trace.clone());
         let network = FakeNetwork::new().with_trace(trace.clone());
         let worktrees = FakeWorktreeProvider::new().with_trace(trace.clone());
-        let command = down_command(&store, &sessions, &confirmer, &runtime, &network, &worktrees);
+        let notify = FakeNotifyProvider::new();
+        let command =
+            down_command(&store, &sessions, &confirmer, &runtime, &network, &worktrees, &notify);
 
         let result = command.run(SandboxName::new("demo").unwrap(), false, false);
 
@@ -208,7 +241,9 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let worktrees = FakeWorktreeProvider::new();
-        let command = down_command(&store, &sessions, &confirmer, &runtime, &network, &worktrees);
+        let notify = FakeNotifyProvider::new();
+        let command =
+            down_command(&store, &sessions, &confirmer, &runtime, &network, &worktrees, &notify);
 
         command.run(name.clone(), false, true).unwrap();
 
@@ -228,7 +263,9 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token()).with_trace(trace.clone());
         let network = FakeNetwork::new().with_trace(trace.clone());
         let worktrees = FakeWorktreeProvider::new().with_trace(trace.clone());
-        let command = down_command(&store, &sessions, &confirmer, &runtime, &network, &worktrees);
+        let notify = FakeNotifyProvider::new();
+        let command =
+            down_command(&store, &sessions, &confirmer, &runtime, &network, &worktrees, &notify);
 
         let result = command.run(name.clone(), false, true);
 
@@ -247,7 +284,9 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let worktrees = FakeWorktreeProvider::new();
-        let command = down_command(&store, &sessions, &confirmer, &runtime, &network, &worktrees);
+        let notify = FakeNotifyProvider::new();
+        let command =
+            down_command(&store, &sessions, &confirmer, &runtime, &network, &worktrees, &notify);
 
         command.run(name.clone(), true, false).unwrap();
 
@@ -265,7 +304,9 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let worktrees = FakeWorktreeProvider::new();
-        let command = down_command(&store, &sessions, &confirmer, &runtime, &network, &worktrees);
+        let notify = FakeNotifyProvider::new();
+        let command =
+            down_command(&store, &sessions, &confirmer, &runtime, &network, &worktrees, &notify);
 
         command.run(name.clone(), false, false).unwrap();
 

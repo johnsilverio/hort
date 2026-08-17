@@ -6,7 +6,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::domain::config::ResolvedConfig;
-use crate::ports::{MountAccess, SandboxFile, SandboxMount};
+use crate::domain::error::HortError;
+use crate::domain::model::{SandboxName, Warning};
+use crate::ports::{MountAccess, Notifier, NotifyWatcher, SandboxFile, SandboxMount};
 
 /// Where the box finds the channel a completion hook writes into. Fixed rather
 /// than configurable: the hook command hort installs names this path, and nothing
@@ -17,8 +19,19 @@ pub const CHANNEL_DIR: &str = "/run/hort/notify";
 /// noticing a completion is noticing an append and never a parse.
 pub const EVENTS_FILE: &str = "events.jsonl";
 
-/// The sink the build ships, raised for a channel whose configuration names none.
-const DEFAULT_SINK: &str = "desktop";
+/// The sink the build ships. It is also the one a channel is raised on when the
+/// configuration names none, so a configuration naming anything else has asked
+/// for something this build cannot do.
+const DESKTOP_SINK: &str = "desktop";
+
+/// The message a completion is raised with when the configuration names none.
+/// A default and not a promise: the configuration replaces it and nothing in the
+/// product quotes it back.
+const DEFAULT_MESSAGE: &str = "hort sandbox '<name>' finished";
+
+/// What the message template has filled in: the sandbox the completion belongs
+/// to.
+const NAME_PLACEHOLDER: &str = "<name>";
 
 /// The one settings file the announcing agent reads inside the box. The vendor
 /// fixes this path, which is what makes several declarers collide on one file.
@@ -57,7 +70,7 @@ pub fn channel_sink(config: &ResolvedConfig) -> Option<String> {
             .notifications
             .as_ref()
             .and_then(|notifications| notifications.sink.clone())
-            .unwrap_or_else(|| DEFAULT_SINK.to_string())
+            .unwrap_or_else(|| DESKTOP_SINK.to_string())
     })
 }
 
@@ -84,6 +97,59 @@ pub fn stop_hook_drop_ins(config: &ResolvedConfig) -> Vec<SandboxFile> {
         })
         .into_iter()
         .collect()
+}
+
+/// The message a completion of `name` is raised with: the configured template
+/// with the sandbox it belongs to filled in, or the one the build ships when the
+/// configuration names none.
+///
+/// Rendered here and once, because the sink is handed a finished message and the
+/// process that would otherwise do the filling in is the one nothing can watch.
+pub fn render_notification(template: Option<&str>, name: &SandboxName) -> String {
+    template.unwrap_or(DEFAULT_MESSAGE).replace(NAME_PLACEHOLDER, name.as_str())
+}
+
+/// Why nothing will be raised for a declared channel on this host, and `None`
+/// when something will.
+///
+/// A sink the build has no implementation for, or a desktop with no program to
+/// raise a notification through, both leave the sandbox standing and the channel
+/// mute: a missing notification is worth a line on the way out, never a box torn
+/// down.
+pub fn notify_degradation_warning(sink: &str, notify_send: Option<&Path>) -> Option<Warning> {
+    if sink != DESKTOP_SINK {
+        return Some(Warning::new(format!(
+            "this build raises a completion on the desktop and nowhere else, so nothing will be raised on the '{sink}' this configuration asks for"
+        )));
+    }
+    notify_send.is_none().then(|| {
+        Warning::new(
+            "notify-send is not on PATH, so no completion of this sandbox will be raised on the desktop (install libnotify to get it)",
+        )
+    })
+}
+
+/// Raise `message` once for every completion appended to the channel, until the
+/// channel is gone.
+///
+/// The whole of what the watcher process does, and it terminates, because the
+/// channel goes away with the sandbox. A notification that fails does not end it:
+/// it is a long-lived process, so a failure is left in the sandbox's log and the
+/// next completion is still raised.
+pub fn watch_and_notify(
+    watcher: &mut dyn NotifyWatcher,
+    notifier: &dyn Notifier,
+    message: &str,
+) -> Result<(), HortError> {
+    while watcher.wait_for_append()? {
+        if let Err(refused) = notifier.notify(message) {
+            // Written to this process's own streams, which are the sandbox's log:
+            // the box has hours of work left in it, and a desktop that was not
+            // there for one completion is no reason to stop hearing the rest.
+            eprintln!("hort: a completion of this sandbox was not raised: {refused}");
+        }
+    }
+    Ok(())
 }
 
 /// The command of every agent that announces its own completions, in the order
@@ -114,6 +180,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::domain::config::{Agent, Auth, Cache, Mounts, Notify};
+    use crate::fakes::{RecordingNotifier, ScriptedNotifyWatcher};
     use crate::ports::MountAccess;
 
     /// The settings file the vendor's schema asks for, with the one-liner that
@@ -237,6 +304,107 @@ mod tests {
                     .to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn a_template_naming_the_sandbox_is_rendered_with_the_name_it_belongs_to() {
+        let rendered =
+            render_notification(Some("<name> is done"), &SandboxName::new("demo").unwrap());
+
+        // The one substitution the configuration is promised. Told about a box by
+        // no name, a person with four of them open learns nothing from being
+        // told one of them finished.
+        assert_eq!(rendered, "demo is done");
+    }
+
+    #[test]
+    fn a_channel_with_no_template_is_raised_with_the_message_the_build_ships() {
+        let rendered = render_notification(None, &SandboxName::new("demo").unwrap());
+
+        // Asserted as a literal, and it is a default rather than a promise: the
+        // configuration replaces it, nothing in the product quotes it back, and
+        // no error catalog carries it.
+        assert_eq!(rendered, "hort sandbox 'demo' finished");
+    }
+
+    #[test]
+    fn a_sink_this_build_does_not_implement_warns_that_nothing_will_be_raised() {
+        let warning =
+            notify_degradation_warning("webhook", Some(Path::new("/usr/bin/notify-send")));
+
+        // The build ships one sink. A configuration naming another has asked for
+        // something that will never happen, and silence here is a person waiting
+        // on a notification that was never going to come.
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn a_host_without_the_program_a_desktop_notification_needs_warns_about_it() {
+        let warning = notify_degradation_warning("desktop", None);
+
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn a_host_that_can_raise_the_configured_sink_warns_about_nothing() {
+        let warning =
+            notify_degradation_warning("desktop", Some(Path::new("/usr/bin/notify-send")));
+
+        // An advisory on every build of every host that has what it needs is one
+        // the user learns to scroll past, taking the next one that matters with
+        // it.
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn an_append_on_the_channel_raises_the_message_once() {
+        let mut watcher = ScriptedNotifyWatcher::appending(1);
+        let notifier = RecordingNotifier::new();
+
+        watch_and_notify(&mut watcher, &notifier, "hort sandbox 'demo' finished").unwrap();
+
+        assert_eq!(notifier.messages(), vec!["hort sandbox 'demo' finished".to_string()]);
+    }
+
+    #[test]
+    fn two_appends_on_the_channel_raise_the_message_twice() {
+        let mut watcher = ScriptedNotifyWatcher::appending(2);
+        let notifier = RecordingNotifier::new();
+
+        watch_and_notify(&mut watcher, &notifier, "hort sandbox 'demo' finished").unwrap();
+
+        // One agent finishing twice is two things the user is waiting on, and
+        // there is no window in which the second is the first said again: hort
+        // holds no clock here and no spec sets one.
+        assert_eq!(notifier.messages().len(), 2);
+    }
+
+    #[test]
+    fn a_channel_that_is_gone_ends_the_watch() {
+        let mut watcher = ScriptedNotifyWatcher::gone();
+        let notifier = RecordingNotifier::new();
+
+        let result = watch_and_notify(&mut watcher, &notifier, "hort sandbox 'demo' finished");
+
+        // The channel goes away with the sandbox, which is what `down` does to it
+        // while the watcher is still holding it. Leaving is the answer; a watcher
+        // that span here would outlive every box on the machine.
+        assert_eq!(result, Ok(()));
+        assert!(notifier.messages().is_empty());
+    }
+
+    #[test]
+    fn a_notification_that_fails_leaves_the_watch_running() {
+        let mut watcher = ScriptedNotifyWatcher::appending(2);
+        let notifier = RecordingNotifier::failing();
+
+        let result = watch_and_notify(&mut watcher, &notifier, "hort sandbox 'demo' finished");
+
+        // A desktop that was not there for one completion is not a reason to stop
+        // hearing about the rest: this process lives as long as the sandbox does,
+        // and the sandbox has hours of work left in it.
+        assert_eq!(result, Ok(()));
+        assert_eq!(notifier.messages().len(), 2);
     }
 
     #[test]

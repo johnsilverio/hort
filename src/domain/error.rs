@@ -98,6 +98,12 @@ pub enum HortError {
     /// is not a canonical product string, so callers match the variant, not the
     /// text.
     NetworkProviderFailed { detail: String },
+    /// Raising the completions of a sandbox failed: making its channel, starting
+    /// or stopping the host-side watcher of it, or running the program a
+    /// notification is raised through. Carries a human-readable detail naming the
+    /// operation; the rendered message is not a canonical product string, so
+    /// callers match the variant, not the text.
+    NotifyProviderFailed { detail: String },
     /// Preparing the state directory failed: creating or resolving the root hort
     /// keeps its records under. Carries a human-readable detail; the rendered
     /// message is not a canonical product string, so callers match the variant,
@@ -202,6 +208,9 @@ impl fmt::Display for HortError {
             }
             HortError::NetworkProviderFailed { detail } => {
                 write!(f, "sandbox networking failed: {detail}")
+            }
+            HortError::NotifyProviderFailed { detail } => {
+                write!(f, "sandbox notifications failed: {detail}")
             }
             HortError::StateIo { detail } => write!(f, "state directory error: {detail}"),
         }

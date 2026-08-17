@@ -133,7 +133,7 @@ mod tests {
             cgroup: CgroupCaps { memory: true, pids: true, cpu: true, cpuset: false },
             landlock_abi: Some(4),
             overlayfs_rootless: true,
-            notify_send: true,
+            notify_send: Some(PathBuf::from("/usr/bin/notify-send")),
             git: true,
         }
     }

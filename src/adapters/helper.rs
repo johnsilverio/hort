@@ -103,7 +103,11 @@ impl HostHelper {
         let outcome = match recorded {
             // A pid outlives the process it named, so the recorded one is only
             // acted on while it still names what was recorded.
-            Some(pid) if self.names(pid) => self.signal(pid),
+            Some(pid) if self.names(pid) => {
+                let signalled = self.signal(pid);
+                collect(pid);
+                signalled
+            }
             _ => Ok(()),
         };
         let _ = fs::remove_file(&pid_file);
@@ -295,6 +299,20 @@ pub(crate) fn a_declared_port() -> u16 {
         return port;
     }
     panic!("no port between {FIRST} and {LAST} is free to declare");
+}
+
+/// Take the exit status of a helper this process is the one that started, so the
+/// stopped process leaves the table instead of staying in it as a corpse that
+/// still answers to its name. Usually there is nothing to take: a sandbox is
+/// normally stopped by a later run of hort, which is not the parent of anything
+/// the earlier one forked.
+fn collect(pid: libc::pid_t) {
+    let mut status = 0;
+    // Asked without waiting first, because a blocking wait on a process that is
+    // not this one's child is the one arrangement that would never return.
+    if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == 0 {
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+    }
 }
 
 /// Take back a helper that was started but could not be handed over.

@@ -6,10 +6,13 @@
 //! the per-name build lock, decides admission against the recorded and live
 //! state, creates or reuses the worktree (or mounts the project folder itself
 //! where there is no git), and persists the metadata record before the
-//! container starts, then records the anchor's liveness token and provisions
-//! networking. A failure once the anchor is standing undoes the build, stopping
-//! the host-side helpers and then the container while leaving the worktree and
-//! the record for the next run. Always detached.
+//! container starts, then records the anchor's liveness token, provisions
+//! networking and starts the watcher that turns a completion written inside the
+//! box into a notification on the host. A failure once the anchor is standing
+//! undoes the build, stopping the host-side helpers and then the container while
+//! leaving the worktree and the record for the next run. The watcher is the one
+//! step that degrades instead: it warns and the sandbox stays up. Always
+//! detached.
 
 use std::path::{Path, PathBuf};
 
@@ -22,7 +25,10 @@ use crate::domain::mounts::{
     cache_landing_error, cache_landings, cache_mount_plan, declared_read_only_sources,
     read_only_mount_plan,
 };
-use crate::domain::notify::{channel_is_declared, channel_mount, channel_sink, stop_hook_drop_ins};
+use crate::domain::notify::{
+    channel_is_declared, channel_mount, channel_sink, notify_degradation_warning,
+    render_notification, stop_hook_drop_ins,
+};
 use crate::domain::policy::{BranchIntent, up_error};
 use crate::domain::preconditions::up_precondition_error;
 use crate::domain::reconcile::SandboxState;
@@ -30,8 +36,8 @@ use crate::domain::resources::resource_limits;
 use crate::domain::teardown::{TeardownStep, rollback_plan};
 use crate::ports::{
     CacheProvider, Clock, ContainerRegistry, ContainerRuntime, DbForward, EnvironmentProbe,
-    LivenessProbe, MetadataStore, NetworkProvider, NetworkSpec, NotifyProvider, OciSpec,
-    SandboxLock, WorktreeProvider,
+    LivenessProbe, MetadataStore, NetworkProvider, NetworkSpec, NotifyProvider, NotifySpec,
+    OciSpec, SandboxLock, WorktreeProvider,
 };
 
 /// Coordinates building (or resuming) the sandbox named `<name>` over the ports
@@ -145,6 +151,25 @@ impl UpCommand<'_> {
         // time one of those starts the sandbox exists and the user is inside it.
         warnings.extend(egress_degradation_warning(&egress, host.landlock_abi));
 
+        // A host that cannot raise a completion still builds the box: what a
+        // refusal here would cost is work nobody else has a copy of, and what
+        // this costs is a desktop popup. The program is the one the probe found,
+        // carried to the watcher rather than looked up again in a process that
+        // can no longer ask anything.
+        let sink = channel_sink(self.config);
+        let raising = match &sink {
+            Some(configured) => {
+                match notify_degradation_warning(configured, host.notify_send.as_deref()) {
+                    Some(mute) => {
+                        warnings.push(mute);
+                        None
+                    }
+                    None => host.notify_send.clone(),
+                }
+            }
+            None => None,
+        };
+
         let declared = declared_read_only_sources(self.config);
         let (mut mounts, mount_warnings) =
             read_only_mount_plan(&self.env.inspect_mount_sources(&declared), &self.host_home);
@@ -250,8 +275,10 @@ impl UpCommand<'_> {
         // an unrestricted agent for nothing. Its address is the provider's
         // answer and never one worked out here, because whatever later reads the
         // same directory has to arrive at the same path.
-        if channel_is_declared(self.config) {
-            mounts.push(channel_mount(&self.notify.ensure(&name)?));
+        let channel =
+            channel_is_declared(self.config).then(|| self.notify.ensure(&name)).transpose()?;
+        if let Some(channel) = &channel {
+            mounts.push(channel_mount(channel));
         }
 
         // Persist the record before the anchor starts: if the container then fails
@@ -268,7 +295,7 @@ impl UpCommand<'_> {
                     overlay_path.clone(),
                     timestamp.clone(),
                     timestamp,
-                    channel_sink(self.config),
+                    sink.clone(),
                     project_dir.clone(),
                 );
                 self.store.put(&fresh)?;
@@ -314,8 +341,32 @@ impl UpCommand<'_> {
             return Err(failure);
         }
 
+        // The last step of the build and the only one that degrades. A box whose
+        // completions nobody raises still holds every bit of work in it, and it
+        // is the one thing here that can be missed and then arranged afterwards
+        // by building the sandbox again.
+        if let (Some(events_dir), Some(sink)) = (channel, raising) {
+            let watching = NotifySpec {
+                name: name.clone(),
+                events_dir,
+                message: render_notification(self.notification_template(), &name),
+                sink,
+            };
+            if let Err(failure) = self.notify.provision(&watching) {
+                warnings.push(Warning::new(format!(
+                    "no completion of this sandbox will be raised, because its watcher could not be started: {failure}"
+                )));
+            }
+        }
+
         self.lock.release(&name)?;
         Ok(warnings)
+    }
+
+    /// The message a completion of this sandbox is raised with, as the
+    /// configuration asks for it, or `None` where it asks for nothing.
+    fn notification_template(&self) -> Option<&str> {
+        self.config.notifications.as_ref().and_then(|sink| sink.message.as_deref())
     }
 
     /// Undo a build that failed with its anchor already standing: the mandatory
@@ -327,9 +378,9 @@ impl UpCommand<'_> {
     fn rollback(&self, record: &SandboxRecord) {
         for step in rollback_plan(record) {
             match step {
-                // No watcher pid is persisted yet, so there is nothing to stop;
-                // the watcher-stop seam lands with the notify watcher work.
-                TeardownStep::StopWatcher => {}
+                TeardownStep::StopWatcher => {
+                    let _ = self.notify.teardown(record.name());
+                }
                 TeardownStep::StopNetwork => {
                     let _ = self.network.teardown(record.name());
                 }
@@ -354,7 +405,7 @@ mod tests {
     use std::time::SystemTime;
 
     use crate::domain::config::{
-        Agent, Auth, Cache, CacheDir, Egress, Mounts, Network, Notify, Resources,
+        Agent, Auth, Cache, CacheDir, Egress, Mounts, Network, Notifications, Notify, Resources,
     };
     use crate::domain::model::{AnchorPid, Capabilities, CgroupCaps, LivenessToken, MountNsInode};
     use crate::ports::{MountAccess, SandboxMount};
@@ -377,7 +428,7 @@ mod tests {
             cgroup: CgroupCaps { memory: true, pids: true, cpu: true, cpuset: false },
             landlock_abi: Some(4),
             overlayfs_rootless: true,
-            notify_send: true,
+            notify_send: Some(PathBuf::from("/usr/bin/notify-send")),
             git: true,
         }
     }
@@ -1189,6 +1240,240 @@ mod tests {
     }
 
     #[test]
+    fn up_points_the_watcher_at_the_channel_the_box_writes_into() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = config_declaring_a_channel();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // The same directory on both sides of the boundary, and that is the whole
+        // mechanism: the hook writes into a path inside a box that cannot reach
+        // the host, and the only reason the host ever hears about it is that this
+        // is the host end of that same path. Watching anywhere else leaves every
+        // other witness here green and the notification never arriving.
+        assert_eq!(
+            notify.provisioned_channel(),
+            Some(FakeNotifyProvider::channel_of(&SandboxName::new("demo").unwrap()))
+        );
+    }
+
+    #[test]
+    fn up_hands_the_watcher_the_message_the_configuration_asks_for() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = ResolvedConfig {
+            notifications: Some(Notifications {
+                sink: None,
+                message: Some("<name> is done in the box".to_string()),
+            }),
+            ..config_declaring_a_channel()
+        };
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // Rendered here and once, because the sink is handed a finished message
+        // and the process that would otherwise fill it in is the one nothing on
+        // the machine can watch. The configured template has to reach it, or the
+        // user gets the wording the build shipped and no way to change it.
+        assert_eq!(notify.provisioned_message(), Some("demo is done in the box".to_string()));
+    }
+
+    #[test]
+    fn up_hands_the_watcher_the_sink_the_host_probe_found() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let found = PathBuf::from("/found/only/by/the/probe/notify-send");
+        let env = FakeCapabilities::new(Capabilities {
+            notify_send: Some(found.clone()),
+            ..ready_host()
+        });
+        let config = config_declaring_a_channel();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // The watcher runs the program the precondition found, not whatever a
+        // search path answers with hours later, in a process that was forked and
+        // can no longer ask anything. A path this deliberate is the point: nothing
+        // could arrive at it by looking a program up by name.
+        assert_eq!(notify.provisioned_sink(), Some(found));
+    }
+
+    #[test]
+    fn up_starts_no_watcher_when_no_agent_announces_a_completion() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // Nothing ever appends to a channel no agent announces into, so a watcher
+        // here is a process per sandbox waiting forever on an event that cannot
+        // happen, and one more thing every teardown has to get right.
+        assert!(notify.provisioned().is_empty());
+    }
+
+    #[test]
+    fn up_warns_when_the_host_cannot_raise_a_notification() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(Capabilities { notify_send: None, ..ready_host() });
+        let config = config_declaring_a_channel();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        let warnings = command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // The user configured a completion signal and this host cannot raise one.
+        // Said nowhere, it becomes an agent that finished hours ago and a person
+        // who never came back to look.
+        assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn up_starts_no_watcher_when_the_host_cannot_raise_a_notification() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(Capabilities { notify_send: None, ..ready_host() });
+        let config = config_declaring_a_channel();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // A watcher whose sink cannot run is a process that wakes on every
+        // completion to fail, and the warning above already said what will not
+        // happen.
+        assert!(notify.provisioned().is_empty());
+    }
+
+    #[test]
+    fn up_warns_when_the_watcher_cannot_be_started() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = config_declaring_a_channel();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::failing_provision();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        let warnings = command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // A box whose channel is mounted and whose watcher never started looks
+        // exactly like one that works until the first completion is missed, so
+        // the failure has to be said on the way out.
+        assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn up_leaves_the_sandbox_standing_when_the_watcher_cannot_be_started() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = config_declaring_a_channel();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::failing_provision();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        let result = command.run(SandboxName::new("demo").unwrap(), None);
+
+        // This is the one step of a build that degrades. The costs are not
+        // symmetric: tearing the box down loses work nobody else has a copy of,
+        // and a mute channel loses a desktop popup.
+        assert!(result.is_ok());
+        assert!(runtime.teardowns().is_empty());
+    }
+
+    #[test]
     fn two_sandboxes_of_one_project_share_a_cache_dir() {
         let lock = FakeSandboxLock::free();
         let store = InMemoryMetadataStore::new();
@@ -1941,6 +2226,35 @@ mod tests {
             *trace.borrow(),
             vec!["network.teardown".to_string(), "runtime.teardown".to_string()]
         );
+    }
+
+    #[test]
+    fn up_stops_the_watcher_when_it_undoes_a_failed_build() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::failing_provision();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = config_declaring_a_channel();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        let result = command.run(SandboxName::new("demo").unwrap(), None);
+
+        // The undo is the teardown order truncated, so every step it carries needs
+        // an answer here as much as in `down`: this is the third place they are
+        // dispatched, and the one where an unanswered step is invisible, because
+        // the plan itself has a witness of its own and this arm does not.
+        assert!(result.is_err());
+        assert_eq!(notify.teardowns(), vec![SandboxName::new("demo").unwrap()]);
     }
 
     #[test]

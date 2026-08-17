@@ -169,13 +169,13 @@ impl RealDeps {
             worktrees: GitWorktreeProvider::new(adapters_dir.clone(), state_root.clone()),
             runtime: LibcontainerRuntime::new(runtime_root.clone()),
             sessions: NullRuntime,
-            network: PastaNetworkProvider::new(runtime_root),
+            network: PastaNetworkProvider::new(runtime_root.clone()),
             terminal: HostTerminal,
             clock: SystemClock,
             confirmer: StdinConfirmer,
             env: HostEnvironmentProbe,
             cache: FileCacheProvider::new(state_root.clone()),
-            notify: FileNotifyProvider::new(state_root.clone()),
+            notify: FileNotifyProvider::new(state_root.clone(), runtime_root.clone()),
             config: ConfigResolver::new(resolve_config_root()?, adapters_dir, host_home.clone()),
             state_root,
             project_dir,
@@ -307,6 +307,7 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<u8, HortError> {
                 &deps.runtime,
                 &deps.network,
                 &deps.worktrees,
+                &deps.notify,
             );
             command.run(name, force, std::io::stdin().is_terminal())?;
             Ok(HORT_SUCCEEDED)
@@ -322,6 +323,7 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<u8, HortError> {
                 &deps.runtime,
                 &deps.network,
                 &deps.cache,
+                &deps.notify,
                 deps.state_root.clone(),
             );
             let report = command.run(idle, force, std::io::stdin().is_terminal())?;

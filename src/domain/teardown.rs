@@ -13,7 +13,7 @@ use crate::domain::model::SandboxRecord;
 /// last.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TeardownStep {
-    /// Stop the host-side notify watcher. Present only when one was spawned.
+    /// Stop the host-side notify watcher.
     StopWatcher,
     /// Stop the host-side network helpers: pasta always, plus the egress proxy
     /// when allowlist mode spawned one.
@@ -32,10 +32,10 @@ pub enum TeardownStep {
 /// sequence as data, never executed here. Host-side helpers stop first, then the
 /// container, then the worktree (git mode only), then the metadata.
 pub fn teardown_plan(record: &SandboxRecord) -> Vec<TeardownStep> {
-    let mut plan = Vec::new();
-    if record.watcher_pid().is_some() {
-        plan.push(TeardownStep::StopWatcher);
-    }
+    // Which host-side helpers a sandbox actually left running is the providers'
+    // answer and not this one's, the way the network step already covers pasta
+    // alone and pasta with a proxy without the plan knowing which.
+    let mut plan = vec![TeardownStep::StopWatcher];
     plan.push(TeardownStep::StopNetwork);
     plan.push(TeardownStep::StopContainer);
     if record.branch().is_some() {
@@ -91,7 +91,7 @@ mod tests {
 
     #[test]
     fn teardown_plan_orders_helpers_before_container() {
-        let plan = teardown_plan(&git_record().with_watcher_pid(99));
+        let plan = teardown_plan(&git_record());
 
         let container = position(&plan, TeardownStep::StopContainer);
         assert!(position(&plan, TeardownStep::StopWatcher) < container);
@@ -125,11 +125,16 @@ mod tests {
     }
 
     #[test]
-    fn teardown_plan_skips_watcher_when_absent() {
-        let plan = teardown_plan(&git_record());
+    fn teardown_plan_stops_the_watcher_of_a_sandbox_that_never_had_one() {
+        let plan = teardown_plan(&no_git_record());
 
-        assert!(!plan.contains(&TeardownStep::StopWatcher));
-        assert!(plan.contains(&TeardownStep::StopNetwork));
+        // Which host-side helpers a sandbox left running is the providers' answer
+        // and not the plan's, exactly as the network step already covers pasta
+        // alone and pasta with a proxy without the plan knowing which. Stopping
+        // a watcher that was never started is not a failure, and a plan that
+        // decided this for itself would need a record that remembers a pid, which
+        // is precisely the state a restart makes meaningless.
+        assert!(plan.contains(&TeardownStep::StopWatcher));
     }
 
     #[test]
@@ -140,6 +145,9 @@ mod tests {
         // A failed build undoes what it started, never what holds work: the
         // worktree may carry changes from an earlier run, and the record is what
         // the next run reads to finish or clean this sandbox.
-        assert_eq!(plan, vec![TeardownStep::StopNetwork, TeardownStep::StopContainer]);
+        assert_eq!(
+            plan,
+            vec![TeardownStep::StopWatcher, TeardownStep::StopNetwork, TeardownStep::StopContainer]
+        );
     }
 }

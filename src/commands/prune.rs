@@ -31,7 +31,7 @@ use crate::domain::reconcile::{SandboxState, reconcile_all};
 use crate::domain::teardown::{TeardownStep, teardown_plan};
 use crate::ports::{
     CacheProvider, Clock, Confirmer, ContainerRegistry, ContainerRuntime, MetadataStore,
-    NetworkProvider, SessionProbe, WorktreeProvider,
+    NetworkProvider, NotifyProvider, SessionProbe, WorktreeProvider,
 };
 
 /// What a `prune` run removed and what it skipped, with the reason for each skip.
@@ -59,6 +59,7 @@ pub struct PruneCommand<'a> {
     runtime: &'a dyn ContainerRuntime,
     network: &'a dyn NetworkProvider,
     caches: &'a dyn CacheProvider,
+    notify: &'a dyn NotifyProvider,
     state_root: PathBuf,
 }
 
@@ -74,6 +75,7 @@ impl<'a> PruneCommand<'a> {
         runtime: &'a dyn ContainerRuntime,
         network: &'a dyn NetworkProvider,
         caches: &'a dyn CacheProvider,
+        notify: &'a dyn NotifyProvider,
         state_root: PathBuf,
     ) -> Self {
         Self {
@@ -86,6 +88,7 @@ impl<'a> PruneCommand<'a> {
             runtime,
             network,
             caches,
+            notify,
             state_root,
         }
     }
@@ -162,9 +165,7 @@ impl PruneCommand<'_> {
             };
             for step in teardown_plan(record) {
                 match step {
-                    // No watcher pid is persisted yet, so there is nothing to stop;
-                    // the watcher-stop seam lands with the notify watcher work.
-                    TeardownStep::StopWatcher => {}
+                    TeardownStep::StopWatcher => self.notify.teardown(name)?,
                     TeardownStep::StopNetwork => self.network.teardown(name)?,
                     TeardownStep::StopContainer => self.runtime.teardown(name)?,
                     TeardownStep::RemoveWorktree => self.worktrees.remove(name)?,
@@ -378,8 +379,9 @@ mod tests {
     };
     use crate::domain::prune::SkipReason;
     use crate::fakes::{
-        FakeCacheProvider, FakeConfirmer, FakeNetwork, FakeRegistry, FakeRuntime, FakeSessionProbe,
-        FakeWorktreeProvider, InMemoryMetadataStore, ScriptedClock, sample_record,
+        FakeCacheProvider, FakeConfirmer, FakeNetwork, FakeNotifyProvider, FakeRegistry,
+        FakeRuntime, FakeSessionProbe, FakeWorktreeProvider, InMemoryMetadataStore, ScriptedClock,
+        sample_record,
     };
 
     fn canned_token() -> LivenessToken {
@@ -401,6 +403,7 @@ mod tests {
         runtime: &'a FakeRuntime,
         network: &'a FakeNetwork,
         caches: &'a FakeCacheProvider,
+        notify: &'a FakeNotifyProvider,
     ) -> PruneCommand<'a> {
         PruneCommand {
             store,
@@ -412,6 +415,7 @@ mod tests {
             runtime,
             network,
             caches,
+            notify,
             state_root: state_root(),
         }
     }
@@ -429,9 +433,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         let report = command.run(None, true, false).unwrap();
@@ -459,9 +464,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token()).with_trace(trace.clone());
         let network = FakeNetwork::new().with_trace(trace.clone());
         let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         command.run(None, true, false).unwrap();
@@ -473,6 +479,34 @@ mod tests {
             "store.remove".to_string(),
         ];
         assert_eq!(*trace.borrow(), expected);
+    }
+
+    #[test]
+    fn prune_stops_the_watcher_of_every_sandbox_it_removes() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo")).unwrap();
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new().with_listed_worktree(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::no();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches, &notify,
+        );
+
+        command.run(None, true, false).unwrap();
+
+        // The plan is shared with `down`, the execution is not: this is a second
+        // place the steps are dispatched, and a step nobody answers here leaves a
+        // watcher of a collected sandbox running with nothing left to stop it,
+        // while every witness of the plan itself stays green.
+        assert_eq!(notify.teardowns(), vec![name]);
     }
 
     #[test]
@@ -491,9 +525,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token()).with_trace(trace.clone());
         let network = FakeNetwork::new().with_trace(trace.clone());
         let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         command.run(None, true, false).unwrap();
@@ -518,9 +553,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         let report = command.run(None, true, false).unwrap();
@@ -542,9 +578,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         let report = command.run(None, false, false).unwrap();
@@ -569,9 +606,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         command.run(None, false, true).unwrap();
@@ -595,9 +633,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         let result = command.run(None, false, false);
@@ -622,9 +661,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         command.run(None, true, false).unwrap();
@@ -648,9 +688,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token()).with_trace(trace.clone());
         let network = FakeNetwork::new().with_trace(trace.clone());
         let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         let report = command.run(None, false, true).unwrap();
@@ -672,9 +713,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         let report = command.run(None, false, false).unwrap();
@@ -698,9 +740,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         let report = command.run(None, false, false).unwrap();
@@ -726,9 +769,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         let report = command.run(None, false, false).unwrap();
@@ -756,9 +800,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         let report = command.run(None, false, true).unwrap();
@@ -786,9 +831,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         let report = command.run(None, false, true).unwrap();
@@ -812,9 +858,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         command.run(None, false, true).unwrap();
@@ -851,9 +898,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         command.run(None, false, true).unwrap();
@@ -874,9 +922,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         command.run(None, false, false).unwrap();
@@ -909,9 +958,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         command.run(Some(Duration::from_secs(1800)), true, false).unwrap();
@@ -970,9 +1020,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new().with_stored_key(GONE_CACHE_KEY);
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         command.run(None, true, false).unwrap();
@@ -994,9 +1045,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new().with_stored_key(GONE_CACHE_KEY);
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         let report = command.run(None, true, false).unwrap();
@@ -1017,9 +1069,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new().with_stored_key(GONE_CACHE_KEY);
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         command.run(None, false, true).unwrap();
@@ -1041,9 +1094,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new().with_stored_key(GONE_CACHE_KEY);
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         command.run(None, false, true).unwrap();
@@ -1066,9 +1120,10 @@ mod tests {
         let caches = FakeCacheProvider::new()
             .with_stored_key(LIVE_CACHE_KEY)
             .with_live_project(Path::new(LIVE_PROJECT));
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         let report = command.run(None, false, true).unwrap();
@@ -1096,9 +1151,10 @@ mod tests {
         // under hort's state, and removing what you did not write is the
         // expensive way to be wrong.
         let caches = FakeCacheProvider::new().with_stored_key("scratch");
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         let report = command.run(None, false, true).unwrap();
@@ -1121,9 +1177,10 @@ mod tests {
         let caches = FakeCacheProvider::new()
             .with_stored_key(LIVE_CACHE_KEY)
             .with_failing_project_probe(Path::new(LIVE_PROJECT));
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         let report = command.run(None, false, true).unwrap();
@@ -1153,9 +1210,10 @@ mod tests {
         let network = FakeNetwork::new().with_trace(trace.clone());
         let caches =
             FakeCacheProvider::new().with_stored_key(GONE_CACHE_KEY).with_trace(trace.clone());
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         command.run(None, true, false).unwrap();
@@ -1193,9 +1251,10 @@ mod tests {
         let caches = FakeCacheProvider::new()
             .with_stored_key(LIVE_CACHE_KEY)
             .with_live_project(Path::new(LIVE_PROJECT));
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         let report = command.run(None, true, false).unwrap();
@@ -1225,9 +1284,10 @@ mod tests {
         let caches = FakeCacheProvider::new()
             .with_stored_key(LIVE_CACHE_KEY)
             .with_live_project(Path::new(LIVE_PROJECT));
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         let report = command.run(None, true, false).unwrap();
@@ -1255,9 +1315,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new().with_stored_key(GONE_CACHE_KEY);
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         let report = command.run(None, true, false).unwrap();
@@ -1285,9 +1346,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new().with_stored_key(GONE_CACHE_KEY);
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         let report = command.run(None, true, false).unwrap();
@@ -1315,9 +1377,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new().with_stored_key(GONE_CACHE_KEY);
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         command.run(None, false, true).unwrap();
@@ -1341,9 +1404,10 @@ mod tests {
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new().with_stored_key(GONE_CACHE_KEY);
+        let notify = FakeNotifyProvider::new();
         let command = prune_command(
             &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches,
+            &caches, &notify,
         );
 
         command.run(None, false, true).unwrap();

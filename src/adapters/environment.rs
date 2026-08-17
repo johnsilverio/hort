@@ -59,7 +59,7 @@ impl EnvironmentProbe for HostEnvironmentProbe {
             cgroup: delegated_controllers(&read_cgroup_controllers()),
             landlock_abi: landlock_abi(),
             overlayfs_rootless: overlayfs_rootless(&read_or_empty(PROC_FILESYSTEMS), user_ns),
-            notify_send: find_on_path("notify-send", &path_var).is_some(),
+            notify_send: find_on_path("notify-send", &path_var),
             git: find_on_path("git", &path_var).is_some(),
         }
     }

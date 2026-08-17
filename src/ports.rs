@@ -179,6 +179,15 @@ pub trait NotifyProvider {
     /// with its host path. A bind whose source is missing takes the whole
     /// container down, so this happens before the sandbox is built.
     fn ensure(&self, name: &SandboxName) -> Result<PathBuf, HortError>;
+    /// Start the host-side watcher of this sandbox's channel, the process that
+    /// turns a completion written inside the box into a notification on the
+    /// host. It is the fourth of the host-side helpers a sandbox leaves running,
+    /// so it is recognized and stopped the way the others are.
+    fn provision(&self, spec: &NotifySpec) -> Result<(), HortError>;
+    /// Stop this sandbox's watcher. Idempotent: a sandbox that never had one is
+    /// already in the state this asks for, which is what lets the teardown plan
+    /// carry the step unconditionally.
+    fn teardown(&self, name: &SandboxName) -> Result<(), HortError>;
 }
 
 /// Serializes the build of a single sandbox name so two concurrent `up`
@@ -199,6 +208,23 @@ pub trait SandboxLock {
 /// rendered, so the sink only delivers it.
 pub trait Notifier {
     fn notify(&self, message: &str) -> Result<(), HortError>;
+}
+
+/// The channel an agent's completion hook appends to, as the host-side watcher
+/// reads it: append detection and nothing more.
+///
+/// It never parses the event line. What a completion says about itself has no
+/// consumer, because the message the sink raises is a template over the sandbox
+/// name, so a parse here would be production nothing reads.
+pub trait NotifyWatcher {
+    /// Wait until the channel is appended to, answering `true` for an append and
+    /// `false` once the channel is gone.
+    ///
+    /// The channel going away is a real state and not an error: `down` removes
+    /// the sandbox's own directory out from under a watcher that has to leave
+    /// rather than spin. It borrows mutably because reading events borrows the
+    /// buffer they are read into, which the watcher owns.
+    fn wait_for_append(&mut self) -> Result<bool, HortError>;
 }
 
 /// Asks the user to confirm a destructive action; only `down` and `prune` use it.
@@ -385,4 +411,21 @@ pub struct NetworkSpec {
 pub struct DbForward {
     pub host: String,
     pub port: u16,
+}
+
+/// Everything the host-side watcher of one sandbox needs: which sandbox it
+/// belongs to, the channel directory it observes, the message it raises, and the
+/// program that raises it.
+///
+/// The whole world of that process travels here because the process is forked and
+/// then outlives the call, so anything it is not handed it can never ask for. The
+/// sink is a resolved path rather than a program name on purpose: the
+/// notification runs the binary the host probe found, instead of whatever the
+/// search path answers with later, and it is what gives the probe's answer a
+/// reader at all.
+pub struct NotifySpec {
+    pub name: SandboxName,
+    pub events_dir: PathBuf,
+    pub message: String,
+    pub sink: PathBuf,
 }

@@ -22,6 +22,7 @@ privileged-tests = []
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
 humantime = "2.3.0"
+inotify = { version = "0.11.5", default-features = false }
 json-strip-comments = "3.1.1"
 landlock = "0.4.7"
 libc = "0.2.189"
@@ -37,7 +38,6 @@ tls-parser = "0.12.2"
 # usually the wrong one.
 #
 # libcgroups = "0.7.0"     # read a sandbox's process list from its cgroup (the session probe)
-# inotify = "0.11.2"       # watch the notify directory for agent completion events
 # dialoguer = "0.12.0"     # the first-run configuration prompts, nothing else
 
 [dev-dependencies]

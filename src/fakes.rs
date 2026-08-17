@@ -21,8 +21,9 @@ use crate::domain::preconditions::{ConfiguredShell, RootfsFacts};
 use crate::ports::{
     CacheProvider, Clock, Confirmer, ContainerRegistry, ContainerRuntime, CorruptEntry, DbForward,
     EnvironmentProbe, LivenessProbe, MetadataStore, NetworkProvider, NetworkSpec, Notifier,
-    NotifyProvider, OciSpec, ProxyEndpoint, RegistryEntry, ResourceLimits, SandboxFile,
-    SandboxLock, SandboxMount, Session, SessionProbe, SessionSpec, Worktree, WorktreeProvider,
+    NotifyProvider, NotifySpec, NotifyWatcher, OciSpec, ProxyEndpoint, RegistryEntry,
+    ResourceLimits, SandboxFile, SandboxLock, SandboxMount, Session, SessionProbe, SessionSpec,
+    Worktree, WorktreeProvider,
 };
 
 /// The shared teardown-order witness threaded through the fakes that perform a
@@ -436,11 +437,18 @@ impl LivenessProbe for ScriptedLivenessProbe {
 #[derive(Default)]
 pub struct RecordingNotifier {
     messages: RefCell<Vec<String>>,
+    fails: bool,
 }
 
 impl RecordingNotifier {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A sink that records what it was asked to raise and reports that it could
+    /// not: the host with no desktop session listening.
+    pub fn failing() -> Self {
+        Self { fails: true, ..Self::default() }
     }
 
     pub fn messages(&self) -> Vec<String> {
@@ -451,7 +459,47 @@ impl RecordingNotifier {
 impl Notifier for RecordingNotifier {
     fn notify(&self, message: &str) -> Result<(), HortError> {
         self.messages.borrow_mut().push(message.to_owned());
+        if self.fails {
+            // An unasserted stand-in error, like the scripted network failures:
+            // what a test watches here is what the caller does next.
+            return Err(HortError::StateIo {
+                detail: "fake notifier: scripted to fail".to_string(),
+            });
+        }
         Ok(())
+    }
+}
+
+/// Answers each wait with a scripted verdict, watching nothing: `appends` of them
+/// are appends, and every one after that is the channel being gone.
+///
+/// The channel running out is what a real one does when the sandbox goes down, so
+/// a glue that ignores its own exit condition still ends here instead of hanging
+/// the suite.
+pub struct ScriptedNotifyWatcher {
+    appends: usize,
+}
+
+impl ScriptedNotifyWatcher {
+    /// A channel appended to this many times before it goes away.
+    pub fn appending(appends: usize) -> Self {
+        Self { appends }
+    }
+
+    /// A channel that is already gone, which is what a watcher finds after the
+    /// sandbox it belongs to was torn down.
+    pub fn gone() -> Self {
+        Self { appends: 0 }
+    }
+}
+
+impl NotifyWatcher for ScriptedNotifyWatcher {
+    fn wait_for_append(&mut self) -> Result<bool, HortError> {
+        if self.appends == 0 {
+            return Ok(false);
+        }
+        self.appends -= 1;
+        Ok(true)
     }
 }
 
@@ -843,11 +891,27 @@ impl CacheProvider for FakeCacheProvider {
 #[derive(Default)]
 pub struct FakeNotifyProvider {
     ensured: RefCell<Vec<SandboxName>>,
+    provisioned: RefCell<Vec<NotifySpec>>,
+    teardowns: RefCell<Vec<SandboxName>>,
+    provision_fails: bool,
+    trace: Option<TeardownTrace>,
 }
 
 impl FakeNotifyProvider {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A provider whose watcher cannot be started, the one step of a build that
+    /// degrades instead of failing.
+    pub fn failing_provision() -> Self {
+        Self { provision_fails: true, ..Self::default() }
+    }
+
+    /// Record the `notify.teardown` step on the shared teardown trace.
+    pub fn with_trace(mut self, trace: TeardownTrace) -> Self {
+        self.trace = Some(trace);
+        self
     }
 
     /// The host path this fake answers with for `name`.
@@ -859,12 +923,62 @@ impl FakeNotifyProvider {
     pub fn ensured(&self) -> Vec<SandboxName> {
         self.ensured.borrow().clone()
     }
+
+    /// Every sandbox it was asked to start a watcher for, in order.
+    pub fn provisioned(&self) -> Vec<SandboxName> {
+        self.provisioned.borrow().iter().map(|spec| spec.name.clone()).collect()
+    }
+
+    /// The channel directory the watcher provisioned last was pointed at.
+    pub fn provisioned_channel(&self) -> Option<PathBuf> {
+        self.provisioned.borrow().last().map(|spec| spec.events_dir.clone())
+    }
+
+    /// The message the watcher provisioned last raises.
+    pub fn provisioned_message(&self) -> Option<String> {
+        self.provisioned.borrow().last().map(|spec| spec.message.clone())
+    }
+
+    /// The program the watcher provisioned last raises it through.
+    pub fn provisioned_sink(&self) -> Option<PathBuf> {
+        self.provisioned.borrow().last().map(|spec| spec.sink.clone())
+    }
+
+    /// Every sandbox whose watcher it was asked to stop, in order.
+    pub fn teardowns(&self) -> Vec<SandboxName> {
+        self.teardowns.borrow().clone()
+    }
 }
 
 impl NotifyProvider for FakeNotifyProvider {
     fn ensure(&self, name: &SandboxName) -> Result<PathBuf, HortError> {
         self.ensured.borrow_mut().push(name.clone());
         Ok(Self::channel_of(name))
+    }
+
+    fn provision(&self, spec: &NotifySpec) -> Result<(), HortError> {
+        self.provisioned.borrow_mut().push(NotifySpec {
+            name: spec.name.clone(),
+            events_dir: spec.events_dir.clone(),
+            message: spec.message.clone(),
+            sink: spec.sink.clone(),
+        });
+        if self.provision_fails {
+            // An unasserted stand-in error, like the scripted network failure:
+            // what a test watches here is that the sandbox is still standing.
+            return Err(HortError::StateIo {
+                detail: "fake notify: provision scripted to fail".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn teardown(&self, name: &SandboxName) -> Result<(), HortError> {
+        self.teardowns.borrow_mut().push(name.clone());
+        if let Some(trace) = &self.trace {
+            trace.borrow_mut().push("notify.teardown".to_string());
+        }
+        Ok(())
     }
 }
 

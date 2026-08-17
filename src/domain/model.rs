@@ -166,7 +166,6 @@ pub struct SandboxRecord {
     created_at: String,
     last_attach_at: String,
     notify_channel: Option<String>,
-    watcher_pid: Option<u32>,
     token: Option<LivenessToken>,
     project_path: Option<PathBuf>,
 }
@@ -202,7 +201,6 @@ impl SandboxRecord {
             created_at,
             last_attach_at,
             notify_channel,
-            watcher_pid: None,
             token: None,
             project_path: Some(project_path),
         }
@@ -218,13 +216,6 @@ impl SandboxRecord {
     /// to persist. Everything else the record holds is carried over.
     pub fn with_last_attach_at(self, at: String) -> Self {
         Self { last_attach_at: at, ..self }
-    }
-
-    /// Record the PID of the host-side notify watcher `up` spawned, returning the
-    /// updated record to persist. A record carries one only when a notify channel
-    /// is configured, so its presence is what later marks a watcher to stop.
-    pub fn with_watcher_pid(self, pid: u32) -> Self {
-        Self { watcher_pid: Some(pid), ..self }
     }
 
     /// The sandbox identity this record belongs to.
@@ -265,12 +256,6 @@ impl SandboxRecord {
         self.notify_channel.as_deref()
     }
 
-    /// The PID of the host-side notify watcher, or `None` when no notify channel
-    /// is configured and none was spawned.
-    pub fn watcher_pid(&self) -> Option<u32> {
-        self.watcher_pid
-    }
-
     /// The kernel liveness token, or `None` before the anchor has started.
     pub fn liveness_token(&self) -> Option<LivenessToken> {
         self.token
@@ -292,7 +277,10 @@ pub struct Capabilities {
     pub cgroup: CgroupCaps,
     pub landlock_abi: Option<u8>,
     pub overlayfs_rootless: bool,
-    pub notify_send: bool,
+    /// The program a desktop notification is raised through. A path and not a
+    /// flag, because the sink has to run it, and running the one the probe found
+    /// is what keeps the answer from changing under hort later.
+    pub notify_send: Option<PathBuf>,
     pub git: bool,
 }
 

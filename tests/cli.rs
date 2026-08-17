@@ -13,13 +13,16 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as GitCommand;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use hort::adapters::metadata::FileMetadataStore;
+use hort::adapters::notify::FileNotifyProvider;
 use hort::adapters::pasta::PastaNetworkProvider;
 use hort::adapters::runtime::LibcontainerRuntime;
 use hort::domain::model::SandboxName;
-use hort::ports::{ContainerRuntime, MetadataStore, NetworkProvider};
+use hort::ports::{ContainerRuntime, MetadataStore, NetworkProvider, NotifyProvider};
 use predicates::prelude::*;
 use tempfile::TempDir;
 
@@ -226,6 +229,8 @@ impl Drop for ScratchSandbox {
         // Nothing here may fail loudly: a panic raised while a test is already
         // unwinding aborts the process and takes the failed assertion with it.
         let runtime_root = self.runtime_root();
+        let _ =
+            FileNotifyProvider::new(self.state_root(), runtime_root.clone()).teardown(&self.name);
         let _ = PastaNetworkProvider::new(runtime_root.clone()).teardown(&self.name);
         let _ = LibcontainerRuntime::new(runtime_root).teardown(&self.name);
         take_back_traversal(self.state_home());
@@ -849,6 +854,163 @@ fn cli_a_session_writes_a_completion_into_the_channel_on_the_host() {
         .args(["down", sandbox.name().as_str()])
         .assert()
         .success();
+}
+
+/// A throwaway directory holding a stand-in for the host's desktop notification
+/// program, plus the file it records into. Returned with its canonicalized path;
+/// the `TempDir` guard must outlive the sandbox that raises through it.
+///
+/// It carries the real program's name, because what hort raises a notification
+/// through is what it found on the search path, and this directory goes in front
+/// of it.
+fn temp_notify_sink() -> (TempDir, PathBuf) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().canonicalize().unwrap();
+    let program = path.join("notify-send");
+    let recording = path.join("raised");
+    fs::write(&program, format!("#!/bin/sh\necho \"$@\" >> {}\n", recording.display())).unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    (dir, path)
+}
+
+/// The search path a sandbox is built with when `first` has to be found before
+/// anything the host installed.
+fn path_led_by(first: &Path) -> String {
+    format!("{}:{}", first.display(), std::env::var("PATH").unwrap_or_default())
+}
+
+/// Whether `recording` comes to hold `expected` before the deadline runs out.
+///
+/// The watcher raises on its own time: the append happens inside the box, the
+/// kernel wakes a host process about it, and that process runs a program. None of
+/// that is finished when the command that made the sandbox returns.
+fn raised_within_deadline(recording: &Path, expected: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if fs::read_to_string(recording).is_ok_and(|raised| raised.contains(expected)) {
+            return true;
+        }
+        sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+/// Whether the process at `pid` is still the sandbox's watcher, asked the way the
+/// teardown itself asks it.
+///
+/// A pid outlives the process it named, so the question is never "is something
+/// there" but "is this still the helper that was recorded". A witness that invents
+/// a second way to ask can drift from the one the code uses, and this family has
+/// already produced one that could not tell a dead process from a live one.
+fn names_the_watcher(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|name| name.trim() == "hort-watcher")
+}
+
+fn stopped_being_the_watcher_within_deadline(pid: u32) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if !names_the_watcher(pid) {
+            return true;
+        }
+        sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_a_completion_inside_the_box_is_raised_on_the_host() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(
+        r#"{{ "rootfs": "{rootfs}", "agents": [{{ "command": "claude", "notify": {{ "stopHook": true }} }}] }}"#
+    ));
+    let (_repo, repo_path) = temp_git_repo();
+    let (_sink, sink_dir) = temp_notify_sink();
+    // Declared after everything it raises through, so the guard stops the watcher
+    // while the program that watcher runs is still on the machine.
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .env("PATH", path_led_by(&sink_dir))
+        .current_dir(&repo_path)
+        .args(["up", sandbox.name().as_str()])
+        .write_stdin("echo '{\"event\":\"stop\"}' >> /run/hort/notify/events.jsonl\n")
+        .assert()
+        .success();
+
+    // The whole chain in one assertion, and it is the only test that can tell
+    // every layer being right from every layer being right with the crossing
+    // broken: an agent finishing inside a box that cannot reach the host, the
+    // append landing in a directory shared with it, the kernel waking a host
+    // process about that directory, and that process raising a message naming the
+    // sandbox through the program the host has for it. Each of those five is
+    // settled somewhere else, and only a real run puts them in one line.
+    assert!(raised_within_deadline(&sink_dir.join("raised"), sandbox.name().as_str()));
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .env("PATH", path_led_by(&sink_dir))
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_the_runtime_root_holds_the_watcher_pid_file_until_the_sandbox_goes_down() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(
+        r#"{{ "rootfs": "{rootfs}", "agents": [{{ "command": "claude", "notify": {{ "stopHook": true }} }}] }}"#
+    ));
+    let (_repo, repo_path) = temp_git_repo();
+    let (_sink, sink_dir) = temp_notify_sink();
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .env("PATH", path_led_by(&sink_dir))
+        .current_dir(&repo_path)
+        .args(["up", "-d", sandbox.name().as_str()])
+        .assert()
+        .success();
+
+    // Read before the teardown, because the teardown takes the file with it. The
+    // watcher is the fourth host-side process of this family and it is recorded
+    // the way the other three are: beside them, under the root a restart empties,
+    // and recognizable in the process table before anything signals it.
+    let pid_file = sandbox.sandbox_dir().join("watcher.pid");
+    let recorded = fs::read_to_string(&pid_file).expect("up records the watcher it started");
+    let pid: u32 = recorded.trim().parse().expect("the recorded watcher is a pid");
+    assert!(names_the_watcher(pid));
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .env("PATH", path_led_by(&sink_dir))
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+
+    // Both halves, because either one alone is satisfied by a teardown that did
+    // half the job: a removed record with the process still holding the channel of
+    // a sandbox that no longer exists, or a stopped process with a pid file that
+    // outlives it and names a stranger on the next boot.
+    assert!(!pid_file.exists());
+    assert!(stopped_being_the_watcher_within_deadline(pid));
 }
 
 #[test]
