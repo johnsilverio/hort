@@ -153,7 +153,7 @@ impl fmt::Display for HortError {
             ),
             HortError::BranchExists { name } => write!(
                 f,
-                "branch '{name}' already exists; choose another name or use --branch to target an existing branch"
+                "branch '{name}' already exists; run 'hort up {name} --branch {name}' to reuse it, or choose another name"
             ),
             HortError::BranchCheckedOut { branch } => {
                 write!(f, "branch '{branch}' is already checked out in another worktree")
@@ -247,12 +247,12 @@ mod tests {
     }
 
     #[test]
-    fn branch_exists_error_renders_canonical_string() {
+    fn branch_exists_error_carries_the_ready_made_command() {
         let error = HortError::BranchExists { name: "demo".to_string() };
 
         assert_eq!(
             error.to_string(),
-            "branch 'demo' already exists; choose another name or use --branch to target an existing branch"
+            "branch 'demo' already exists; run 'hort up demo --branch demo' to reuse it, or choose another name"
         );
     }
 
