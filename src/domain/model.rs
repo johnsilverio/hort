@@ -259,6 +259,12 @@ impl SandboxRecord {
         &self.last_attach_at
     }
 
+    /// The sink a completion is raised on, or `None` when no configured agent
+    /// declares a channel and nothing raises one.
+    pub fn notify_channel(&self) -> Option<&str> {
+        self.notify_channel.as_deref()
+    }
+
     /// The PID of the host-side notify watcher, or `None` when no notify channel
     /// is configured and none was spawned.
     pub fn watcher_pid(&self) -> Option<u32> {

@@ -808,6 +808,94 @@ fn cli_a_declared_cache_dir_survives_the_sandbox_that_wrote_it() {
 
 #[test]
 #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_a_session_writes_a_completion_into_the_channel_on_the_host() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(
+        r#"{{ "rootfs": "{rootfs}", "agents": [{{ "command": "claude", "notify": {{ "stopHook": true }} }}] }}"#
+    ));
+    let (_repo, repo_path) = temp_git_repo();
+    // Declared after the fixtures it depends on, so it is the first of them to
+    // go: the guard takes the sandbox down, and a container still standing over a
+    // directory another guard has already removed is the failure the shutdown
+    // order exists to prevent.
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", sandbox.name().as_str()])
+        .write_stdin("echo finished >> /run/hort/notify/events.jsonl\n")
+        .assert()
+        .success();
+
+    // Read while the sandbox is still up, because `down` takes the channel away
+    // with the rest of what remembers the sandbox. This is the crossing the whole
+    // mechanism exists for: the hook runs inside a box that cannot reach the
+    // host, and the only reason the host ever hears about a completion is that
+    // this one directory is the same directory on both sides. Every layer of it
+    // can be right on its own with the crossing broken.
+    let events = sandbox.state_dir().join("notify").join("events.jsonl");
+    assert_eq!(fs::read_to_string(&events).ok().as_deref(), Some("finished\n"));
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_a_session_sees_the_dropped_hook_beside_what_only_the_base_carries() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(
+        r#"{{ "rootfs": "{rootfs}", "agents": [{{ "command": "claude", "notify": {{ "stopHook": true }} }}] }}"#
+    ));
+    let (_repo, repo_path) = temp_git_repo();
+    // Declared last for the reason the type's own documentation gives: it has to
+    // fall before the fixtures whose directories the container holds.
+    let sandbox = ScratchSandbox::new();
+
+    // Writing the drop-in means writing into `/etc` of the sandbox's own layer,
+    // and that only works if the merge shows a directory living in both layers as
+    // the union of the two. It is the expected behavior and hort leans on it
+    // elsewhere, but if it shadows instead, the box's `/etc` becomes the one file
+    // hort wrote and the whole base configuration disappears: no shell config, no
+    // certificates, no users. Nothing in a suite that never boots a container can
+    // see that, and the failure looks like the agent misbehaving.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", sandbox.name().as_str()])
+        .write_stdin("cat /etc/claude-code/managed-settings.d/hort-notify.json /etc/passwd\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#""Stop""#))
+        .stdout(predicate::str::contains("root:"));
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
 fn cli_down_without_git_leaves_the_project_folder() {
     let Some(rootfs) = prepared_rootfs() else { return };
     let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));

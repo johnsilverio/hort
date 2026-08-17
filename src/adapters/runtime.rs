@@ -71,7 +71,7 @@ use crate::domain::model::{AnchorPid, LivenessToken, MountNsInode, SandboxName};
 use crate::domain::mounts::{SANDBOX_HOME, WORKDIR};
 use crate::ports::{
     ContainerRegistry, ContainerRuntime, MountAccess, OciSpec, RegistryEntry, ResourceLimits,
-    SandboxMount, Session, SessionProbe, SessionSpec,
+    SandboxFile, SandboxMount, Session, SessionProbe, SessionSpec,
 };
 
 const SANDBOXES_DIR: &str = "sandboxes";
@@ -203,6 +203,9 @@ impl LibcontainerRuntime {
         }
 
         detach_mount_propagation()?;
+        // Before the merge and not after it: a write into a layer the merge is
+        // already assembled from is not guaranteed to show through it.
+        write_drop_ins(&spec.overlay, &spec.drop_ins)?;
         mount_merged_root(spec)?;
         let bundle = self.bundle_dir(&spec.name);
         write_bundle_config(&bundle, &anchor_spec(spec))?;
@@ -503,6 +506,31 @@ fn c_path(path: &Path) -> Result<CString, String> {
 
 fn c_string(value: &str) -> Result<CString, String> {
     CString::new(value).map_err(|err| format!("{value} is not a usable option: {err}"))
+}
+
+/// Put the files the sandbox is given into its own writable layer, making the
+/// directories they sit in.
+///
+/// They go into the layer rather than into the merged root because a bind mount
+/// cannot reach these paths: the directories they sit in exist in no prepared
+/// rootfs, and a bind creates no parent. Writing into the layer the merged root
+/// is assembled from leaves the base untouched and the file visible inside the
+/// box.
+fn write_drop_ins(overlay: &Path, files: &[SandboxFile]) -> Result<(), String> {
+    let upper = overlay.join(UPPER_LAYER);
+    for file in files {
+        // The leading separator has to go: joining an absolute path onto another
+        // keeps only the absolute one, which would put the file on the host's own
+        // /etc instead of the sandbox's.
+        let landing = upper.join(file.path.strip_prefix("/").unwrap_or(&file.path));
+        if let Some(directory) = landing.parent() {
+            fs::create_dir_all(directory)
+                .map_err(|err| format!("creating {}: {err}", directory.display()))?;
+        }
+        fs::write(&landing, &file.content)
+            .map_err(|err| format!("writing {}: {err}", landing.display()))?;
+    }
+    Ok(())
 }
 
 fn write_bundle_config(bundle: &Path, spec: &Spec) -> Result<(), String> {
@@ -1083,6 +1111,7 @@ mod tests {
                 ("HORT_WORKTREE".to_string(), "/state/sandboxes/demo/worktree-demo".to_string()),
             ],
             mounts: Vec::new(),
+            drop_ins: Vec::new(),
             resources: None,
         }
     }
@@ -1658,6 +1687,30 @@ mod tests {
         // Nothing has run yet: the root is created by the first build, and every
         // command that reconciles asks this before then.
         assert!(live.is_empty());
+    }
+
+    #[test]
+    fn a_drop_in_lands_in_the_writable_layer_at_its_container_path() {
+        let overlay = tempfile::tempdir().unwrap();
+        let settings = SandboxFile {
+            path: PathBuf::from("/etc/claude-code/managed-settings.d/hort-notify.json"),
+            content: "{\"hooks\":{}}".to_string(),
+        };
+
+        write_drop_ins(overlay.path(), std::slice::from_ref(&settings)).unwrap();
+
+        // A container path is absolute, and joining an absolute path onto another
+        // discards the first: written that way the file lands on the host's own
+        // /etc, where it either fails for want of permission or, on a machine
+        // that grants it, edits the settings of the person running hort. Neither
+        // needs a kernel to catch, which is why this is asked here rather than
+        // from inside a real box. The parents come with it because none of them
+        // exists in any prepared rootfs.
+        let landed = overlay
+            .path()
+            .join("upper")
+            .join("etc/claude-code/managed-settings.d/hort-notify.json");
+        assert_eq!(fs::read_to_string(landed).ok().as_deref(), Some("{\"hooks\":{}}"));
     }
 }
 

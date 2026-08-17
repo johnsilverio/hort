@@ -9,6 +9,7 @@ pub mod error;
 pub mod idle;
 pub mod model;
 pub mod mounts;
+pub mod notify;
 pub mod onboarding;
 pub mod policy;
 pub mod preconditions;

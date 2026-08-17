@@ -25,6 +25,7 @@ use crate::adapters::environment::HostEnvironmentProbe;
 use crate::adapters::liveness::ProcLivenessProbe;
 use crate::adapters::lock::FlockSandboxLock;
 use crate::adapters::metadata::FileMetadataStore;
+use crate::adapters::notify::FileNotifyProvider;
 use crate::adapters::pasta::PastaNetworkProvider;
 use crate::adapters::runtime::{LibcontainerRuntime, NullRuntime};
 use crate::adapters::terminal::HostTerminal;
@@ -108,6 +109,7 @@ pub struct RealDeps {
     confirmer: StdinConfirmer,
     env: HostEnvironmentProbe,
     cache: FileCacheProvider,
+    notify: FileNotifyProvider,
     config: ConfigResolver,
     /// Kept so `prune` can derive a corrupt entry's canonical worktree path,
     /// which has no record to read it from.
@@ -173,6 +175,7 @@ impl RealDeps {
             confirmer: StdinConfirmer,
             env: HostEnvironmentProbe,
             cache: FileCacheProvider::new(state_root.clone()),
+            notify: FileNotifyProvider::new(state_root.clone()),
             config: ConfigResolver::new(resolve_config_root()?, adapters_dir, host_home.clone()),
             state_root,
             project_dir,
@@ -260,6 +263,7 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<u8, HortError> {
                 &deps.clock,
                 &deps.env,
                 &deps.cache,
+                &deps.notify,
                 deps.state_root.clone(),
                 deps.project_dir.clone(),
                 deps.current_dir.clone(),

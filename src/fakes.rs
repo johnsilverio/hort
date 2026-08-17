@@ -21,8 +21,8 @@ use crate::domain::preconditions::{ConfiguredShell, RootfsFacts};
 use crate::ports::{
     CacheProvider, Clock, Confirmer, ContainerRegistry, ContainerRuntime, CorruptEntry, DbForward,
     EnvironmentProbe, LivenessProbe, MetadataStore, NetworkProvider, NetworkSpec, Notifier,
-    OciSpec, ProxyEndpoint, RegistryEntry, ResourceLimits, SandboxLock, SandboxMount, Session,
-    SessionProbe, SessionSpec, Worktree, WorktreeProvider,
+    NotifyProvider, OciSpec, ProxyEndpoint, RegistryEntry, ResourceLimits, SandboxFile,
+    SandboxLock, SandboxMount, Session, SessionProbe, SessionSpec, Worktree, WorktreeProvider,
 };
 
 /// The shared teardown-order witness threaded through the fakes that perform a
@@ -121,6 +121,7 @@ pub struct FakeRuntime {
     started_rootfs: RefCell<PathBuf>,
     started_workdir: RefCell<PathBuf>,
     started_mounts: RefCell<Vec<SandboxMount>>,
+    started_drop_ins: RefCell<Vec<SandboxFile>>,
     started_resources: RefCell<Option<ResourceLimits>>,
     sessions: RefCell<Vec<SessionSpec>>,
     teardowns: RefCell<Vec<SandboxName>>,
@@ -139,6 +140,7 @@ impl FakeRuntime {
             started_rootfs: RefCell::new(PathBuf::new()),
             started_workdir: RefCell::new(PathBuf::new()),
             started_mounts: RefCell::new(Vec::new()),
+            started_drop_ins: RefCell::new(Vec::new()),
             started_resources: RefCell::new(None),
             sessions: RefCell::new(Vec::new()),
             teardowns: RefCell::new(Vec::new()),
@@ -179,6 +181,12 @@ impl FakeRuntime {
     /// the sandbox, in order.
     pub fn started_mounts(&self) -> Vec<SandboxMount> {
         self.started_mounts.borrow().clone()
+    }
+
+    /// The files the spec the last `start_anchor` was handed asks to be written
+    /// into the sandbox, in order.
+    pub fn started_drop_ins(&self) -> Vec<SandboxFile> {
+        self.started_drop_ins.borrow().clone()
     }
 
     /// The memory ceiling of the spec the last `start_anchor` was handed.
@@ -227,6 +235,7 @@ impl ContainerRuntime for FakeRuntime {
         self.started_rootfs.borrow_mut().clone_from(&spec.rootfs);
         self.started_workdir.borrow_mut().clone_from(&spec.workdir);
         self.started_mounts.borrow_mut().clone_from(&spec.mounts);
+        self.started_drop_ins.borrow_mut().clone_from(&spec.drop_ins);
         *self.started_resources.borrow_mut() = spec
             .resources
             .as_ref()
@@ -821,6 +830,41 @@ impl CacheProvider for FakeCacheProvider {
         }
         self.removed.borrow_mut().push(key.to_string());
         Ok(())
+    }
+}
+
+/// Remembers the sandboxes it was asked to make a completion channel for, making
+/// nothing, and answers with a path nothing else could have arrived at.
+///
+/// The address is deliberately unlike the layout the real provider uses. What the
+/// channel's layout is belongs to this port, so a caller that derived the path
+/// itself would agree with a fake that derived it the same way, and the two
+/// copies would drift apart with every test still green.
+#[derive(Default)]
+pub struct FakeNotifyProvider {
+    ensured: RefCell<Vec<SandboxName>>,
+}
+
+impl FakeNotifyProvider {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The host path this fake answers with for `name`.
+    pub fn channel_of(name: &SandboxName) -> PathBuf {
+        PathBuf::from(format!("/channel-only-the-provider-knows/{}", name.as_str()))
+    }
+
+    /// Every sandbox it was asked to make a channel for, in order.
+    pub fn ensured(&self) -> Vec<SandboxName> {
+        self.ensured.borrow().clone()
+    }
+}
+
+impl NotifyProvider for FakeNotifyProvider {
+    fn ensure(&self, name: &SandboxName) -> Result<PathBuf, HortError> {
+        self.ensured.borrow_mut().push(name.clone());
+        Ok(Self::channel_of(name))
     }
 }
 

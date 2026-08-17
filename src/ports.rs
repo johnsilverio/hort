@@ -167,6 +167,20 @@ pub trait CacheProvider {
     fn remove(&self, key: &str) -> Result<(), HortError>;
 }
 
+/// The per-sandbox directory an agent's completion hook writes its events into.
+///
+/// The channel's layout belongs here, and the host path is handed back rather
+/// than derived again by the caller: the watcher that reads the same directory
+/// needs the same answer, and two derivations of one path drift apart in silence.
+/// It is a port of its own rather than a directory the record store makes on the
+/// side, because that store's contract is records.
+pub trait NotifyProvider {
+    /// Create this sandbox's channel directory if it is not there, and answer
+    /// with its host path. A bind whose source is missing takes the whole
+    /// container down, so this happens before the sandbox is built.
+    fn ensure(&self, name: &SandboxName) -> Result<PathBuf, HortError>;
+}
+
 /// Serializes the build of a single sandbox name so two concurrent `up`
 /// invocations cannot both clear the duplicate-name check and race to create the
 /// same sandbox. The lock is released once the build completes, before any
@@ -259,8 +273,25 @@ pub struct OciSpec {
     /// a mount whose destination lives inside another is hidden by it unless it
     /// comes after.
     pub mounts: Vec<SandboxMount>,
+    /// The files hort writes into the sandbox's own writable layer before the
+    /// container starts.
+    pub drop_ins: Vec<SandboxFile>,
     /// The per-sandbox resource ceiling; `None` leaves the sandbox uncapped.
     pub resources: Option<ResourceLimits>,
+}
+
+/// A file hort puts inside a sandbox: where the box finds it, and what it holds.
+///
+/// Plain data for the same reason the mounts are: which file a configured agent
+/// needs is a decision about that agent, and making it in the code that talks to
+/// the kernel would leave it with no fast test. A bind mount cannot do this job,
+/// because the directories these land in exist in no prepared rootfs and a bind
+/// creates no parent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxFile {
+    /// Where the box finds it, as an absolute container path.
+    pub path: PathBuf,
+    pub content: String,
 }
 
 /// One host path carried into the sandbox: where it comes from, where the box

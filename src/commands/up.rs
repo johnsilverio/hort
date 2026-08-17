@@ -22,6 +22,7 @@ use crate::domain::mounts::{
     cache_landing_error, cache_landings, cache_mount_plan, declared_read_only_sources,
     read_only_mount_plan,
 };
+use crate::domain::notify::{channel_is_declared, channel_mount, channel_sink, stop_hook_drop_ins};
 use crate::domain::policy::{BranchIntent, up_error};
 use crate::domain::preconditions::up_precondition_error;
 use crate::domain::reconcile::SandboxState;
@@ -29,8 +30,8 @@ use crate::domain::resources::resource_limits;
 use crate::domain::teardown::{TeardownStep, rollback_plan};
 use crate::ports::{
     CacheProvider, Clock, ContainerRegistry, ContainerRuntime, DbForward, EnvironmentProbe,
-    LivenessProbe, MetadataStore, NetworkProvider, NetworkSpec, OciSpec, SandboxLock,
-    WorktreeProvider,
+    LivenessProbe, MetadataStore, NetworkProvider, NetworkSpec, NotifyProvider, OciSpec,
+    SandboxLock, WorktreeProvider,
 };
 
 /// Coordinates building (or resuming) the sandbox named `<name>` over the ports
@@ -47,6 +48,7 @@ pub struct UpCommand<'a> {
     clock: &'a dyn Clock,
     env: &'a dyn EnvironmentProbe,
     cache: &'a dyn CacheProvider,
+    notify: &'a dyn NotifyProvider,
     state_root: PathBuf,
     /// The project a marker declares, `None` when nothing up the chain declares
     /// one. Without git this directory is what backs `/workdir`, and its absence
@@ -74,6 +76,7 @@ impl<'a> UpCommand<'a> {
         clock: &'a dyn Clock,
         env: &'a dyn EnvironmentProbe,
         cache: &'a dyn CacheProvider,
+        notify: &'a dyn NotifyProvider,
         state_root: PathBuf,
         project_dir: Option<PathBuf>,
         current_dir: PathBuf,
@@ -91,6 +94,7 @@ impl<'a> UpCommand<'a> {
             clock,
             env,
             cache,
+            notify,
             state_root,
             project_dir,
             current_dir,
@@ -235,11 +239,20 @@ impl UpCommand<'_> {
             self.worktrees.create(&name, target)?;
         }
 
-        // The other mount source hort owns rather than finds, made here for the
+        // Another mount source hort owns rather than finds, made here for the
         // same reason the worktree is: a bind whose source is missing takes the
         // whole container down, and nothing else on the machine creates these.
         self.cache.ensure(&caches.iter().map(|cache| cache.source.clone()).collect::<Vec<_>>())?;
         mounts.extend(caches);
+
+        // Carried in only when some agent announces its completions: the bind is
+        // writable, and one nothing ever writes to is a writable path handed to
+        // an unrestricted agent for nothing. Its address is the provider's
+        // answer and never one worked out here, because whatever later reads the
+        // same directory has to arrive at the same path.
+        if channel_is_declared(self.config) {
+            mounts.push(channel_mount(&self.notify.ensure(&name)?));
+        }
 
         // Persist the record before the anchor starts: if the container then fails
         // to come up, the half-built sandbox stays recorded so a later run can
@@ -255,7 +268,7 @@ impl UpCommand<'_> {
                     overlay_path.clone(),
                     timestamp.clone(),
                     timestamp,
-                    None,
+                    channel_sink(self.config),
                     project_dir.clone(),
                 );
                 self.store.put(&fresh)?;
@@ -274,6 +287,7 @@ impl UpCommand<'_> {
                 ("HORT_WORKTREE".to_string(), worktree_display),
             ],
             mounts,
+            drop_ins: stop_hook_drop_ins(self.config),
             resources: limits,
         })?;
 
@@ -339,13 +353,15 @@ mod tests {
     use std::rc::Rc;
     use std::time::SystemTime;
 
-    use crate::domain::config::{Cache, CacheDir, Egress, Mounts, Network, Resources};
+    use crate::domain::config::{
+        Agent, Auth, Cache, CacheDir, Egress, Mounts, Network, Notify, Resources,
+    };
     use crate::domain::model::{AnchorPid, Capabilities, CgroupCaps, LivenessToken, MountNsInode};
     use crate::ports::{MountAccess, SandboxMount};
 
     use crate::fakes::{
-        FakeCacheProvider, FakeCapabilities, FakeNetwork, FakeRegistry, FakeRuntime,
-        FakeSandboxLock, FakeWorktreeProvider, InMemoryMetadataStore, ScriptedClock,
+        FakeCacheProvider, FakeCapabilities, FakeNetwork, FakeNotifyProvider, FakeRegistry,
+        FakeRuntime, FakeSandboxLock, FakeWorktreeProvider, InMemoryMetadataStore, ScriptedClock,
         ScriptedLivenessProbe, sample_record,
     };
 
@@ -380,6 +396,19 @@ mod tests {
         }
     }
 
+    /// A configuration whose one agent announces its own completions, which is
+    /// the whole of what gives a sandbox a channel.
+    fn config_declaring_a_channel() -> ResolvedConfig {
+        ResolvedConfig {
+            agents: vec![Agent {
+                command: "claude".to_string(),
+                auth: Auth::default(),
+                notify: Some(Notify { stop_hook: true }),
+            }],
+            ..healthy_config()
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn up_command<'a>(
         lock: &'a FakeSandboxLock,
@@ -392,6 +421,7 @@ mod tests {
         clock: &'a ScriptedClock,
         env: &'a FakeCapabilities,
         cache: &'a FakeCacheProvider,
+        notify: &'a FakeNotifyProvider,
         config: &'a ResolvedConfig,
     ) -> UpCommand<'a> {
         UpCommand {
@@ -405,6 +435,7 @@ mod tests {
             clock,
             env,
             cache,
+            notify,
             state_root: PathBuf::from("/state"),
             project_dir: Some(PathBuf::from("/project")),
             current_dir: PathBuf::from("/project"),
@@ -426,9 +457,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -450,9 +482,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -475,9 +508,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -502,9 +536,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -530,9 +565,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -558,9 +594,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -584,9 +621,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -607,9 +645,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -632,9 +671,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -657,9 +697,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -680,9 +721,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -703,9 +745,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command
@@ -730,9 +773,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command
@@ -754,9 +798,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command
@@ -784,9 +829,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -808,9 +854,10 @@ mod tests {
         let env = FakeCapabilities::new(Capabilities { user_ns: false, ..ready_host() });
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -834,9 +881,10 @@ mod tests {
             ..healthy_config()
         };
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -857,9 +905,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host()).with_missing_rootfs();
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -881,9 +930,10 @@ mod tests {
         let config =
             ResolvedConfig { shell: Some("/usr/bin/fish".to_string()), ..healthy_config() };
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -907,9 +957,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -933,9 +984,10 @@ mod tests {
             ..healthy_config()
         };
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -960,9 +1012,10 @@ mod tests {
             ..healthy_config()
         };
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -981,6 +1034,161 @@ mod tests {
     }
 
     #[test]
+    fn up_carries_the_channel_of_a_declared_hook_into_the_sandbox() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = config_declaring_a_channel();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // The source is the path the provider answered with, never one this
+        // command worked out for itself: the layout of the channel belongs to
+        // that port because the watcher has to find the same directory, and a
+        // second derivation agrees with the first right until one of them moves.
+        // The directory also has to be there before the container is built, and
+        // it can only be in the spec at all if it was asked for first.
+        assert_eq!(
+            runtime.started_mounts(),
+            vec![SandboxMount {
+                source: FakeNotifyProvider::channel_of(&SandboxName::new("demo").unwrap()),
+                target: PathBuf::from("/run/hort/notify"),
+                access: MountAccess::ReadWrite,
+            }]
+        );
+    }
+
+    #[test]
+    fn up_carries_no_channel_when_no_agent_declares_one() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // Nothing inside the box ever writes to a channel no agent announces
+        // into, and the mount is writable: a sandbox that gets one anyway hands
+        // an agent running without restrictions a writable path to the host for
+        // nothing in return.
+        assert!(runtime.started_mounts().is_empty());
+    }
+
+    #[test]
+    fn up_hands_the_runtime_the_settings_file_a_declared_hook_needs() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = config_declaring_a_channel();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // Which file to drop is decided in the pure layer and the writing is the
+        // runtime's, so this handover is the whole of the wiring between them: a
+        // build that decides right and hands nothing over comes up with an agent
+        // that announces nothing, with every test of the decision still green.
+        let dropped = runtime.started_drop_ins();
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(
+            dropped[0].path,
+            PathBuf::from("/etc/claude-code/managed-settings.d/hort-notify.json")
+        );
+    }
+
+    #[test]
+    fn up_records_the_sink_a_declared_channel_is_raised_on() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = config_declaring_a_channel();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // The record is what a later run reads to decide whether this sandbox has
+        // a channel at all, so a box with one and nothing written down is a box
+        // whose listing pays a disk read per line to learn nothing. This
+        // configuration names no sink, and the desktop is the one the build ships.
+        let persisted = store.get(&SandboxName::new("demo").unwrap()).unwrap().unwrap();
+        assert_eq!(persisted.notify_channel(), Some("desktop"));
+    }
+
+    #[test]
+    fn up_records_no_channel_when_no_agent_declares_one() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // The absence is the answer a reader acts on: told a sink, it goes
+        // looking for a channel that was never mounted and reports whatever the
+        // failed read gives it.
+        let persisted = store.get(&SandboxName::new("demo").unwrap()).unwrap().unwrap();
+        assert_eq!(persisted.notify_channel(), None);
+    }
+
+    #[test]
     fn two_sandboxes_of_one_project_share_a_cache_dir() {
         let lock = FakeSandboxLock::free();
         let store = InMemoryMetadataStore::new();
@@ -996,9 +1204,10 @@ mod tests {
             ..healthy_config()
         };
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
         let shared = SandboxMount {
             source: PathBuf::from("/state/cache/%2Fproject/node_modules"),
@@ -1035,9 +1244,10 @@ mod tests {
             ..healthy_config()
         };
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -1077,9 +1287,10 @@ mod tests {
             ..healthy_config()
         };
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -1133,9 +1344,10 @@ mod tests {
             ..healthy_config()
         };
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -1179,9 +1391,10 @@ mod tests {
             ..healthy_config()
         };
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let _ = command.run(SandboxName::new("demo").unwrap(), None);
@@ -1217,9 +1430,10 @@ mod tests {
             ..healthy_config()
         };
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -1248,9 +1462,10 @@ mod tests {
             ..healthy_config()
         };
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let warnings = command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -1282,9 +1497,10 @@ mod tests {
             ..healthy_config()
         };
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let warnings = command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -1308,9 +1524,10 @@ mod tests {
             ..healthy_config()
         };
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let warnings = command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -1338,9 +1555,10 @@ mod tests {
             ..healthy_config()
         };
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let warnings = command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -1367,9 +1585,10 @@ mod tests {
             ..healthy_config()
         };
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -1399,9 +1618,10 @@ mod tests {
             ..healthy_config()
         };
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -1423,12 +1643,13 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = UpCommand {
             project_dir: Some(project.clone()),
             current_dir: project.clone(),
             ..up_command(
                 &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
-                &cache, &config,
+                &cache, &notify, &config,
             )
         };
 
@@ -1451,12 +1672,13 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = UpCommand {
             project_dir: Some(project.clone()),
             current_dir: project,
             ..up_command(
                 &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
-                &cache, &config,
+                &cache, &notify, &config,
             )
         };
 
@@ -1483,12 +1705,13 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = UpCommand {
             project_dir: Some(project.clone()),
             current_dir: project,
             ..up_command(
                 &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
-                &cache, &config,
+                &cache, &notify, &config,
             )
         };
 
@@ -1510,12 +1733,13 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = UpCommand {
             project_dir: None,
             current_dir: PathBuf::from("/home/tester/Downloads"),
             ..up_command(
                 &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
-                &cache, &config,
+                &cache, &notify, &config,
             )
         };
 
@@ -1544,12 +1768,13 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = UpCommand {
             project_dir: Some(project.clone()),
             current_dir: project,
             ..up_command(
                 &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
-                &cache, &config,
+                &cache, &notify, &config,
             )
         };
 
@@ -1572,12 +1797,13 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = UpCommand {
             project_dir: None,
             current_dir: PathBuf::from("/home/tester/Downloads"),
             ..up_command(
                 &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
-                &cache, &config,
+                &cache, &notify, &config,
             )
         };
 
@@ -1608,9 +1834,10 @@ mod tests {
             ..healthy_config()
         };
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -1632,9 +1859,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         command.run(SandboxName::new("demo").unwrap(), None).unwrap();
@@ -1660,12 +1888,13 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = UpCommand {
             project_dir: Some(project.clone()),
             current_dir: project.clone(),
             ..up_command(
                 &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
-                &cache, &config,
+                &cache, &notify, &config,
             )
         };
 
@@ -1694,9 +1923,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -1726,9 +1956,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -1753,9 +1984,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -1786,9 +2018,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -1813,9 +2046,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -1841,9 +2075,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         let result = command.run(SandboxName::new("demo").unwrap(), None);
@@ -1871,9 +2106,10 @@ mod tests {
         let env = FakeCapabilities::new(ready_host());
         let config = healthy_config();
         let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
         let command = up_command(
             &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
-            &config,
+            &notify, &config,
         );
 
         command.run(SandboxName::new("demo").unwrap(), None).unwrap();

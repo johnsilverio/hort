@@ -116,6 +116,7 @@ impl ScratchSandbox {
             workdir,
             env: vec![("HORT_SANDBOX".to_string(), self.name.as_str().to_string())],
             mounts: Vec::new(),
+            drop_ins: Vec::new(),
             resources: None,
         }
     }
