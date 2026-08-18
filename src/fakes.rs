@@ -893,6 +893,8 @@ pub struct FakeNotifyProvider {
     ensured: RefCell<Vec<SandboxName>>,
     provisioned: RefCell<Vec<NotifySpec>>,
     teardowns: RefCell<Vec<SandboxName>>,
+    asked_for_last_event: RefCell<Vec<SandboxName>>,
+    last_event_at: Option<SystemTime>,
     provision_fails: bool,
     trace: Option<TeardownTrace>,
 }
@@ -911,6 +913,14 @@ impl FakeNotifyProvider {
     /// Record the `notify.teardown` step on the shared teardown trace.
     pub fn with_trace(mut self, trace: TeardownTrace) -> Self {
         self.trace = Some(trace);
+        self
+    }
+
+    /// Script when an agent last finished, for every sandbox this is asked
+    /// about. Without it no sandbox has ever announced a completion, which is
+    /// what a box whose channel holds nothing yet looks like.
+    pub fn with_last_event_at(mut self, finished: SystemTime) -> Self {
+        self.last_event_at = Some(finished);
         self
     }
 
@@ -948,6 +958,13 @@ impl FakeNotifyProvider {
     pub fn teardowns(&self) -> Vec<SandboxName> {
         self.teardowns.borrow().clone()
     }
+
+    /// Every sandbox whose last completion it was asked about, in order. What a
+    /// caller does not ask has no observable answer, so this is the only way to
+    /// witness that a sandbox with no channel is left alone.
+    pub fn asked_for_last_event(&self) -> Vec<SandboxName> {
+        self.asked_for_last_event.borrow().clone()
+    }
 }
 
 impl NotifyProvider for FakeNotifyProvider {
@@ -979,6 +996,11 @@ impl NotifyProvider for FakeNotifyProvider {
             trace.borrow_mut().push("notify.teardown".to_string());
         }
         Ok(())
+    }
+
+    fn last_event_at(&self, name: &SandboxName) -> Option<SystemTime> {
+        self.asked_for_last_event.borrow_mut().push(name.clone());
+        self.last_event_at
     }
 }
 

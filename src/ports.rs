@@ -188,6 +188,16 @@ pub trait NotifyProvider {
     /// already in the state this asks for, which is what lets the teardown plan
     /// carry the step unconditionally.
     fn teardown(&self, name: &SandboxName) -> Result<(), HortError>;
+    /// When this sandbox last announced that an agent finished, or `None` if it
+    /// never has. The answer is the timestamp of the channel's own event file, so
+    /// it lands on the port that owns where that file lives: a caller deriving
+    /// that path itself would be a second copy of the layout, free to drift.
+    ///
+    /// It cannot fail on purpose. A channel with no completion yet and a
+    /// timestamp the host refused to hand over lead the caller to the same place,
+    /// counting idle from whatever else it knows, so a distinction between them
+    /// would have no reader.
+    fn last_event_at(&self, name: &SandboxName) -> Option<SystemTime>;
 }
 
 /// Serializes the build of a single sandbox name so two concurrent `up`

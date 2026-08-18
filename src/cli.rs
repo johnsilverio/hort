@@ -293,6 +293,7 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<u8, HortError> {
                 &deps.worktrees,
                 &deps.sessions,
                 &deps.clock,
+                &deps.notify,
             );
             let entries = command.run()?;
             print!("{}", render_ls(&entries));

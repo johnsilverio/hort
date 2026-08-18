@@ -12,6 +12,7 @@ use std::fs;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
 
 use inotify::{EventMask, Inotify, WatchMask};
 
@@ -54,11 +55,18 @@ impl FileNotifyProvider {
     fn sandbox_dir(&self, name: &SandboxName) -> PathBuf {
         self.runtime_root.join(SANDBOXES_DIR).join(name.as_str())
     }
+
+    /// Where the completions of `name` are collected. Every use of the layout
+    /// goes through here, so the path the watcher is pointed at and the path a
+    /// listing reads the time off cannot drift apart.
+    fn channel_dir(&self, name: &SandboxName) -> PathBuf {
+        self.state_root.join(SANDBOXES_DIR).join(name.as_str()).join(CHANNEL_DIR)
+    }
 }
 
 impl NotifyProvider for FileNotifyProvider {
     fn ensure(&self, name: &SandboxName) -> Result<PathBuf, HortError> {
-        let channel = self.state_root.join(SANDBOXES_DIR).join(name.as_str()).join(CHANNEL_DIR);
+        let channel = self.channel_dir(name);
         fs::create_dir_all(&channel).map_err(|error| HortError::StateIo {
             detail: format!("could not create {}: {error}", channel.display()),
         })?;
@@ -96,6 +104,10 @@ impl NotifyProvider for FileNotifyProvider {
 
     fn teardown(&self, name: &SandboxName) -> Result<(), HortError> {
         WATCHER.stop(&self.sandbox_dir(name)).map_err(notify_failure)
+    }
+
+    fn last_event_at(&self, name: &SandboxName) -> Option<SystemTime> {
+        fs::metadata(self.channel_dir(name).join(EVENTS_FILE)).ok()?.modified().ok()
     }
 }
 
@@ -363,6 +375,66 @@ mod tests {
         // asserted here.
         assert_eq!(channel, state.path().join("sandboxes").join("demo").join("notify"));
         assert!(channel.is_dir());
+    }
+
+    #[test]
+    fn the_channel_answers_with_the_time_of_the_last_completion() {
+        let state = TempDir::new().unwrap();
+        let runtime = TempDir::new().unwrap();
+        let provider =
+            FileNotifyProvider::new(state.path().to_path_buf(), runtime.path().to_path_buf());
+        let name = SandboxName::new("demo").unwrap();
+        let channel = provider.ensure(&name).unwrap();
+        let finished = humantime::parse_rfc3339("2026-08-18T09:30:00Z").unwrap();
+
+        // Written into the path `ensure` answered with, never into one this test
+        // spelled out: the two derivations are put against each other by
+        // construction, so a read that lost a component of the layout comes back
+        // empty here instead of agreeing with a second copy of the same mistake.
+        let events = fs::File::create(channel.join(EVENTS_FILE)).unwrap();
+        events.set_times(fs::FileTimes::new().set_modified(finished)).unwrap();
+
+        assert_eq!(provider.last_event_at(&name), Some(finished));
+    }
+
+    #[test]
+    fn a_channel_with_no_completion_yet_has_no_event_time() {
+        let state = TempDir::new().unwrap();
+        let runtime = TempDir::new().unwrap();
+        let provider =
+            FileNotifyProvider::new(state.path().to_path_buf(), runtime.path().to_path_buf());
+        let name = SandboxName::new("demo").unwrap();
+
+        let channel = provider.ensure(&name).unwrap();
+
+        // The channel is asserted present before its silence means anything. The
+        // first completion is what creates the file, so a box that has a channel
+        // and has never finished anything is the ordinary state of a fresh
+        // sandbox, and an answer of "no time" from a directory that was never
+        // made would witness nothing about the file.
+        assert!(channel.is_dir());
+        assert_eq!(provider.last_event_at(&name), None);
+    }
+
+    #[test]
+    fn a_channel_that_is_no_longer_there_has_no_event_time() {
+        let state = TempDir::new().unwrap();
+        let runtime = TempDir::new().unwrap();
+        let provider =
+            FileNotifyProvider::new(state.path().to_path_buf(), runtime.path().to_path_buf());
+        let name = SandboxName::new("demo").unwrap();
+        let channel = provider.ensure(&name).unwrap();
+        fs::write(channel.join(EVENTS_FILE), "{\"event\":\"stop\"}\n").unwrap();
+
+        // Made and then taken away, which is how a record outlives the directory
+        // it names: the sandbox remembers it has a channel, and the user emptied
+        // the state hort keeps by hand. Asking is the one thing that must not
+        // fail, because both callers are listings that report a row they cannot
+        // read rather than dying on it, and this is the arm the two tests above
+        // never walk.
+        fs::remove_dir_all(&channel).unwrap();
+
+        assert_eq!(provider.last_event_at(&name), None);
     }
 
     #[test]

@@ -3,23 +3,28 @@
 //!
 //! It cross-checks the on-disk records against the live anchors and the
 //! worktrees still on disk, joins each verdict back to its record, and derives
-//! age and idle from the recorded timestamps. Liveness comes from matching the
-//! record tokens against the registry entries, so there is no liveness probe
-//! here. The dirty column is asked at each record's own worktree path on disk,
-//! so a sandbox of another project reports its dirty state like any other; the
-//! forgotten box holding uncommitted work is the one this listing exists to
-//! surface, and it is rarely the box of the project you are standing in. A
-//! record with a corrupt timestamp degrades only its own row to an unknown age
-//! and idle, and the listing never mutates anything.
+//! age from the recorded timestamps. Idle counts from the newest of those and
+//! the last completion the sandbox announced, so a box whose agent has been
+//! working all afternoon is not reported as untouched since its shell was
+//! opened. Liveness comes from matching the record tokens against the registry
+//! entries, so there is no liveness probe here. The dirty column is asked at
+//! each record's own worktree path on disk, so a sandbox of another project
+//! reports its dirty state like any other; the forgotten box holding
+//! uncommitted work is the one this listing exists to surface, and it is rarely
+//! the box of the project you are standing in. A record with a corrupt
+//! timestamp degrades only its own row to an unknown age and idle, and the
+//! listing never mutates anything.
 
 use std::time::{Duration, SystemTime};
 
-use crate::commands::present_worktrees;
+use crate::commands::{last_announced_completion, present_worktrees};
 use crate::domain::error::HortError;
 use crate::domain::idle::{IdleState, age, idle, parse_timestamp};
 use crate::domain::model::{BranchName, SandboxName, SandboxRecord};
 use crate::domain::reconcile::{SandboxState, reconcile_all};
-use crate::ports::{Clock, ContainerRegistry, MetadataStore, SessionProbe, WorktreeProvider};
+use crate::ports::{
+    Clock, ContainerRegistry, MetadataStore, NotifyProvider, SessionProbe, WorktreeProvider,
+};
 
 /// One row of `ls` output: a sandbox's reconciled state plus the figures the CLI
 /// renders beside it. `age`, `idle`, and `branch` are `None` when there is no
@@ -49,6 +54,7 @@ pub struct LsCommand<'a> {
     worktrees: &'a dyn WorktreeProvider,
     sessions: &'a dyn SessionProbe,
     clock: &'a dyn Clock,
+    notify: &'a dyn NotifyProvider,
 }
 
 impl<'a> LsCommand<'a> {
@@ -58,8 +64,9 @@ impl<'a> LsCommand<'a> {
         worktrees: &'a dyn WorktreeProvider,
         sessions: &'a dyn SessionProbe,
         clock: &'a dyn Clock,
+        notify: &'a dyn NotifyProvider,
     ) -> Self {
-        Self { store, registry, worktrees, sessions, clock }
+        Self { store, registry, worktrees, sessions, clock, notify }
     }
 }
 
@@ -80,7 +87,9 @@ impl LsCommand<'_> {
                 let sessions = self.sessions.session_pids(&name).map_or(0, |pids| pids.len());
                 let record = records.iter().find(|record| record.name() == &name);
                 let dirty = record.and_then(|record| self.observe_dirty(record));
-                build_entry(name, state, sessions, record, dirty, now)
+                let last_event =
+                    record.and_then(|record| last_announced_completion(self.notify, record));
+                build_entry(name, state, sessions, record, dirty, last_event, now)
             })
             .collect();
 
@@ -106,6 +115,7 @@ fn build_entry(
     sessions: usize,
     record: Option<&SandboxRecord>,
     dirty: Option<bool>,
+    last_event: Option<SystemTime>,
     now: SystemTime,
 ) -> LsEntry {
     let Some(record) = record else {
@@ -123,7 +133,7 @@ fn build_entry(
         state,
         sessions,
         age: Some(age(created, now)),
-        idle: Some(idle(sessions, created, attach, None, now)),
+        idle: Some(idle(sessions, created, attach, last_event, now)),
         branch,
         dirty,
     }
@@ -138,8 +148,8 @@ mod tests {
 
     use crate::domain::model::{AnchorPid, LivenessToken, MountNsInode, SandboxRecord};
     use crate::fakes::{
-        FakeRegistry, FakeSessionProbe, FakeWorktreeProvider, InMemoryMetadataStore, ScriptedClock,
-        sample_record,
+        FakeNotifyProvider, FakeRegistry, FakeSessionProbe, FakeWorktreeProvider,
+        InMemoryMetadataStore, ScriptedClock, sample_record,
     };
 
     fn canned_token() -> LivenessToken {
@@ -152,8 +162,9 @@ mod tests {
         worktrees: &'a FakeWorktreeProvider,
         sessions: &'a FakeSessionProbe,
         clock: &'a ScriptedClock,
+        notify: &'a FakeNotifyProvider,
     ) -> LsCommand<'a> {
-        LsCommand { store, registry, worktrees, sessions, clock }
+        LsCommand { store, registry, worktrees, sessions, clock, notify }
     }
 
     #[test]
@@ -165,7 +176,8 @@ mod tests {
         let worktrees = FakeWorktreeProvider::new().with_listed_worktree(&name);
         let sessions = FakeSessionProbe::new(vec![]);
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
 
         let entries = command.run().unwrap();
 
@@ -183,7 +195,8 @@ mod tests {
         let worktrees = FakeWorktreeProvider::new().with_listed_worktree(&name);
         let sessions = FakeSessionProbe::new(vec![]);
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
 
         let entries = command.run().unwrap();
 
@@ -199,7 +212,8 @@ mod tests {
         let worktrees = FakeWorktreeProvider::new();
         let sessions = FakeSessionProbe::new(vec![]);
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
 
         let entries = command.run().unwrap();
 
@@ -221,7 +235,8 @@ mod tests {
         let worktrees = FakeWorktreeProvider::new();
         let sessions = FakeSessionProbe::new(vec![]);
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
 
         let entries = command.run().unwrap();
 
@@ -238,7 +253,8 @@ mod tests {
         let worktrees = FakeWorktreeProvider::new().with_present_worktree(&name);
         let sessions = FakeSessionProbe::new(vec![]);
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
 
         let entries = command.run().unwrap();
 
@@ -260,7 +276,8 @@ mod tests {
         let worktrees = FakeWorktreeProvider::new().with_listed_worktree(&name);
         let sessions = FakeSessionProbe::new(vec![]);
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
 
         command.run().unwrap();
 
@@ -276,7 +293,8 @@ mod tests {
         let worktrees = FakeWorktreeProvider::new().with_listed_worktree(&name);
         let sessions = FakeSessionProbe::new(vec![111, 222, 333]);
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
 
         let entries = command.run().unwrap();
 
@@ -293,7 +311,8 @@ mod tests {
         let sessions = FakeSessionProbe::new(vec![]);
         let now = humantime::parse_rfc3339("2026-06-11T13:00:00Z").unwrap();
         let clock = ScriptedClock::new(now);
-        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
 
         let entries = command.run().unwrap();
 
@@ -321,11 +340,89 @@ mod tests {
         let sessions = FakeSessionProbe::new(vec![]);
         let now = humantime::parse_rfc3339("2026-06-11T13:00:00Z").unwrap();
         let clock = ScriptedClock::new(now);
-        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
 
         let entries = command.run().unwrap();
 
         assert_eq!(entries[0].idle, Some(IdleState::Idle(Duration::from_secs(1800))));
+    }
+
+    #[test]
+    fn ls_counts_idle_from_the_last_completion_event() {
+        let name = SandboxName::new("demo").unwrap();
+        let record = SandboxRecord::new(
+            name.clone(),
+            Some(BranchName::new("demo").unwrap()),
+            PathBuf::from("/state/sandboxes/demo/worktree-demo"),
+            PathBuf::from("/state/sandboxes/demo/overlay"),
+            "2026-06-11T09:00:00Z".to_string(),
+            "2026-06-11T10:00:00Z".to_string(),
+            Some("desktop".to_string()),
+            PathBuf::from("/home/tester/projects/demo"),
+        )
+        .with_token(canned_token());
+        let store = InMemoryMetadataStore::new();
+        store.put(&record).unwrap();
+        let registry = FakeRegistry::new(vec![(name.clone(), canned_token())]);
+        let worktrees = FakeWorktreeProvider::new().with_listed_worktree(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let now = humantime::parse_rfc3339("2026-06-11T13:00:00Z").unwrap();
+        let clock = ScriptedClock::new(now);
+        let finished = humantime::parse_rfc3339("2026-06-11T12:50:00Z").unwrap();
+        let notify = FakeNotifyProvider::new().with_last_event_at(finished);
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
+
+        let entries = command.run().unwrap();
+
+        // Three hours since the shell was closed, ten minutes since the agent
+        // announced it was done. This is the box the listing exists to keep from
+        // being lost, and counting from the attach reports it as untouched all
+        // afternoon while it was working the whole time.
+        assert_eq!(entries[0].idle, Some(IdleState::Idle(Duration::from_secs(600))));
+    }
+
+    #[test]
+    fn ls_does_not_ask_for_a_completion_time_without_a_declared_channel() {
+        let announcing = SandboxName::new("announcing").unwrap();
+        let silent = SandboxName::new("silent").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store
+            .put(
+                &SandboxRecord::new(
+                    announcing.clone(),
+                    Some(BranchName::new("announcing").unwrap()),
+                    PathBuf::from("/state/sandboxes/announcing/worktree-announcing"),
+                    PathBuf::from("/state/sandboxes/announcing/overlay"),
+                    "2026-06-11T12:00:00Z".to_string(),
+                    "2026-06-11T12:00:00Z".to_string(),
+                    Some("desktop".to_string()),
+                    PathBuf::from("/home/tester/projects/announcing"),
+                )
+                .with_token(canned_token()),
+            )
+            .unwrap();
+        store.put(&sample_record("silent").with_token(canned_token())).unwrap();
+        let registry = FakeRegistry::new(vec![
+            (announcing.clone(), canned_token()),
+            (silent.clone(), canned_token()),
+        ]);
+        let worktrees = FakeWorktreeProvider::new()
+            .with_listed_worktree(&announcing)
+            .with_listed_worktree(&silent);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
+
+        command.run().unwrap();
+
+        // Both halves, and the first is what makes the second mean anything: a
+        // listing that asked nobody would satisfy the denial while pinning
+        // nothing. What the record says is the memory of what the build actually
+        // made, so a box whose channel was never created is never stat'd for a
+        // file that cannot be there, whatever the configuration claims today.
+        assert_eq!(notify.asked_for_last_event(), vec![announcing]);
     }
 
     #[test]
@@ -337,7 +434,8 @@ mod tests {
         let worktrees = FakeWorktreeProvider::new().with_listed_worktree(&name);
         let sessions = FakeSessionProbe::new(vec![111]);
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
 
         let entries = command.run().unwrap();
 
@@ -364,7 +462,8 @@ mod tests {
         let worktrees = FakeWorktreeProvider::new().with_listed_worktree(&name);
         let sessions = FakeSessionProbe::new(vec![]);
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
 
         let entries = command.run().unwrap();
 
@@ -384,7 +483,8 @@ mod tests {
             FakeWorktreeProvider::new().with_listed_worktree(&name).with_dirty_worktree(&name);
         let sessions = FakeSessionProbe::new(vec![]);
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
 
         let entries = command.run().unwrap();
 
@@ -401,7 +501,8 @@ mod tests {
             FakeWorktreeProvider::new().with_present_worktree(&name).with_dirty_worktree(&name);
         let sessions = FakeSessionProbe::new(vec![]);
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
 
         let entries = command.run().unwrap();
 
@@ -422,7 +523,8 @@ mod tests {
             FakeWorktreeProvider::new().with_listed_worktree(&name).with_failing_dirty_probe(&name);
         let sessions = FakeSessionProbe::new(vec![]);
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
 
         let entries = command.run().unwrap();
 
@@ -450,7 +552,8 @@ mod tests {
             FakeWorktreeProvider::new().with_listed_worktree(&name).with_dirty_worktree(&name);
         let sessions = FakeSessionProbe::new(vec![]);
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
 
         let entries = command.run().unwrap();
 
@@ -466,7 +569,8 @@ mod tests {
         let worktrees = FakeWorktreeProvider::new();
         let sessions = FakeSessionProbe::new(vec![]);
         let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
-        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
 
         let entries = command.run().unwrap();
 

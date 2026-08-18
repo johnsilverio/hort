@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::commands::present_worktrees;
+use crate::commands::{last_announced_completion, present_worktrees};
 use crate::domain::cache::project_from_cache_key;
 use crate::domain::error::HortError;
 use crate::domain::idle::{IdleState, idle, parse_timestamp};
@@ -244,7 +244,8 @@ impl PruneCommand<'_> {
         else {
             return None;
         };
-        Some(idle(sessions, created, attach, None, now))
+        let last_event = last_announced_completion(self.notify, record);
+        Some(idle(sessions, created, attach, last_event, now))
     }
 
     /// What a record's worktree holds, asked only when there is something to
@@ -967,6 +968,73 @@ mod tests {
         command.run(Some(Duration::from_secs(1800)), true, false).unwrap();
 
         assert_eq!(store.get(&name).unwrap(), None);
+    }
+
+    #[test]
+    fn prune_spares_a_sandbox_whose_agent_just_finished() {
+        let finished = SandboxName::new("finished").unwrap();
+        let stale = SandboxName::new("stale").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store
+            .put(
+                &SandboxRecord::new(
+                    finished.clone(),
+                    Some(BranchName::new("finished").unwrap()),
+                    PathBuf::from("/state/sandboxes/finished/worktree-finished"),
+                    PathBuf::from("/state/sandboxes/finished/overlay"),
+                    "2026-06-12T09:00:00Z".to_string(),
+                    "2026-06-12T10:00:00Z".to_string(),
+                    Some("desktop".to_string()),
+                    PathBuf::from("/home/tester/projects/finished"),
+                )
+                .with_token(canned_token()),
+            )
+            .unwrap();
+        store
+            .put(
+                &SandboxRecord::new(
+                    stale.clone(),
+                    Some(BranchName::new("stale").unwrap()),
+                    PathBuf::from("/state/sandboxes/stale/worktree-stale"),
+                    PathBuf::from("/state/sandboxes/stale/overlay"),
+                    "2026-06-12T09:00:00Z".to_string(),
+                    "2026-06-12T10:00:00Z".to_string(),
+                    None,
+                    PathBuf::from("/home/tester/projects/stale"),
+                )
+                .with_token(canned_token()),
+            )
+            .unwrap();
+        let registry = FakeRegistry::new(vec![
+            (finished.clone(), canned_token()),
+            (stale.clone(), canned_token()),
+        ]);
+        let worktrees = FakeWorktreeProvider::new()
+            .with_listed_worktree(&finished)
+            .with_listed_worktree(&stale);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let now = humantime::parse_rfc3339("2026-06-12T13:00:00Z").unwrap();
+        let clock = ScriptedClock::new(now);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
+        let announced = humantime::parse_rfc3339("2026-06-12T12:50:00Z").unwrap();
+        let notify = FakeNotifyProvider::new().with_last_event_at(announced);
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches, &notify,
+        );
+
+        command.run(Some(Duration::from_secs(7200)), true, false).unwrap();
+
+        // The box whose agent finished ten minutes ago is the one at stake: its
+        // shell has been closed for three hours, so a threshold read off the
+        // attach alone hands a working sandbox to a deletion. The second box is
+        // what proves the threshold bit at all here, and it is the same three
+        // hours with nothing to announce it.
+        assert!(store.get(&finished).unwrap().is_some());
+        assert_eq!(store.get(&stale).unwrap(), None);
     }
 
     /// The stored address of a project that is no longer on disk, and the project
