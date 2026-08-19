@@ -9,9 +9,10 @@
 //! did.
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command as GitCommand;
+use std::process::{Command as GitCommand, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -625,6 +626,84 @@ fn cli_up_without_detach_opens_a_session_in_the_sandbox_it_built() {
         .assert()
         .success()
         .stdout(predicate::str::contains("ran-inside-the-sandbox"));
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
+
+/// The file a session leaves in `/workdir` once it is running. `/workdir` is a
+/// bind mount of a host directory, so what the session writes there is what the
+/// test outside the sandbox reads to know the box has somebody in it.
+const SESSION_WITNESS: &str = "session-is-open";
+
+/// Whether `path` shows up before the deadline runs out. The whole build has to
+/// finish and a shell has to start inside the box before anything can write
+/// there, and none of it is done when the spawn returns.
+fn appeared_within_deadline(path: &Path) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_ls_counts_the_session_open_in_a_sandbox() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+    let witness = sandbox
+        .state_dir()
+        .join(format!("worktree-{}", sandbox.name().as_str()))
+        .join(SESSION_WITNESS);
+
+    // Spawned rather than run to completion, because the session has to still be
+    // open when the next command asks about it: a shell whose input stays open is
+    // the only way a second invocation of hort can find somebody in the box.
+    let mut occupied = std::process::Command::new(assert_cmd::cargo::cargo_bin("hort"))
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", sandbox.name().as_str()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut into_the_box = occupied.stdin.take().unwrap();
+    writeln!(into_the_box, "touch /workdir/{SESSION_WITNESS}").unwrap();
+    assert!(appeared_within_deadline(&witness), "no session ever reached the worktree");
+
+    // Which probe the binary wires itself up with is settled where hort assembles
+    // its adapters, and nothing below that wiring can witness it: every command
+    // reads a probe that answers nothing as a box with nobody in it, so the whole
+    // suite stays green while the column lies, `down` never asks before killing
+    // somebody's work, and a box being typed in is offered to `prune --idle`.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .arg("ls")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("{}  live  1  ", sandbox.name().as_str())));
+
+    drop(into_the_box);
+    occupied.wait().unwrap();
 
     Command::cargo_bin("hort")
         .unwrap()

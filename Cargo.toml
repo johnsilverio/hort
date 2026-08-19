@@ -37,7 +37,8 @@ tls-parser = "0.12.2"
 # live version before uncommenting: these move fast enough that a remembered version is
 # usually the wrong one.
 #
-# libcgroups = "0.7.0"     # read a sandbox's process list from its cgroup (the session probe)
+# libcgroups = "0.7.0"     # no direct consumer: the session probe asks the kernel instead, and this
+#                          # crate's systemd manager costs a session D-Bus connection per read
 # dialoguer = "0.12.0"     # the first-run configuration prompts, nothing else
 
 [dev-dependencies]

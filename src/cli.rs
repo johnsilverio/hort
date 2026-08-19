@@ -27,7 +27,7 @@ use crate::adapters::lock::FlockSandboxLock;
 use crate::adapters::metadata::FileMetadataStore;
 use crate::adapters::notify::FileNotifyProvider;
 use crate::adapters::pasta::PastaNetworkProvider;
-use crate::adapters::runtime::{LibcontainerRuntime, NullRuntime};
+use crate::adapters::runtime::LibcontainerRuntime;
 use crate::adapters::terminal::HostTerminal;
 use crate::adapters::worktree::GitWorktreeProvider;
 use crate::commands::attach::AttachCommand;
@@ -93,16 +93,13 @@ pub enum CliCommand {
     },
 }
 
-/// The real adapters the commands run against, assembled once at startup. The
-/// per-sandbox process list is the one read still served by a placeholder, so a
-/// sandbox reads as having no session open.
+/// The real adapters the commands run against, assembled once at startup.
 pub struct RealDeps {
     lock: FlockSandboxLock,
     store: FileMetadataStore,
     probe: ProcLivenessProbe,
     worktrees: GitWorktreeProvider,
     runtime: LibcontainerRuntime,
-    sessions: NullRuntime,
     network: PastaNetworkProvider,
     terminal: HostTerminal,
     clock: SystemClock,
@@ -168,7 +165,6 @@ impl RealDeps {
             probe: ProcLivenessProbe,
             worktrees: GitWorktreeProvider::new(adapters_dir.clone(), state_root.clone()),
             runtime: LibcontainerRuntime::new(runtime_root.clone()),
-            sessions: NullRuntime,
             network: PastaNetworkProvider::new(runtime_root.clone()),
             terminal: HostTerminal,
             clock: SystemClock,
@@ -291,7 +287,7 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<u8, HortError> {
                 &deps.store,
                 &deps.runtime,
                 &deps.worktrees,
-                &deps.sessions,
+                &deps.runtime,
                 &deps.clock,
                 &deps.notify,
             );
@@ -303,7 +299,7 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<u8, HortError> {
             let name = SandboxName::new(&name)?;
             let command = DownCommand::new(
                 &deps.store,
-                &deps.sessions,
+                &deps.runtime,
                 &deps.confirmer,
                 &deps.runtime,
                 &deps.network,
@@ -318,7 +314,7 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<u8, HortError> {
                 &deps.store,
                 &deps.runtime,
                 &deps.worktrees,
-                &deps.sessions,
+                &deps.runtime,
                 &deps.clock,
                 &deps.confirmer,
                 &deps.runtime,

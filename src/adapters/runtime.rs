@@ -1,6 +1,6 @@
 //! The container half of a sandbox: `LibcontainerRuntime`, the embedded OCI
-//! runtime that starts and stops the anchor, and `NullRuntime`, the honest
-//! stand-in that answers no session while the process list is being built.
+//! runtime that starts and stops the anchor, joins sessions to it, and reads
+//! back which processes a sandbox is holding.
 //!
 //! Starting an anchor is a fork, not an unshare in place. Creating a user
 //! namespace requires a single-threaded process, and hort's own process has to
@@ -86,20 +86,20 @@ const SANDBOX_TMP: &str = "/tmp";
 const DEV_NULL: &str = "/dev/null";
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const CPU_PERIOD_USEC: u64 = 100_000;
+/// Where the embedded runtime puts a container's cgroup: it holds this root as a
+/// constant of its own rather than looking the mount up, so a reader that went
+/// hunting for cgroup2 in the mount table could end up somewhere nothing was
+/// ever written.
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+const CGROUP_PROCS_FILE: &str = "cgroup.procs";
+/// What every line of `/proc/<pid>/cgroup` starts with on a unified host:
+/// hierarchy id zero and an empty controller list, then the path.
+const UNIFIED_HIERARCHY: &str = "0::";
 /// The byte both handshakes send; only its arrival, never its value, carries
 /// meaning, and the closed pipe that yields none is the abort signal.
 const HANDSHAKE: [u8; 1] = [1];
 const PROCESS_FAILED: u8 = 0;
 const PROCESS_STARTED: u8 = 1;
-
-/// A `SessionProbe` for builds without the per-sandbox process list.
-pub struct NullRuntime;
-
-impl SessionProbe for NullRuntime {
-    fn session_pids(&self, _name: &SandboxName) -> Result<Vec<u32>, HortError> {
-        Ok(Vec::new())
-    }
-}
 
 /// The `ContainerRuntime` hort runs sandboxes on, embedding the OCI runtime in
 /// hort's own process: no daemon, no container binary to shell out to.
@@ -224,21 +224,22 @@ impl LibcontainerRuntime {
     }
 
     /// The pid of a running sandbox's anchor, taken from the container state the
-    /// runtime keeps. It is the anchor's namespaces a session climbs into, and
-    /// naming it here is what spares the caller from carrying it around.
-    fn anchor_pid(&self, name: &SandboxName) -> Result<u32, HortError> {
+    /// runtime keeps. It is the anchor's namespaces a session climbs into and the
+    /// anchor's cgroup a sandbox's processes are counted in, and naming it here
+    /// is what spares both callers from carrying it around.
+    fn anchor_pid(&self, name: &SandboxName, operation: &str) -> Result<u32, HortError> {
         let container = Container::load(self.container_dir(name)).map_err(|err| {
             runtime_failure(format!(
-                "join_session: loading the container state of '{}': {err}",
+                "{operation}: loading the container state of '{}': {err}",
                 name.as_str()
             ))
         })?;
         let pid = container.pid().ok_or_else(|| {
-            runtime_failure(format!("join_session: sandbox '{}' has no anchor", name.as_str()))
+            runtime_failure(format!("{operation}: sandbox '{}' has no anchor", name.as_str()))
         })?;
         u32::try_from(pid.as_raw()).map_err(|_| {
             runtime_failure(format!(
-                "join_session: the runtime reported {} as the anchor pid",
+                "{operation}: the runtime reported {} as the anchor pid",
                 pid.as_raw()
             ))
         })
@@ -285,7 +286,7 @@ impl ContainerRuntime for LibcontainerRuntime {
     }
 
     fn join_session(&self, spec: &SessionSpec) -> Result<Session, HortError> {
-        let anchor = self.anchor_pid(&spec.name)?;
+        let anchor = self.anchor_pid(&spec.name, "join_session")?;
         // Read here, and not where it is applied: by then the session is inside
         // the sandbox, whose root holds nothing of the host to read it from.
         let reachable = landlock::recorded_connect_ports(&self.sandbox_dir(&spec.name))
@@ -364,6 +365,55 @@ impl ContainerRegistry for LibcontainerRuntime {
 
         Ok(container_dirs.flatten().filter_map(|entry| live_anchor(&entry.path())).collect())
     }
+}
+
+impl SessionProbe for LibcontainerRuntime {
+    fn session_pids(&self, name: &SandboxName) -> Result<Vec<u32>, HortError> {
+        let anchor = self.anchor_pid(name, "session_pids")?;
+        let processes = cgroup_of(anchor).map(processes_in).unwrap_or_default();
+        Ok(sessions_among(processes, anchor))
+    }
+}
+
+/// Where the kernel has `pid` right now, as a directory under the cgroup root,
+/// or `None` when it has it nowhere any more.
+///
+/// Asked of the kernel rather than assembled from the sandbox name, because a
+/// rootless container is put in a systemd scope and the name of that scope is
+/// systemd's convention rather than anything hort chose: rebuilding it here
+/// would be a guess that only looks like code. The kernel already knows, and
+/// answers in one file read.
+///
+/// The path it answers with is relative to the cgroup namespace of whoever is
+/// reading, not of the process being asked about. hort's own process is never
+/// inside a sandbox, so what comes back is the whole path from the root of the
+/// hierarchy and joins onto the cgroup mount unchanged.
+fn cgroup_of(pid: u32) -> Option<PathBuf> {
+    let memberships = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let path = memberships.lines().find_map(|line| line.strip_prefix(UNIFIED_HIERARCHY))?;
+    Some(Path::new(CGROUP_ROOT).join(path.trim_start_matches('/')))
+}
+
+/// Every process the kernel currently has in `cgroup`.
+///
+/// A cgroup that has just been collected, and a line that is not a pid, both
+/// read as nothing rather than as a failure. The question being asked is who is
+/// in there at this instant, and the kernel is rewriting the answer as processes
+/// come and go, so a read that arrives a moment too late has observed something
+/// ordinary.
+fn processes_in(cgroup: PathBuf) -> Vec<u32> {
+    fs::read_to_string(cgroup.join(CGROUP_PROCS_FILE))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+/// The sessions among the processes a sandbox holds: everything the read found,
+/// less the anchor that keeps the box alive. An anchor the read no longer finds
+/// leaves the rest of the list exactly as it came.
+fn sessions_among(processes: Vec<u32>, anchor: u32) -> Vec<u32> {
+    processes.into_iter().filter(|process| *process != anchor).collect()
 }
 
 /// The live anchor a container directory describes, or `None` when it describes
@@ -1574,6 +1624,32 @@ mod tests {
         assert!(neighbour.join("output.log").exists());
     }
 
+    #[test]
+    fn the_anchor_is_not_among_the_sessions_of_its_own_sandbox() {
+        let anchor = 4242;
+
+        let sessions = sessions_among(vec![anchor, 5150], anchor);
+
+        // The anchor sits in the sandbox's cgroup like everything else in the
+        // box, and the three callers count what comes out of here without
+        // looking at it again. Handing the read through unchanged makes an empty
+        // sandbox report one session, which asks before every `down` and leaves
+        // an idle box permanently active.
+        assert_eq!(sessions, vec![5150]);
+    }
+
+    #[test]
+    fn an_anchor_missing_from_the_process_list_leaves_the_rest_reported() {
+        let sessions = sessions_among(vec![5150], 4242);
+
+        // The anchor pid comes from the container state and the process list
+        // from the kernel, so the two are read a moment apart and an anchor that
+        // died in between is simply not in the list. Removing it by position, or
+        // insisting it be there, turns that ordinary race into a failure and
+        // loses the sessions that outlived it.
+        assert_eq!(sessions, vec![5150]);
+    }
+
     /// Write the container state a build leaves behind, through the runtime's own
     /// public writer rather than by hand, so what these tests hand the registry is
     /// what a real sandbox writes and no test knows the file format.
@@ -2296,6 +2372,31 @@ mod privileged_tests {
         // sees the same worktree, runs the same shell and answers every other
         // question here correctly, while the egress allowlist restricts nothing.
         assert_eq!(namespace_inode(session.pid, "net"), namespace_inode(token.pid.0, "net"));
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn a_running_sandbox_reports_the_session_joined_to_it() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+        let session = runtime.join_session(&session_spec(&spec.name)).unwrap();
+
+        let reported = runtime.session_pids(&spec.name).unwrap();
+
+        // Only a real box can say this: the anchor and the session land in the
+        // sandbox's cgroup through the runtime's own bookkeeping, and where that
+        // cgroup is on this host is decided by the systemd driver a rootless
+        // container is forced onto. Equality rather than membership, because the
+        // anchor is in that same cgroup and everything downstream counts this
+        // list without reading it: one extra entry is a box that reports a
+        // session nobody opened.
+        assert_eq!(reported, vec![session.pid]);
         runtime.teardown(&spec.name).unwrap();
     }
 
