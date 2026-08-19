@@ -712,13 +712,14 @@ mod tests {
         let carried = sandbox.path().join("held-by-the-caller");
         let held = File::create(&carried).unwrap();
 
-        let port = start(sandbox.path(), &allowlist_of("localhost")).unwrap();
-        answering_within_deadline(port);
+        start(sandbox.path(), &allowlist_of("localhost")).unwrap();
 
-        // A fork keeps every open file of the process that forked it, and one of
-        // those is the lock held while the sandbox is being built. Kept by a
-        // process that only leaves when the sandbox does, it makes the name read
-        // as still being built for as long as the sandbox lives.
+        // What this pins is routing: the proxy is started through the family that
+        // sweeps a forked helper's inherited descriptors, and not around it.
+        // Read as evidence about that sweep it would be a blind witness, because
+        // its way of looking (a pid file, a listing of the process's descriptors,
+        // a readlink each) takes far longer than the sweep it would have to catch
+        // in the act. The sweep has its own witness, next to the code doing it.
         let recorded = fs::read_to_string(sandbox.path().join("proxy.pid")).unwrap();
         let descriptors = fs::read_dir(format!("/proc/{}/fd", recorded.trim())).unwrap();
         let carried_along = descriptors

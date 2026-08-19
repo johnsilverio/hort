@@ -255,20 +255,6 @@ mod tests {
         false
     }
 
-    /// Whether a process holds no descriptor of this file, waiting for it: a
-    /// forked process takes a moment to let go of what it inherited, and a
-    /// descriptor once let go is never taken back.
-    fn released_within_deadline(pid: u32, file: &Path) -> bool {
-        let deadline = Instant::now() + WIRING_DEADLINE;
-        while Instant::now() < deadline {
-            if !holds(pid, file) {
-                return true;
-            }
-            sleep(POLL);
-        }
-        false
-    }
-
     fn holds(pid: u32, file: &Path) -> bool {
         let Ok(descriptors) = fs::read_dir(format!("/proc/{pid}/fd")) else { return false };
         descriptors
@@ -469,11 +455,13 @@ mod tests {
 
         start(sandbox.path(), &[database_beyond_the_loopback(port)]).unwrap();
 
-        // A fork keeps every open file of the process that forked it, and one of
-        // those is the lock hort holds while it builds a sandbox. Held by a
-        // process that only leaves when the sandbox does, it makes the name read
-        // as still being built for as long as the sandbox lives.
-        assert!(released_within_deadline(recorded_pid(sandbox.path()), &carried));
+        // What this pins is routing: the forwarding is started through the family
+        // that sweeps a forked helper's inherited descriptors, and not around it.
+        // Read as evidence about that sweep it would be a blind witness, because
+        // its way of looking (a pid file, a listing of the process's descriptors,
+        // a readlink each) takes far longer than the sweep it would have to catch
+        // in the act. The sweep has its own witness, next to the code doing it.
+        assert!(!holds(recorded_pid(sandbox.path()), &carried));
 
         drop(held);
         stop(sandbox.path()).unwrap();

@@ -48,9 +48,10 @@ impl HostHelper {
     }
 
     /// Start one in a process that outlives this call, serving with `kept` as the
-    /// only descriptors it carries over from here, and record what it is. One
-    /// that cannot be recorded is stopped rather than left running: nothing else
-    /// knows it exists.
+    /// only descriptors it carries over from here, and record what it is. By the
+    /// time this returns the started process has already let go of everything
+    /// else it inherited. One that cannot be recorded is stopped rather than left
+    /// running: nothing else knows it exists.
     pub fn start(
         &self,
         sandbox_dir: &Path,
@@ -60,13 +61,13 @@ impl HostHelper {
         let streams = helper_streams(sandbox_dir)?;
         let (mut announcement, announce) =
             io::pipe().map_err(|err| format!("creating a pipe: {err}"))?;
-        let mut kept = kept.to_vec();
+        let mut carried = carried_through_the_sweep(kept, &streams, &announce);
 
         match unsafe { libc::fork() } {
             -1 => Err(format!("forking {}: {}", self.process_name, io::Error::last_os_error())),
             0 => {
                 drop(announcement);
-                serve_detached(self.process_name, &mut kept, streams, announce, serve)
+                serve_detached(self.process_name, &mut carried, streams, announce, serve)
             }
             child => {
                 drop(announce);
@@ -164,18 +165,34 @@ pub fn splice(client: &TcpStream, upstream: &TcpStream) {
 /// unwinding would clean up belongs to the process on the other side of the fork.
 fn serve_detached(
     process_name: &str,
-    kept: &mut [RawFd],
+    carried: &mut [RawFd],
     streams: HelperStreams,
     announce: PipeWriter,
     serve: impl FnOnce(),
 ) -> ! {
+    // Swept before anything else, because until this line the child holds every
+    // descriptor the forking process had open, including files another of its
+    // threads has in hand. Nothing written here closes that interval: the kernel
+    // copies the table inside the fork, so the child is already holding all of it
+    // while the rest of the fork runs and while it waits for a CPU, which is far
+    // longer than its own path to this call. The announcement comes last for the
+    // opposite reason, since it is what releases the caller.
+    //
+    // No test pins this order, and that is a finding rather than a gap. One was
+    // written and deleted: all it can observe is whether a file the caller let
+    // go of is still held, and a child forked by any other thread holds that
+    // same file for the same instant, which is a different race and one no
+    // ordering here reaches. Beside its siblings it went red against this order
+    // and the wrong one alike; alone it went green against both. What keeps the
+    // order right is that it cannot be written wrong: an announcement cannot
+    // come before a sweep that is the first line.
+    close_inherited_descriptors(carried);
     if name_process(process_name).is_err()
         || redirect(streams).is_err()
         || announced(announce).is_err()
     {
         unsafe { libc::_exit(1) }
     }
-    close_inherited_descriptors(kept);
     serve();
     unsafe { libc::_exit(0) }
 }
@@ -186,6 +203,12 @@ struct HelperStreams {
     input: File,
     output: File,
     errors: File,
+}
+
+impl HelperStreams {
+    fn descriptors(&self) -> [RawFd; 3] {
+        [self.input.as_raw_fd(), self.output.as_raw_fd(), self.errors.as_raw_fd()]
+    }
 }
 
 /// Open them from hort's own process, before the fork. A helper keeps whatever it
@@ -232,12 +255,28 @@ fn announced(mut announce: PipeWriter) -> io::Result<()> {
     announce.write_all(&HANDSHAKE)
 }
 
-/// Close everything this process inherited except the descriptors it was left to
-/// serve with.
-fn close_inherited_descriptors(kept: &mut [RawFd]) {
-    kept.sort_unstable();
+/// What the sweep leaves in place: the descriptors the helper was left to serve
+/// with, the streams the redirect still has to put in place of the inherited
+/// ones, and the one the helper announces itself over. Assembled before the fork
+/// so that sweeping can be the child's first act, and the announcement belongs in
+/// it because a sweep that closed it would reach the caller as a helper that
+/// never started.
+fn carried_through_the_sweep(
+    kept: &[RawFd],
+    streams: &HelperStreams,
+    announce: &PipeWriter,
+) -> Vec<RawFd> {
+    let mut carried = kept.to_vec();
+    carried.extend(streams.descriptors());
+    carried.push(announce.as_raw_fd());
+    carried
+}
+
+/// Close everything this process inherited except what it was left to carry over.
+fn close_inherited_descriptors(carried: &mut [RawFd]) {
+    carried.sort_unstable();
     let mut first = 3;
-    for descriptor in kept.iter() {
+    for descriptor in carried.iter() {
         if *descriptor < first {
             continue;
         }
@@ -320,4 +359,38 @@ fn discard(pid: libc::pid_t) {
     unsafe { libc::kill(pid, libc::SIGKILL) };
     let mut status = 0;
     unsafe { libc::waitpid(pid, &mut status, 0) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::net::TcpListener;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    /// A helper of no particular kind, so what the whole family is started under
+    /// is asked of the family and not of one of its four members.
+    const A_HELPER: HostHelper = HostHelper::new("hort-witness", "witness.pid");
+    /// How long a started helper stays in the process table. Bounded rather than
+    /// endless because a test that dies on an assertion never reaches the stop,
+    /// and what it leaves behind should leave on its own.
+    const LINGERS: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn a_helper_given_descriptors_to_serve_with_is_reported_as_started() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let served = TcpListener::bind("127.0.0.1:0").unwrap();
+
+        let started = A_HELPER.start(sandbox.path(), &[served.as_raw_fd()], || sleep(LINGERS));
+
+        // A caller learns a helper started by hearing from it over a descriptor
+        // of its own, and that descriptor is in nobody's keeping. Swept away
+        // along with everything else inherited, it reaches the caller as a closed
+        // pipe, and a helper that is already serving is killed as one that never
+        // started.
+        assert!(started.is_ok());
+
+        A_HELPER.stop(sandbox.path()).unwrap();
+    }
 }
