@@ -54,6 +54,8 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 use libcontainer::container::builder::ContainerBuilder;
 use libcontainer::container::{Container, ContainerStatus};
@@ -105,6 +107,10 @@ const SANDBOX_MARKER: &str = "HORT_SANDBOX=";
 const PID_NUMBERING: &str = "NSpid:";
 /// What the first process of a pid namespace is numbered inside it.
 const FIRST_PROCESS: &str = "1";
+/// How long a sandbox's own processes are given to answer a request to stop
+/// before the sandbox comes down over them.
+const STOP_GRACE: Duration = Duration::from_secs(5);
+const STOP_POLL: Duration = Duration::from_millis(50);
 /// What every line of `/proc/<pid>/cgroup` starts with on a unified host:
 /// hierarchy id zero and an empty controller list, then the path.
 const UNIFIED_HIERARCHY: &str = "0::";
@@ -169,10 +175,12 @@ impl LibcontainerRuntime {
     fn stop_container(&self, name: &SandboxName) -> Result<(), HortError> {
         let container_dir = self.container_dir(name);
         if !container_dir.exists() {
-            // Teardown runs against a record, and the kernel is free to have
-            // outlived it: a sandbox the runtime never knew, or no longer knows,
-            // is already torn down.
-            return Ok(());
+            // Those files are bookkeeping the anchor does not depend on, so losing
+            // them costs the runtime the handle it stops a container by and costs
+            // the container nothing at all. What is left of the sandbox is
+            // whatever the kernel still has of it, and a signal is the only way
+            // left to reach that.
+            return stop_by_signal(name);
         }
 
         let mut container = Container::load(container_dir).map_err(|err| {
@@ -554,6 +562,119 @@ fn merged(recorded: Vec<RegistryEntry>, declared: Vec<RegistryEntry>) -> Vec<Reg
         }
     }
     anchors
+}
+
+/// Stop a sandbox by signalling what the kernel still has of it, for when the
+/// runtime has no container state left to stop it through.
+///
+/// A name no live anchor declares is a sandbox that really is down, and saying so
+/// is what lets a teardown run a second time. An anchor that is still up is the
+/// opposite case: reporting a sandbox down while it holds the worktree mounted
+/// gets that worktree deleted under it, which is the corruption the order of a
+/// shutdown exists to prevent.
+fn stop_by_signal(name: &SandboxName) -> Result<(), HortError> {
+    // The enumeration behind this is deliberately looser, so that a stray process
+    // carrying the marker still shows up as something to look at. Strictness
+    // belongs here, where getting it wrong signals a process a user is typing in.
+    let Some(entry) = declared_anchors()
+        .into_iter()
+        .find(|entry| entry.id == *name && heads_its_own_pid_namespace(entry.token.pid.0))
+    else {
+        return Ok(());
+    };
+    let anchor = entry.token;
+
+    let sessions = sessions_of(&anchor);
+    for session in &sessions {
+        ask_to_stop(*session);
+    }
+    wait_until_gone(&sessions, &anchor);
+
+    // Nothing is asked of the anchor, because there is nothing it could hear: it
+    // is the first process of the sandbox's own pid namespace, and for such a
+    // process the kernel discards a signal whose action is the default unless it
+    // installed a handler, which the `sleep` holding a sandbox open never does.
+    // Killing it is also what ends a session that refused the request above,
+    // since the death of that first process takes its pid namespace with it.
+    kill_outright(anchor.pid.0)
+}
+
+/// Whether the process at `pid` is the first process of a pid namespace of its
+/// own, which is what a sandbox anchor is and what nothing else on this host is.
+///
+/// Any process a user runs may export the variable that names a sandbox, and
+/// that alone is enough to be enumerated as an anchor. The pid namespace is not
+/// something a process can claim: hort gives one to every sandbox it builds, and
+/// a process outside a sandbox is numbered in no namespace but the one doing the
+/// reading. A process this cannot be read for is not one to signal.
+fn heads_its_own_pid_namespace(pid: u32) -> bool {
+    let Ok(status) = fs::read_to_string(format!("{PROC_ROOT}/{pid}/status")) else {
+        return false;
+    };
+    let Some(numbering) = status.lines().find_map(|line| line.strip_prefix(PID_NUMBERING)) else {
+        return false;
+    };
+    let mut inside = numbering.split_whitespace();
+    inside.next();
+    inside.last().is_some_and(|innermost| innermost == FIRST_PROCESS)
+}
+
+/// The sandbox's own processes, less the anchor holding it open.
+///
+/// The cgroup says where to look and never who belongs. It is the anchor's own,
+/// so it holds the sandbox and nothing else, but the same read from a pid that is
+/// no container anchor answers a scope shared with the rest of what this user
+/// runs, the shell hort was typed into included. The mount namespace is what
+/// settles it: every session shares the anchor's by construction, and nothing
+/// outside the sandbox is in it.
+fn sessions_of(anchor: &LivenessToken) -> Vec<u32> {
+    let processes = cgroup_of(anchor.pid.0).map(processes_in).unwrap_or_default();
+    sessions_among(processes, anchor.pid.0)
+        .into_iter()
+        .filter(|pid| joined_to(*pid, anchor))
+        .collect()
+}
+
+/// Whether the kernel still has `pid`, and has it inside the sandbox `anchor`
+/// holds open.
+fn joined_to(pid: u32, anchor: &LivenessToken) -> bool {
+    liveness_token(pid).is_ok_and(|found| found.mnt_ns == anchor.mnt_ns)
+}
+
+/// Wait for every one of `sessions` to leave, returning as soon as none is left
+/// and giving up once the grace runs out.
+fn wait_until_gone(sessions: &[u32], anchor: &LivenessToken) {
+    let deadline = Instant::now() + STOP_GRACE;
+    while Instant::now() < deadline {
+        if !sessions.iter().any(|pid| joined_to(*pid, anchor)) {
+            return;
+        }
+        sleep(STOP_POLL);
+    }
+}
+
+/// Ask a process to stop, and let a request that could not be delivered pass.
+///
+/// Asking is a courtesy and never the mechanism. A session can be an agent
+/// halfway through writing a file into the worktree, and the difference between a
+/// whole file and a truncated one is why a shutdown has an order at all; what
+/// takes the sandbox down is the kill that follows, so a request that found
+/// nobody has already produced what it was sent for.
+fn ask_to_stop(pid: u32) {
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+}
+
+/// Take a process down, counting one that has already left as taken down.
+fn kill_outright(pid: u32) -> Result<(), HortError> {
+    if unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } == -1 {
+        let failure = io::Error::last_os_error();
+        if failure.raw_os_error() != Some(libc::ESRCH) {
+            return Err(runtime_failure(format!(
+                "teardown: killing the anchor ({pid}): {failure}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The host user a sandbox's writes must land as: the owner of the directory
@@ -1965,6 +2086,20 @@ mod tests {
         fn pid(&self) -> u32 {
             self.0.id()
         }
+
+        /// Whether the process is still running, asked once anything sent its way
+        /// has had time to land.
+        ///
+        /// A signal is delivered to a running process and acted on when that
+        /// process next runs, so one asked about the instant after a kill was
+        /// sent can still answer that it is alive while already being doomed.
+        /// Measured on this same kind of process, a kill leaves it reapable
+        /// within a tenth of a millisecond, and the wait here is three orders of
+        /// magnitude of that.
+        fn is_still_running(&mut self) -> bool {
+            sleep(Duration::from_millis(100));
+            self.0.try_wait().unwrap().is_none()
+        }
     }
 
     impl Drop for HostProcess {
@@ -2031,6 +2166,36 @@ mod tests {
         // `ls` fills with lost records nobody made and `prune` offers to clean
         // processes that were never hort's to touch.
         assert!(!live.iter().any(|entry| entry.token.pid.0 == stranger.pid()));
+    }
+
+    #[test]
+    fn teardown_does_not_stop_a_host_process_that_merely_declares_the_sandbox() {
+        let runtime_root = tempfile::tempdir().unwrap();
+        let name = a_name_nothing_else_answers_to("impostor");
+        let mut impostor = HostProcess::declaring(&name);
+        let runtime = LibcontainerRuntime::new(runtime_root.path().to_path_buf());
+        // What follows is only worth reading if this process is one hort sees
+        // under that name: a process the enumeration never finds is one nothing
+        // could have signalled by mistake.
+        let live = runtime.list_live().unwrap();
+        assert!(
+            live.iter().any(|entry| entry.id == name && entry.token.pid.0 == impostor.pid()),
+            "the process is not enumerated under the sandbox it declares"
+        );
+
+        runtime.teardown(&name).unwrap();
+
+        // Exporting a variable is not what makes a sandbox, and anything this
+        // user runs is free to export it, the shell hort was typed into
+        // included. A teardown that signals on the strength of that name alone
+        // reaches whatever the host happens to be running under it.
+        //
+        // Which is also the warning owed to whoever loosens that check to try
+        // something: on a tree where it is gone, this test signals the processes
+        // sharing its own cgroup, and on a developer's machine that is the shell
+        // and whatever is driving it. Run it under a scope of its own before
+        // reverting anything here.
+        assert!(impostor.is_still_running(), "the teardown stopped a process outside any sandbox");
     }
 
     #[test]
@@ -2175,6 +2340,62 @@ mod privileged_tests {
             sleep(POLL);
         }
         false
+    }
+
+    /// The file a session leaves in `/workdir` once what a stop request does to
+    /// it is its own to answer for.
+    ///
+    /// A session exists as a pid before it execs, and until it does, a signal
+    /// reaches whatever hort started it as rather than what it was written to
+    /// become. Without this, a request that arrives early kills a session that
+    /// was never arranged to survive one.
+    const READY_FOR_A_STOP: &str = "ready-for-a-stop";
+    /// The file a session leaves in `/workdir` when it is asked to stop instead
+    /// of being killed where it stands.
+    const ASKED_TO_STOP: &str = "asked-to-stop";
+
+    /// A session nothing short of a kill takes down, which is what an agent that
+    /// holds off a stop request until it has finished writing looks like from
+    /// outside the box.
+    ///
+    /// One process and not two: a signal set to be ignored stays ignored across
+    /// an exec while a handler does not, so the `sleep` this becomes carries the
+    /// disposition, and the session holds no child that could die of the request
+    /// and end it that way instead.
+    fn stop_ignoring_session(name: &SandboxName) -> SessionSpec {
+        SessionSpec {
+            name: name.clone(),
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("trap '' TERM; touch {WORKDIR}/{READY_FOR_A_STOP}; exec sleep infinity"),
+            ],
+            cwd: PathBuf::from(WORKDIR),
+            env: Vec::new(),
+            terminal: false,
+        }
+    }
+
+    /// A session that records having been asked to stop, and then stops.
+    ///
+    /// It waits on a background child rather than running a foreground one
+    /// because a shell holds a pending handler until the command it is waiting
+    /// on returns, and the wait built into it is what returns on the signal
+    /// itself.
+    fn stop_reporting_session(name: &SandboxName) -> SessionSpec {
+        SessionSpec {
+            name: name.clone(),
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "trap 'touch {WORKDIR}/{ASKED_TO_STOP}; exit 0' TERM; touch {WORKDIR}/{READY_FOR_A_STOP}; sleep infinity & wait"
+                ),
+            ],
+            cwd: PathBuf::from(WORKDIR),
+            env: Vec::new(),
+            terminal: false,
+        }
     }
 
     /// An allowlisted sandbox declaring one database on the host's own loopback.
@@ -2654,6 +2875,146 @@ mod privileged_tests {
         runtime.teardown(&spec.name).unwrap();
 
         assert!(stopped_within_deadline(token.pid.0));
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn teardown_stops_an_anchor_whose_container_state_is_gone() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+        let _state_gone = ContainerStateAside::taken_from(&sandbox, &spec.name);
+
+        runtime.teardown(&spec.name).unwrap();
+
+        // Those files are bookkeeping the anchor does not depend on: losing them
+        // costs the runtime the only handle it had on the container and costs the
+        // container nothing at all. Read as a box that is already down, the loss
+        // buys a successful teardown over a sandbox still holding the worktree
+        // mounted, and whoever asked for the teardown deletes that worktree next.
+        assert!(stopped_within_deadline(token.pid.0), "the anchor outlived the teardown");
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn teardown_stops_a_session_of_a_sandbox_whose_container_state_is_gone() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+        // Joined while the state is still there, because joining reads the very
+        // files the arrangement is about to take away.
+        let session = runtime.join_session(&session_spec(&spec.name)).unwrap();
+        let _state_gone = ContainerStateAside::taken_from(&sandbox, &spec.name);
+
+        runtime.teardown(&spec.name).unwrap();
+
+        // This session dies twice over, which is measured and not reasoned: the
+        // request to stop reaches it first, and the death of the anchor would
+        // take it anyway, since the anchor is pid 1 of the sandbox's pid
+        // namespace and a pid 1 takes its namespace with it. So nothing here
+        // discriminates, and no single change to how a teardown signals turns
+        // this red. It stays because it is the only line that notices if BOTH
+        // of those go away, and the second one goes away silently, by someone
+        // dropping the pid namespace from the spec.
+        // The session deliberately carries nothing naming the sandbox in its
+        // environment, which is what anything spawned inside the box looks like
+        // once a shell in there has cleared the variable.
+        assert!(stopped_within_deadline(session.pid), "the session outlived the teardown");
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn teardown_stops_a_sandbox_process_that_ignores_the_request_to_stop() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+        let session = runtime.join_session(&stop_ignoring_session(&spec.name)).unwrap();
+        let ready = spec.workdir.join(READY_FOR_A_STOP);
+        assert!(
+            appeared_within_deadline(&ready),
+            "the session never took charge of a stop request"
+        );
+        let _state_gone = ContainerStateAside::taken_from(&sandbox, &spec.name);
+
+        runtime.teardown(&spec.name).unwrap();
+
+        // Asking a process to stop is a request, and this sandbox holds one that
+        // refuses it, which is the shape of the agent the request exists for in
+        // the first place. A teardown that asks, waits and gives up leaves the
+        // box standing behind a report that it is down, which is the same lie
+        // this arm was opened to end, arriving through the remedy for it.
+        assert!(stopped_within_deadline(session.pid), "the session survived the teardown");
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn a_sandbox_process_is_asked_to_stop_before_it_is_killed() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+        runtime.join_session(&stop_reporting_session(&spec.name)).unwrap();
+        let ready = spec.workdir.join(READY_FOR_A_STOP);
+        assert!(
+            appeared_within_deadline(&ready),
+            "the session never took charge of a stop request"
+        );
+        let _state_gone = ContainerStateAside::taken_from(&sandbox, &spec.name);
+
+        runtime.teardown(&spec.name).unwrap();
+
+        // The anchor is a `sleep` and goes on the first signal either way, but a
+        // session can be an agent halfway through writing a file into the
+        // worktree, and the difference between a whole file and a truncated one
+        // is the whole reason the order of a shutdown is fixed at all. Killing
+        // outright saves nothing and spends exactly what the shutdown order is
+        // there to protect.
+        assert!(spec.workdir.join(ASKED_TO_STOP).exists(), "the session was killed unasked");
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn teardown_leaves_the_live_anchor_of_another_sandbox_running() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+        let stranger = SandboxName::new(&format!("{}-stranger", spec.name.as_str())).unwrap();
+        // The refusal below is only worth reading if the enumeration a teardown
+        // consults does name this anchor: a sandbox nothing can see is one
+        // nothing could have stopped by mistake.
+        let live = runtime.list_live().unwrap();
+        assert!(live.iter().any(|entry| entry.id == spec.name), "the anchor is not enumerated");
+
+        runtime.teardown(&stranger).unwrap();
+
+        // The runtime knows nothing of this name, so the anchors it can reach
+        // are the ones it was never asked about. Signalling by liveness instead
+        // of by name would take down the box a person is working in on the
+        // strength of a teardown aimed somewhere else entirely.
+        assert!(
+            Path::new(&format!("/proc/{}/ns/mnt", token.pid.0)).exists(),
+            "the teardown of another name stopped this anchor"
+        );
+        runtime.teardown(&spec.name).unwrap();
     }
 
     #[test]
