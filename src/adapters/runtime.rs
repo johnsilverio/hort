@@ -26,6 +26,10 @@
 //! refreshes its status against the `/proc` entry of the pid it recorded, so
 //! walking the container states and loading each entry answers which anchors are
 //! up without a daemon and without hort ever parsing the runtime's file format.
+//! Those files are bookkeeping the anchor does not depend on, though, so the
+//! process table is read alongside them: a process of this user carrying the
+//! sandbox marker is an anchor as well, and an anchor no file describes any more
+//! is precisely the one whose worktree must not be deleted under it.
 //!
 //! Everything this adapter writes is meaningless once the machine restarts, so it
 //! all lives under the runtime root: the container states under one directory, the
@@ -92,6 +96,15 @@ const CPU_PERIOD_USEC: u64 = 100_000;
 /// ever written.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const CGROUP_PROCS_FILE: &str = "cgroup.procs";
+const PROC_ROOT: &str = "/proc";
+/// The environment entry hort puts in a sandbox, and the whole of what tells a
+/// sandbox's processes from the rest of what this user is running.
+const SANDBOX_MARKER: &str = "HORT_SANDBOX=";
+/// The line of `/proc/<pid>/status` numbering a process in every pid namespace
+/// it belongs to, the reader's own first and the one it lives in last.
+const PID_NUMBERING: &str = "NSpid:";
+/// What the first process of a pid namespace is numbered inside it.
+const FIRST_PROCESS: &str = "1";
 /// What every line of `/proc/<pid>/cgroup` starts with on a unified host:
 /// hierarchy id zero and an empty controller list, then the path.
 const UNIFIED_HIERARCHY: &str = "0::";
@@ -346,12 +359,16 @@ impl ContainerRuntime for LibcontainerRuntime {
 
 impl ContainerRegistry for LibcontainerRuntime {
     fn list_live(&self) -> Result<Vec<RegistryEntry>, HortError> {
+        // Read before the walk below can answer anything, because the anchor
+        // this source exists for is exactly the one the walk will not find.
+        let declared = declared_anchors();
+
         let containers_root = self.containers_root();
         let container_dirs = match fs::read_dir(&containers_root) {
             Ok(entries) => entries,
-            // Nothing has been built on this boot, so no anchor is alive. Every
-            // command that reconciles asks this before the first sandbox exists.
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            // Nothing was ever built under this root, which says where the
+            // container states are not and nothing about which anchors are up.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(declared),
             // A root that cannot be read is not an empty root: answering "no
             // anchor is alive" without knowing would hand every running sandbox
             // to `prune` as debris.
@@ -363,7 +380,9 @@ impl ContainerRegistry for LibcontainerRuntime {
             }
         };
 
-        Ok(container_dirs.flatten().filter_map(|entry| live_anchor(&entry.path())).collect())
+        let recorded =
+            container_dirs.flatten().filter_map(|entry| live_anchor(&entry.path())).collect();
+        Ok(merged(recorded, declared))
     }
 }
 
@@ -432,6 +451,109 @@ fn live_anchor(container_dir: &Path) -> Option<RegistryEntry> {
     let id = SandboxName::new(container.id()).ok()?;
     let pid = u32::try_from(container.pid()?.as_raw()).ok()?;
     Some(RegistryEntry { id, token: liveness_token(pid).ok()? })
+}
+
+/// Every live anchor the host's own process table names.
+///
+/// A container's state directory is bookkeeping the anchor does not depend on:
+/// an older build wrote it where this one does not look, and a hand that removed
+/// it loses it outright, while the process goes on holding the worktree mounted.
+/// What no such loss reaches is the anchor's own environment, so the process
+/// table answers for the sandboxes those files no longer describe. Without it
+/// they are invisible to every command that reconciles, which is what lets
+/// `prune` remove a worktree out from under a running container.
+///
+/// A `/proc` that cannot be listed yields nothing rather than an error, because
+/// by then every liveness read in hort is already dead and this enumeration is
+/// not where that gets reported.
+fn declared_anchors() -> Vec<RegistryEntry> {
+    let user = unsafe { libc::getuid() };
+    let Ok(processes) = fs::read_dir(PROC_ROOT) else {
+        return Vec::new();
+    };
+    processes
+        .flatten()
+        .filter_map(|process| process.file_name().to_str()?.parse().ok())
+        .filter_map(|pid| declared_anchor(pid, user))
+        .collect()
+}
+
+/// The live anchor the process at `pid` declares itself to be, or `None` when it
+/// declares none.
+///
+/// Reading a process is racing it, and every step here can find it gone, find a
+/// file it may not read, or find a value it cannot make sense of. All of those
+/// mean the same thing, that there is no anchor here: a pid that disappears
+/// between the listing and the read is the ordinary case rather than a failure
+/// of the enumeration, and one process nobody can read is no reason to stop
+/// answering for the rest.
+///
+/// Only what `user` runs is considered. Another user's environment is not
+/// readable anyway while hort runs unprivileged, and a sandbox hort could not
+/// have started is not one it may report on and offer to clean.
+fn declared_anchor(pid: u32, user: u32) -> Option<RegistryEntry> {
+    if fs::metadata(format!("{PROC_ROOT}/{pid}")).ok()?.uid() != user {
+        return None;
+    }
+    let environ = fs::read(format!("{PROC_ROOT}/{pid}/environ")).ok()?;
+    let id = declared_sandbox(&environ)?;
+    let status = fs::read_to_string(format!("{PROC_ROOT}/{pid}/status")).ok()?;
+    if !anchors_the_sandbox_it_declares(&status) {
+        return None;
+    }
+    Some(RegistryEntry { id, token: liveness_token(pid).ok()? })
+}
+
+/// The sandbox a process says it belongs to, read out of its environment.
+///
+/// The entries come separated by nul bytes and are not text: an environment may
+/// hold bytes no string does, so a value becomes a name only once it has been
+/// found. The whole `NAME=` is matched rather than the name alone, or a variable
+/// that merely begins the same way would name a sandbox.
+fn declared_sandbox(environ: &[u8]) -> Option<SandboxName> {
+    let declared = environ
+        .split(|byte| *byte == 0)
+        .find_map(|entry| entry.strip_prefix(SANDBOX_MARKER.as_bytes()))?;
+    SandboxName::new(std::str::from_utf8(declared).ok()?).ok()
+}
+
+/// Whether the process this status describes is the one its sandbox was started
+/// with, rather than one that joined the sandbox afterwards.
+///
+/// Every session carries the same marker as its anchor and runs in the anchor's
+/// mount namespace, so the two differ in nothing read here except the pid, while
+/// reconciliation matches a record against the whole token. A session reported
+/// in its anchor's place therefore reads a running sandbox as orphaned, which is
+/// the very outcome this second source exists to prevent. What separates them is
+/// that hort gives a sandbox a pid namespace of its own: the anchor is the first
+/// process in it and everything joined later is numbered after it.
+fn anchors_the_sandbox_it_declares(status: &str) -> bool {
+    let Some(numbering) = status.lines().find_map(|line| line.strip_prefix(PID_NUMBERING)) else {
+        return false;
+    };
+    let mut inside = numbering.split_whitespace();
+    inside.next();
+    // A process numbered in no namespace but the reader's own is inside no
+    // sandbox, so there is nothing here to mistake for a session and the marker
+    // it carries is the whole of what it is judged by.
+    inside.last().is_none_or(|innermost| innermost == FIRST_PROCESS)
+}
+
+/// The two sources of live anchors as one enumeration, one entry per sandbox.
+///
+/// They overlap for every sandbox in good health, so concatenating them would
+/// report the ordinary case twice and offer a box with no record for adoption
+/// once per source. What `recorded` says wins where both know a sandbox: it is
+/// read from the state the sandbox was started against, which is the state the
+/// record was written from.
+fn merged(recorded: Vec<RegistryEntry>, declared: Vec<RegistryEntry>) -> Vec<RegistryEntry> {
+    let mut anchors = recorded;
+    for found in declared {
+        if !anchors.iter().any(|known| known.id == found.id) {
+            anchors.push(found);
+        }
+    }
+    anchors
 }
 
 /// The host user a sandbox's writes must land as: the owner of the directory
@@ -1142,6 +1264,9 @@ fn ceiling(limits: &ResourceLimits) -> LinuxResources {
 mod tests {
     use super::*;
 
+    use std::io::{BufRead, BufReader};
+    use std::process::{Child, Command, Stdio};
+
     use libcontainer::container::ContainerStatus;
     use libcontainer::oci_spec::runtime::{
         Capabilities, LinuxIdMappingBuilder, LinuxNamespaceType,
@@ -1674,7 +1799,13 @@ mod tests {
     #[test]
     fn registry_reports_a_running_container_as_a_live_anchor() {
         let runtime_root = tempfile::tempdir().unwrap();
-        record_container(runtime_root.path(), "demo", ContainerStatus::Running, Some(a_live_pid()));
+        let name = a_name_nothing_else_answers_to("recorded");
+        record_container(
+            runtime_root.path(),
+            name.as_str(),
+            ContainerStatus::Running,
+            Some(a_live_pid()),
+        );
         let registry = registry_over(runtime_root.path());
 
         let live = registry.list_live().unwrap();
@@ -1682,29 +1813,41 @@ mod tests {
         // Nothing else in hort answers "which anchors are up". A registry that
         // finds none reports every sandbox in `ls` as orphaned while its anchor
         // runs, and hands `prune` a live box as debris to remove.
-        assert_eq!(live.len(), 1);
-        assert_eq!(live[0].id, SandboxName::new("demo").unwrap());
+        assert!(live.iter().any(|entry| entry.id == name));
     }
 
     #[test]
     fn registry_reports_a_token_the_liveness_probe_recognizes() {
         let runtime_root = tempfile::tempdir().unwrap();
-        record_container(runtime_root.path(), "demo", ContainerStatus::Running, Some(a_live_pid()));
+        let name = a_name_nothing_else_answers_to("recognizable");
+        record_container(
+            runtime_root.path(),
+            name.as_str(),
+            ContainerStatus::Running,
+            Some(a_live_pid()),
+        );
         let registry = registry_over(runtime_root.path());
 
         let live = registry.list_live().unwrap();
 
+        let reported = live.iter().find(|entry| entry.id == name).expect("the recorded sandbox");
         // Reconciliation matches this token against the one the record carries,
         // and that one was read the way this probe reads it. A registry that
         // reports the right sandbox under a token nobody recognizes is the same
         // outcome as reporting nothing, and looks correct from every other angle.
-        assert!(ProcLivenessProbe.is_alive(&live[0].token));
+        assert!(ProcLivenessProbe.is_alive(&reported.token));
     }
 
     #[test]
     fn registry_skips_a_container_directory_it_cannot_read() {
         let runtime_root = tempfile::tempdir().unwrap();
-        record_container(runtime_root.path(), "demo", ContainerStatus::Running, Some(a_live_pid()));
+        let name = a_name_nothing_else_answers_to("beside-a-half-written-one");
+        record_container(
+            runtime_root.path(),
+            name.as_str(),
+            ContainerStatus::Running,
+            Some(a_live_pid()),
+        );
         fs::create_dir_all(runtime_root.path().join("containers").join("half-written")).unwrap();
 
         let live = registry_over(runtime_root.path()).list_live().unwrap();
@@ -1714,26 +1857,31 @@ mod tests {
         // one an interrupted build or a container removed mid-walk leaves behind.
         // Failing on it would take down every command that reconciles, and the
         // only way out would be deleting files by hand.
-        assert_eq!(live.len(), 1);
-        assert_eq!(live[0].id, SandboxName::new("demo").unwrap());
+        assert!(live.iter().any(|entry| entry.id == name));
     }
 
     #[test]
     fn registry_omits_a_container_whose_anchor_is_not_running() {
         let runtime_root = tempfile::tempdir().unwrap();
+        let name = a_name_nothing_else_answers_to("recorded-short-of-running");
         // A live pid with a status short of running: the runtime keeps that
         // status rather than promoting it, so nothing but the status itself
         // stands between this entry and being read as a live anchor. Recording
         // it with a dead pid instead would prove nothing, because a pid nobody
         // can read is dropped a step later anyway.
-        record_container(runtime_root.path(), "demo", ContainerStatus::Created, Some(a_live_pid()));
+        record_container(
+            runtime_root.path(),
+            name.as_str(),
+            ContainerStatus::Created,
+            Some(a_live_pid()),
+        );
 
         let live = registry_over(runtime_root.path()).list_live().unwrap();
 
         // The container state outlives the anchor it describes, so the directory
         // alone means nothing. Reading it as alive makes `ls` report a dead
         // sandbox as live and keeps `prune` from ever offering to clean it.
-        assert!(live.is_empty());
+        assert!(!live.iter().any(|entry| entry.id == name));
     }
 
     #[test]
@@ -1754,15 +1902,135 @@ mod tests {
     }
 
     #[test]
-    fn registry_reports_nothing_when_no_container_was_ever_built() {
+    fn registry_answers_a_root_that_was_never_built_rather_than_refusing_it() {
         let runtime_root = tempfile::tempdir().unwrap();
         let registry = LibcontainerRuntime::new(runtime_root.path().to_path_buf());
 
-        let live = registry.list_live().unwrap();
+        let live = registry.list_live();
 
         // Nothing has run yet: the root is created by the first build, and every
-        // command that reconciles asks this before then.
-        assert!(live.is_empty());
+        // command that reconciles asks this before then. What comes back is not
+        // the point, since a root nothing was built under is no evidence about
+        // what is running; that an answer comes back at all is, and it is the
+        // honest counterpart of refusing a root that cannot be read.
+        assert!(live.is_ok());
+    }
+
+    /// A sandbox name nothing else on this machine answers to. These tests read
+    /// the real process table, so a name shared with anything else running would
+    /// have them assert about somebody else's process.
+    fn a_name_nothing_else_answers_to(suffix: &str) -> SandboxName {
+        SandboxName::new(&format!("scan-{}-{suffix}", std::process::id())).unwrap()
+    }
+
+    /// A real process of this user, alive until the test lets go of it and taken
+    /// away whether that test reached its own end or died on an assertion.
+    ///
+    /// It announces itself before anything reads it because spawning comes back
+    /// before the exec does: measured 464 times in 500, the pid already existed
+    /// while the environment behind it still belonged to the process that started
+    /// it, so a read taken straight after spawning reads the test harness. The
+    /// wait is bounded for the same reason the name is unique: once hort reads
+    /// the process table, one of these left behind is a sandbox it reports.
+    struct HostProcess(Child);
+
+    impl HostProcess {
+        fn declaring(sandbox: &SandboxName) -> Self {
+            Self::announcing(Command::new("sh").env("HORT_SANDBOX", sandbox.as_str()))
+        }
+
+        /// A process carrying a variable whose name merely begins the way the
+        /// marker does, and no marker. The removal is not belt and braces: it is
+        /// what keeps this a process that declares nothing when the suite is run
+        /// from inside a sandbox.
+        fn under_a_lookalike_variable(sandbox: &SandboxName) -> Self {
+            Self::announcing(
+                Command::new("sh")
+                    .env("HORT_SANDBOX_OLD", sandbox.as_str())
+                    .env_remove("HORT_SANDBOX"),
+            )
+        }
+
+        fn announcing(command: &mut Command) -> Self {
+            let mut child = command
+                .args(["-c", "echo ready; exec sleep 30"])
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut announcement = String::new();
+            BufReader::new(child.stdout.take().unwrap()).read_line(&mut announcement).unwrap();
+            Self(child)
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for HostProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn registry_reports_a_live_anchor_whose_container_state_is_gone() {
+        let runtime_root = tempfile::tempdir().unwrap();
+        let name = a_name_nothing_else_answers_to("vanished");
+        let anchor = HostProcess::declaring(&name);
+
+        let live = registry_over(runtime_root.path()).list_live().unwrap();
+
+        // The container state is bookkeeping the anchor does not depend on: an
+        // older build wrote it where this one does not look, and a hand that
+        // removed it loses it outright. Answering only from those files calls a
+        // sandbox dead while its anchor runs, which is what lets `prune` select
+        // it and reach the step that deletes a worktree the container still
+        // holds mounted.
+        assert!(live.iter().any(|entry| entry.id == name && entry.token.pid.0 == anchor.pid()));
+    }
+
+    #[test]
+    fn an_anchor_both_sources_know_about_is_reported_once() {
+        let runtime_root = tempfile::tempdir().unwrap();
+        let name = a_name_nothing_else_answers_to("known-twice");
+        let anchor = HostProcess::declaring(&name);
+        record_container(
+            runtime_root.path(),
+            name.as_str(),
+            ContainerStatus::Running,
+            Some(anchor.pid() as i32),
+        );
+
+        let live = registry_over(runtime_root.path()).list_live().unwrap();
+
+        // The two sources overlap for every healthy sandbox, so an enumeration
+        // that simply concatenates them reports the ordinary case twice. A
+        // sandbox with no record then earns a lost-record row per source, and
+        // whoever reads that listing cannot tell one box from two.
+        assert_eq!(live.iter().filter(|entry| entry.id == name).count(), 1);
+    }
+
+    #[test]
+    fn a_process_of_this_user_declaring_no_sandbox_is_not_an_anchor() {
+        let runtime_root = tempfile::tempdir().unwrap();
+        // The variable only looks like the marker, and it is worth what it costs:
+        // a process carrying nothing at all cannot tell a careful reading from a
+        // careless one, since a careless one has no name to build an entry out
+        // of. This one hands it a name, and a name that is valid on purpose, or
+        // the mistake would be caught by the name and not by this test.
+        let name = a_name_nothing_else_answers_to("lookalike");
+        let stranger = HostProcess::under_a_lookalike_variable(&name);
+
+        let live = registry_over(runtime_root.path()).list_live().unwrap();
+
+        // Everything this user runs is readable exactly the way an anchor is, so
+        // what a process says about itself is the whole of what separates a
+        // sandbox from the rest of the login session. Without that line drawn,
+        // `ls` fills with lost records nobody made and `prune` offers to clean
+        // processes that were never hort's to touch.
+        assert!(!live.iter().any(|entry| entry.token.pid.0 == stranger.pid()));
     }
 
     #[test]
@@ -1810,9 +2078,11 @@ mod privileged_tests {
     use crate::adapters::proxy;
     use crate::adapters::streams::sandbox_log_path;
     use crate::domain::egress::{EgressPolicy, HostPattern};
-    use crate::domain::model::Domain;
+    use crate::domain::model::{BranchName, Domain, SandboxRecord};
+    use crate::domain::reconcile::{SandboxState, reconcile_all};
     use crate::ports::{
         DbForward, EnvironmentProbe, MountAccess, NetworkProvider, NetworkSpec, SandboxMount,
+        Worktree,
     };
 
     const ANCHOR_DEADLINE: Duration = Duration::from_secs(5);
@@ -1853,6 +2123,24 @@ mod privileged_tests {
             command: vec!["sleep".to_string(), "infinity".to_string()],
             cwd: PathBuf::from(WORKDIR),
             env: Vec::new(),
+            terminal: false,
+        }
+    }
+
+    /// A session carrying what `attach` states about the sandbox it enters, and
+    /// staying alive long enough to be read from the host.
+    ///
+    /// Every session hort opens carries this, so the process table holds one
+    /// process per session naming the sandbox on top of the anchor naming it.
+    fn declaring_session(spec: &OciSpec) -> SessionSpec {
+        SessionSpec {
+            name: spec.name.clone(),
+            command: vec!["sleep".to_string(), "infinity".to_string()],
+            cwd: PathBuf::from(WORKDIR),
+            env: vec![
+                ("HORT_SANDBOX".to_string(), spec.name.as_str().to_string()),
+                ("HORT_WORKTREE".to_string(), spec.workdir.display().to_string()),
+            ],
             terminal: false,
         }
     }
@@ -2077,6 +2365,30 @@ mod privileged_tests {
         panic!("the anchor did not exec within {ANCHOR_DEADLINE:?}");
     }
 
+    /// Wait until the session is the process the sandbox opened it as, which is
+    /// when its environment first names the sandbox.
+    ///
+    /// A session exists as a pid before it execs, and until then the environment
+    /// behind that pid is still the one hort was invoked with, which names no
+    /// sandbox. Read that early, a session is indistinguishable from any other
+    /// process on the host, and a test asking whether the scan tells it from an
+    /// anchor would be asking about a process the scan never had to judge. The
+    /// question is production's own, so what counts as naming the sandbox cannot
+    /// drift from what the scan counts.
+    fn wait_for_session_to_declare(pid: u32, name: &SandboxName) {
+        let deadline = Instant::now() + SESSION_DEADLINE;
+        while Instant::now() < deadline {
+            let declared = fs::read(format!("/proc/{pid}/environ"))
+                .ok()
+                .and_then(|environ| declared_sandbox(&environ));
+            if declared.as_ref() == Some(name) {
+                return;
+            }
+            sleep(POLL);
+        }
+        panic!("the session never named '{}' within {SESSION_DEADLINE:?}", name.as_str());
+    }
+
     /// Point this process's input at `path` and hand back the restore. An anchor
     /// inherits whatever hort was invoked with, so a test whose own input is
     /// already `/dev/null` cannot tell an anchor that was detached from its
@@ -2121,6 +2433,76 @@ mod privileged_tests {
         runtime.teardown(&spec.name).unwrap();
     }
 
+    /// The record `up` would have persisted for this sandbox, short of the token
+    /// its caller stamps on once the anchor is running.
+    fn record_of(spec: &OciSpec) -> SandboxRecord {
+        SandboxRecord::new(
+            spec.name.clone(),
+            Some(BranchName::new(spec.name.as_str()).unwrap()),
+            spec.workdir.clone(),
+            spec.overlay.clone(),
+            "2026-08-20T12:00:00Z".to_string(),
+            "2026-08-20T12:00:00Z".to_string(),
+            None,
+            spec.workdir.clone(),
+        )
+    }
+
+    /// A sandbox's container state moved out of the directory the enumeration
+    /// walks, and put back however the test that took it away ended.
+    ///
+    /// Putting it back is not tidiness. With that directory gone the runtime
+    /// reads the sandbox as one it never knew and reports a successful teardown
+    /// having stopped nothing, so restoring it is what lets the scratch sandbox
+    /// take the anchor down. Declare it after the sandbox, so it goes first.
+    struct ContainerStateAside {
+        home: PathBuf,
+        aside: PathBuf,
+    }
+
+    impl ContainerStateAside {
+        fn taken_from(sandbox: &ScratchSandbox, name: &SandboxName) -> Self {
+            let home = sandbox.runtime_root().join(CONTAINERS_DIR).join(name.as_str());
+            // Out of the walked directory rather than renamed inside it, which is
+            // also where the build that produced the first of these left it.
+            let aside = sandbox.runtime_root().join(name.as_str());
+            fs::rename(&home, &aside).unwrap();
+            Self { home, aside }
+        }
+    }
+
+    impl Drop for ContainerStateAside {
+        fn drop(&mut self) {
+            let _ = fs::rename(&self.aside, &self.home);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn a_record_whose_container_state_vanished_still_reconciles_live() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+        let record = record_of(&spec).with_token(token);
+        let worktrees = vec![Worktree { path: spec.workdir.clone() }];
+        let _state_gone = ContainerStateAside::taken_from(&sandbox, &spec.name);
+
+        let verdicts = reconcile_all(&[record], &runtime.list_live().unwrap(), &worktrees);
+
+        // Only a real box can say that what hort writes into a sandbox's
+        // environment is still readable from the host once the anchor is up, and
+        // with the container state out of reach that marker is the whole of what
+        // is left to recognize the anchor by. Everywhere else this is inference
+        // off the spec the container was built from. Read wrong, the record
+        // reconciles orphaned while the container still holds the worktree
+        // mounted, and `prune` takes that worktree away next.
+        assert!(verdicts.contains(&(spec.name.clone(), SandboxState::Live)));
+    }
+
     #[test]
     #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
     #[serial]
@@ -2139,9 +2521,7 @@ mod privileged_tests {
         // only here does the pid come from the runtime's own state file rather
         // than from the test. Whole-token equality is the contract: same pid
         // under an inode read another way still reads as a dead sandbox.
-        assert_eq!(live.len(), 1);
-        assert_eq!(live[0].id, spec.name);
-        assert_eq!(live[0].token, started);
+        assert!(live.iter().any(|entry| entry.id == spec.name && entry.token == started));
         runtime.teardown(&spec.name).unwrap();
     }
 
@@ -2164,7 +2544,36 @@ mod privileged_tests {
         // against the kernel rather than to prevent the kill. A registry reading
         // the leftover state as a live anchor is what would make `ls` insist a
         // killed sandbox is running and keep `prune` from clearing the debris.
-        assert!(live.is_empty());
+        assert!(!live.iter().any(|entry| entry.id == spec.name));
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn a_session_joined_to_a_sandbox_is_not_read_as_its_anchor() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+        let session = runtime.join_session(&declaring_session(&spec)).unwrap();
+        wait_for_session_to_declare(session.pid, &spec.name);
+
+        let declared = declared_anchors();
+
+        // A session names the same sandbox as the anchor it joined and lands in
+        // the same mount namespace, so the token read off it differs from the
+        // anchor's in the pid alone, while a record is matched against the whole
+        // token. Taken for the anchor, a session makes a running sandbox
+        // reconcile as orphaned, which is the outcome this scan exists to
+        // prevent: `prune` then selects the box and deletes the worktree the
+        // container is still holding mounted. Membership rather than position,
+        // because the walk takes pids in ascending order and an anchor is
+        // started before any session of its own, so asking which of them comes
+        // first is a question the host answers the same way either way.
+        assert!(!declared.iter().any(|entry| entry.token.pid.0 == session.pid));
         runtime.teardown(&spec.name).unwrap();
     }
 
