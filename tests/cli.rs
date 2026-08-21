@@ -1309,3 +1309,118 @@ fn cli_prune_force_removes_orphaned_sandbox() {
 
     assert!(!state_root.join("sandboxes").join("demo").exists());
 }
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_a_session_cannot_read_a_host_path_the_sandbox_never_declared() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    // Under the host's own home and never under `/tmp`: the box mounts a fresh
+    // tmpfs at `/tmp`, so a file planted there would read as absent from a build
+    // with no confinement whatsoever, and the witness would prove nothing.
+    let (_home, home_path) = temp_host_home();
+    let host_only = home_path.join("host-secret");
+    fs::write(&host_only, "only-the-host-can-read-this\n").unwrap();
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    // The `echo` is the control. Without it a session that never opened at all
+    // would satisfy the absence below by producing no output whatsoever.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("HOME", &home_path)
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", sandbox.name().as_str()])
+        .write_stdin(format!("cat {}\necho the-session-ran\n", host_only.display()))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("the-session-ran"))
+        .stdout(predicate::str::contains("only-the-host-can-read-this").not());
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("HOME", &home_path)
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_climbing_out_of_the_worktree_reaches_the_container_root() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    // Listed rather than climbed with `cd`, because the kernel has to be the one
+    // that walks `..`: a shell resolves `cd /workdir/..` against the string it
+    // keeps and answers `/` without ever asking what the parent of a mount is.
+    // `metadata.json` sits in the host directory the worktree lives in, so it is
+    // what a climb that landed on the host would have listed instead.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", sandbox.name().as_str()])
+        .write_stdin("ls -a /workdir/..\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("workdir"))
+        .stdout(predicate::str::contains("metadata.json").not());
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_a_session_runs_in_a_mount_namespace_of_its_own() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let host_namespace = fs::read_link("/proc/self/ns/mnt").unwrap().display().to_string();
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    // The mechanism the other two cannot pin. A plain `chroot` hides the host
+    // filesystem and stops `..` at the new root exactly the same way, and what
+    // tells the two apart is which mount namespace the session is running in.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", sandbox.name().as_str()])
+        .write_stdin("readlink /proc/self/ns/mnt\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("mnt:["))
+        .stdout(predicate::str::contains(host_namespace).not());
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
