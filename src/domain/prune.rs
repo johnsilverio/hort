@@ -3,12 +3,13 @@
 //! Orphaned and inconsistent sandboxes are debris and always candidates; a live
 //! sandbox is a candidate only when an idle threshold is set and it has been idle
 //! at least that long; an active or unknown-idle sandbox is never selected, and a
-//! lost record is never prune's to remove. Every candidate then passes a
-//! fail-closed guard: without `--force` only a worktree proven to hold nothing
-//! and a cache whose project is proven gone are removed, and one hort could not
-//! read is skipped with a reason of its own. A cache answers one thing before any
-//! of that, and `--force` is not passed to it: a directory a running container is
-//! standing on is not a candidate at all.
+//! lost record is never prune's to remove. An unknown idle is reported when a
+//! threshold was asked for, because that is a hold `--force` cannot lift. Every
+//! candidate then passes a fail-closed guard: without `--force` only a worktree
+//! proven to hold nothing and a cache whose project is proven gone are removed,
+//! and one hort could not read is skipped with a reason of its own. A cache
+//! answers one thing before any of that, and `--force` is not passed to it: a
+//! directory a running container is standing on is not a candidate at all.
 
 use std::time::Duration;
 
@@ -30,8 +31,8 @@ pub enum WorktreeRisk {
 }
 
 /// One reconciled sandbox as the selection sees it: its name, its cross-source
-/// state, its idle (`None` when timestamps are unreadable, so never idle-selected),
-/// and what its worktree holds.
+/// state, its idle (`None` when hort could not compute it, which is never
+/// idle-selected), and what its worktree holds.
 pub struct PruneInput {
     pub name: SandboxName,
     pub state: SandboxState,
@@ -90,7 +91,10 @@ pub struct CacheInput {
 /// gone sends the user hunting for uncommitted changes git can no longer
 /// enumerate, and that report is what they read before deciding to force. The
 /// cache reasons are separate from it for the same reason they exist at all: one
-/// word for both questions sends that reader to the wrong place.
+/// word for both questions sends that reader to the wrong place. `UnknownIdle`
+/// is the third question and has no "something at risk" twin, because a sandbox
+/// that is definitely busy was never withheld out of uncertainty: only the
+/// uncertainty needs a voice.
 #[derive(Debug, PartialEq)]
 pub enum SkipReason {
     Dirty,
@@ -99,6 +103,7 @@ pub enum SkipReason {
     UnknownProject,
     LiveSandbox,
     UnknownSandbox,
+    UnknownIdle,
 }
 
 /// A candidate the selection chose not to remove, with the reason.
@@ -137,6 +142,9 @@ pub fn prune_selection(
 
     for input in sandboxes {
         if !is_candidate(input, idle_threshold) {
+            if let Some(reason) = withheld(input, idle_threshold) {
+                plan.skipped.push(skip(input.name.as_str(), reason));
+            }
             continue;
         }
         match protected(&input.risk, force) {
@@ -181,6 +189,22 @@ fn is_candidate(input: &PruneInput, idle_threshold: Option<Duration>) -> bool {
         SandboxState::Orphaned | SandboxState::Inconsistent => true,
         SandboxState::Live => idle_at_least(input.idle.as_ref(), idle_threshold),
         SandboxState::LostRecord => false,
+    }
+}
+
+/// Why a sandbox that never reached the removal set still owes the reader a line,
+/// or `None` when passing it over in silence is right.
+///
+/// A live sandbox is silent because nobody asked to remove it. Typing `--idle` is
+/// exactly that request, and an idle hort could not compute holds the box back
+/// through a door `--force` cannot open, so saying nothing leaves the user
+/// passing the flag, watching nothing happen, and finding no line that explains.
+/// A definite answer needs no voice: whoever asked for the idle boxes got them,
+/// and nothing was withheld out of uncertainty.
+fn withheld(input: &PruneInput, idle_threshold: Option<Duration>) -> Option<SkipReason> {
+    match (input.state, &input.idle, idle_threshold) {
+        (SandboxState::Live, None, Some(_)) => Some(SkipReason::UnknownIdle),
+        _ => None,
     }
 }
 
@@ -369,6 +393,66 @@ mod tests {
         let plan = prune_selection(&inputs, &[], &[], Some(Duration::from_secs(1800)), false);
 
         assert!(plan.sandboxes.is_empty());
+    }
+
+    #[test]
+    fn prune_reports_live_sandbox_with_unknown_idle_when_a_threshold_is_asked() {
+        let inputs = vec![PruneInput {
+            name: name("demo"),
+            state: SandboxState::Live,
+            idle: None,
+            risk: WorktreeRisk::NothingAtRisk,
+        }];
+
+        let plan = prune_selection(&inputs, &[], &[], Some(Duration::from_secs(1800)), false);
+
+        // A live box is normally passed over in silence because nobody asked to
+        // remove it. Typing --idle is exactly that request, so the silence stops
+        // fitting: the user reads a report with no line about this box, reaches
+        // for --force, and finds that the flag cannot lift this one either.
+        assert_eq!(
+            plan.skipped,
+            vec![PruneSkip { name: "demo".to_string(), reason: SkipReason::UnknownIdle }]
+        );
+    }
+
+    #[test]
+    fn prune_reports_unknown_idle_even_with_force() {
+        let inputs = vec![PruneInput {
+            name: name("demo"),
+            state: SandboxState::Live,
+            idle: None,
+            risk: WorktreeRisk::NothingAtRisk,
+        }];
+
+        let plan = prune_selection(&inputs, &[], &[], Some(Duration::from_secs(1800)), true);
+
+        // --force buys past the risk guard, and this hold sits before it: a box
+        // whose idle hort could not compute was never up for removal, so the
+        // flag has nothing to lift. That is the whole reason the line has to
+        // stay. Without it the user passes the strongest flag hort has, watches
+        // nothing happen, and finds no report saying which box did not go.
+        assert!(plan.sandboxes.is_empty());
+        assert_eq!(
+            plan.skipped,
+            vec![PruneSkip { name: "demo".to_string(), reason: SkipReason::UnknownIdle }]
+        );
+    }
+
+    #[test]
+    fn prune_stays_silent_about_unknown_idle_without_a_threshold() {
+        let inputs = vec![PruneInput {
+            name: name("demo"),
+            state: SandboxState::Live,
+            idle: None,
+            risk: WorktreeRisk::NothingAtRisk,
+        }];
+
+        let plan = prune_selection(&inputs, &[], &[], None, false);
+
+        // With no threshold no live box was up for removal at all, so a line
+        // about one is noise about a box nobody asked to touch.
+        assert!(plan.skipped.is_empty());
     }
 
     #[test]

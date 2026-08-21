@@ -424,7 +424,7 @@ fn render_line(entry: &LsEntry) -> String {
         "{}  {}  {}  {}  {}  {}  {}",
         entry.name.as_str(),
         state_label(entry.state),
-        entry.sessions,
+        render_sessions(entry.sessions),
         render_duration(entry.age),
         render_idle(entry.idle.as_ref()),
         render_branch(entry.branch.as_ref()),
@@ -434,12 +434,13 @@ fn render_line(entry: &LsEntry) -> String {
 
 /// Each reason in the words that send the reader to the right place. A cache skip
 /// that read like a worktree skip would have them hunting for uncommitted changes
-/// in a directory that holds none, which is why no two of the three questions
-/// share a label. The last two matter most: they are the only reasons `--force`
-/// does not clear, so a reader told the same thing it tells them about a live
-/// project would pass the flag, watch nothing happen, and find no line explaining
-/// why. Their own two words are apart for the same reason, since downing a named
-/// box and going to look at `ls` are different things to do next.
+/// in a directory that holds none, which is why no two of the four questions share
+/// a label. The last three matter most: they are the only reasons `--force` does
+/// not clear, so a reader told the same thing it tells them about a live project
+/// would pass the flag, watch nothing happen, and find no line explaining why.
+/// Their words are apart from each other for the same reason, since downing a
+/// named box, going to look at `ls`, and finding out who is inside a box hort
+/// could not read are different things to do next.
 fn skip_reason_label(reason: &SkipReason) -> &'static str {
     match reason {
         SkipReason::Dirty => "dirty",
@@ -448,6 +449,14 @@ fn skip_reason_label(reason: &SkipReason) -> &'static str {
         SkipReason::UnknownProject => "project unreadable",
         SkipReason::LiveSandbox => "sandbox running",
         SkipReason::UnknownSandbox => "sandbox unaccounted for",
+        SkipReason::UnknownIdle => "idle unknown",
+    }
+}
+
+fn render_sessions(sessions: Option<usize>) -> String {
+    match sessions {
+        Some(count) => count.to_string(),
+        None => DASH.to_string(),
     }
 }
 
@@ -506,7 +515,7 @@ mod tests {
         let entry = LsEntry {
             name: SandboxName::new("demo").unwrap(),
             state: SandboxState::Live,
-            sessions: 2,
+            sessions: Some(2),
             age: Some(Duration::from_secs(3600)),
             idle: Some(IdleState::Idle(Duration::from_secs(300))),
             branch: Some(BranchName::new("demo").unwrap()),
@@ -528,7 +537,7 @@ mod tests {
         let entry = LsEntry {
             name: SandboxName::new("ghost").unwrap(),
             state: SandboxState::LostRecord,
-            sessions: 0,
+            sessions: Some(0),
             age: None,
             idle: None,
             branch: None,
@@ -542,11 +551,51 @@ mod tests {
     }
 
     #[test]
+    fn render_ls_renders_unknown_sessions_as_a_dash() {
+        let entry = LsEntry {
+            name: SandboxName::new("demo").unwrap(),
+            state: SandboxState::Live,
+            sessions: None,
+            age: Some(Duration::from_secs(3600)),
+            idle: Some(IdleState::Idle(Duration::from_secs(300))),
+            branch: Some(BranchName::new("demo").unwrap()),
+            dirty: Some(false),
+        };
+
+        let rendered = render_ls(&[entry]);
+
+        // Every other column of this row is deliberately known, so the only
+        // dash the line can hold is the session count. Printed as a zero it
+        // reads as a box nobody is in, which is a claim hort did not make.
+        assert!(rendered.contains("-"));
+    }
+
+    #[test]
+    fn render_prune_tells_an_unknown_idle_from_an_unreadable_worktree() {
+        let worktree = PruneReport {
+            removed: Vec::new(),
+            removed_caches: Vec::new(),
+            skipped: vec![PruneSkip { name: "demo".to_string(), reason: SkipReason::Unknown }],
+        };
+        let idle = PruneReport {
+            removed: Vec::new(),
+            removed_caches: Vec::new(),
+            skipped: vec![PruneSkip { name: "demo".to_string(), reason: SkipReason::UnknownIdle }],
+        };
+
+        // One sends the reader to a worktree to look for uncommitted work that
+        // --force would spend; the other says hort could not tell how long the
+        // box has been idle, which --force cannot lift at all. The same word for
+        // both is a user passing the flag and watching nothing happen.
+        assert_ne!(render_prune(&worktree), render_prune(&idle));
+    }
+
+    #[test]
     fn render_ls_renders_running_sessions_as_active() {
         let entry = LsEntry {
             name: SandboxName::new("demo").unwrap(),
             state: SandboxState::Live,
-            sessions: 1,
+            sessions: Some(1),
             age: Some(Duration::from_secs(3600)),
             idle: Some(IdleState::Active),
             branch: Some(BranchName::new("demo").unwrap()),
@@ -712,7 +761,7 @@ mod tests {
         let entry = LsEntry {
             name: SandboxName::new("demo").unwrap(),
             state: SandboxState::Live,
-            sessions: 0,
+            sessions: Some(0),
             age: Some(Duration::from_secs(3600)),
             idle: Some(IdleState::Idle(Duration::from_secs(300))),
             branch: Some(BranchName::new("demo").unwrap()),

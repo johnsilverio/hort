@@ -105,6 +105,29 @@ mod tests {
     }
 
     #[test]
+    fn down_stops_a_sandbox_whose_session_list_cannot_be_read() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo")).unwrap();
+        let sessions = FakeSessionProbe::failing();
+        let confirmer = FakeConfirmer::no();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let worktrees = FakeWorktreeProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command =
+            down_command(&store, &sessions, &confirmer, &runtime, &network, &worktrees, &notify);
+
+        command.run(name.clone(), false, false).unwrap();
+
+        // `down` is the one caller that keeps reading a failed session read as
+        // no sessions. A reboot fails every one of these reads, so protecting
+        // here would answer a piped `hort down` with a refusal for every box on
+        // the machine, which locks the user out of their own cleanup.
+        assert_eq!(store.get(&name).unwrap(), None);
+    }
+
+    #[test]
     fn down_tears_helpers_and_container_before_worktree() {
         let trace = Rc::new(RefCell::new(Vec::new()));
         let store = InMemoryMetadataStore::new().with_trace(trace.clone());

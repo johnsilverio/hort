@@ -1007,16 +1007,32 @@ impl NotifyProvider for FakeNotifyProvider {
 /// Reports a scripted process list for a sandbox.
 pub struct FakeSessionProbe {
     pids: Vec<u32>,
+    failing: bool,
 }
 
 impl FakeSessionProbe {
     pub fn new(pids: Vec<u32>) -> Self {
-        Self { pids }
+        Self { pids, failing: false }
+    }
+
+    /// Script every session read as failing: `session_pids` answers `Err`,
+    /// standing in for a sandbox whose container state the runtime cannot load.
+    /// That state lives where a reboot discards it, so this is what every
+    /// sandbox on the machine looks like after one.
+    pub fn failing() -> Self {
+        Self { pids: Vec::new(), failing: true }
     }
 }
 
 impl SessionProbe for FakeSessionProbe {
     fn session_pids(&self, _name: &SandboxName) -> Result<Vec<u32>, HortError> {
+        if self.failing {
+            // An unasserted stand-in error: no consumer asserts the variant,
+            // only that it is an `Err`.
+            return Err(HortError::StateIo {
+                detail: "fake session probe: scripted to fail".to_string(),
+            });
+        }
         Ok(self.pids.clone())
     }
 }

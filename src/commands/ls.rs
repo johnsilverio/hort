@@ -29,7 +29,11 @@ use crate::ports::{
 /// One row of `ls` output: a sandbox's reconciled state plus the figures the CLI
 /// renders beside it. `age`, `idle`, and `branch` are `None` when there is no
 /// record to derive them from (a lost-record row) or the record's timestamps are
-/// corrupt; `branch` is also `None` for a no-git record. `dirty` is probed only
+/// corrupt; `branch` is also `None` for a no-git record. `sessions` is `None` when
+/// hort could not read the box's process list while its anchor was up, and `idle`
+/// goes with it, having been computed from that same read: a row reporting three
+/// hours untouched about a box hort never managed to look into reads as an
+/// invitation to prune it. `dirty` is probed only
 /// for a git record whose worktree is still on disk; it is `None` for no record,
 /// a no-git record, an absent worktree, or a failed probe, all of which `ls`
 /// reports as unknown rather than guessing. It stays an `Option<bool>` while
@@ -38,7 +42,7 @@ use crate::ports::{
 pub struct LsEntry {
     pub name: SandboxName,
     pub state: SandboxState,
-    pub sessions: usize,
+    pub sessions: Option<usize>,
     pub age: Option<Duration>,
     pub idle: Option<IdleState>,
     pub branch: Option<BranchName>,
@@ -82,9 +86,7 @@ impl LsCommand<'_> {
         let entries: Vec<LsEntry> = verdicts
             .into_iter()
             .map(|(name, state)| {
-                // A probe error reads as zero sessions rather than failing the
-                // whole listing: a single racing sandbox must not blind the rest.
-                let sessions = self.sessions.session_pids(&name).map_or(0, |pids| pids.len());
+                let sessions = self.observe_sessions(&name, state);
                 let record = records.iter().find(|record| record.name() == &name);
                 let dirty = record.and_then(|record| self.observe_dirty(record));
                 let last_event =
@@ -94,6 +96,25 @@ impl LsCommand<'_> {
             .collect();
 
         Ok(entries)
+    }
+
+    /// How many sessions are joined to a sandbox, or unknown when hort could not
+    /// look. A read that failed says nothing about who is inside, and this is the
+    /// column a person reads to find that out, so it is reported as unknown rather
+    /// than as a confident zero. The one exception is a sandbox with no live
+    /// anchor: the anchor is pid 1 of the box's pid namespace and takes the
+    /// namespace down with it, so there is nowhere left for a session to be and
+    /// zero is an observation. Written as that exception and never as a list of
+    /// the verdicts that mean the anchor is up, because three of the four do and a
+    /// list that forgets one prints a confident zero over a box somebody is
+    /// working in. A failure never fails the listing: one racing sandbox must not
+    /// blind the rest.
+    fn observe_sessions(&self, name: &SandboxName, state: SandboxState) -> Option<usize> {
+        match self.sessions.session_pids(name) {
+            Ok(pids) => Some(pids.len()),
+            Err(_) if state == SandboxState::Orphaned => Some(0),
+            Err(_) => None,
+        }
     }
 
     /// Whether a sandbox's worktree is dirty, observed only when there is a git
@@ -112,7 +133,7 @@ impl LsCommand<'_> {
 fn build_entry(
     name: SandboxName,
     state: SandboxState,
-    sessions: usize,
+    sessions: Option<usize>,
     record: Option<&SandboxRecord>,
     dirty: Option<bool>,
     last_event: Option<SystemTime>,
@@ -133,7 +154,7 @@ fn build_entry(
         state,
         sessions,
         age: Some(age(created, now)),
-        idle: Some(idle(sessions, created, attach, last_event, now)),
+        idle: sessions.map(|count| idle(count, created, attach, last_event, now)),
         branch,
         dirty,
     }
@@ -298,7 +319,114 @@ mod tests {
 
         let entries = command.run().unwrap();
 
-        assert_eq!(entries[0].sessions, 3);
+        assert_eq!(entries[0].sessions, Some(3));
+    }
+
+    #[test]
+    fn ls_reports_unknown_sessions_when_the_probe_fails_for_a_live_sandbox() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo").with_token(canned_token())).unwrap();
+        let registry = FakeRegistry::new(vec![(name.clone(), canned_token())]);
+        let worktrees = FakeWorktreeProvider::new().with_listed_worktree(&name);
+        let sessions = FakeSessionProbe::failing();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
+
+        let entries = command.run().unwrap();
+
+        // The column that says whether somebody is inside is the one column
+        // where a confident zero costs the most, and the anchor of this box is
+        // up: hort failed to look, which is not the same finding as looking and
+        // finding nobody.
+        assert_eq!(entries[0].sessions, None);
+    }
+
+    #[test]
+    fn ls_degrades_idle_to_unknown_when_the_probe_fails_for_a_live_sandbox() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo").with_token(canned_token())).unwrap();
+        let registry = FakeRegistry::new(vec![(name.clone(), canned_token())]);
+        let worktrees = FakeWorktreeProvider::new().with_listed_worktree(&name);
+        let sessions = FakeSessionProbe::failing();
+        let now = humantime::parse_rfc3339("2026-06-11T13:00:00Z").unwrap();
+        let clock = ScriptedClock::new(now);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
+
+        let entries = command.run().unwrap();
+
+        // Idle is computed from the same read: with no session count there is no
+        // way to tell an hour untouched from an hour of somebody typing, and the
+        // hour is the figure a person reads before deciding to prune by idle.
+        assert_eq!(entries[0].idle, None);
+    }
+
+    #[test]
+    fn ls_reports_unknown_sessions_when_the_probe_fails_for_a_lost_record() {
+        let store = InMemoryMetadataStore::new();
+        let registry =
+            FakeRegistry::new(vec![(SandboxName::new("ghost").unwrap(), canned_token())]);
+        let worktrees = FakeWorktreeProvider::new();
+        let sessions = FakeSessionProbe::failing();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
+
+        let entries = command.run().unwrap();
+
+        // The question is whether the anchor is up, not whether the row is
+        // `live`: three of the four verdicts say it is, and this one is the row
+        // where the count decides something, since a lost record is the one hort
+        // offers to adopt or clean. Cleaning it on a zero hort never observed
+        // kills the box somebody is working in.
+        assert_eq!(entries[0].sessions, None);
+    }
+
+    #[test]
+    fn ls_reports_unknown_sessions_when_the_probe_fails_for_an_inconsistent_sandbox() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo").with_token(canned_token())).unwrap();
+        let registry = FakeRegistry::new(vec![(name.clone(), canned_token())]);
+        let worktrees = FakeWorktreeProvider::new();
+        let sessions = FakeSessionProbe::failing();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
+
+        let entries = command.run().unwrap();
+
+        // A worktree gone from under a live anchor is the third verdict that
+        // means somebody can still be inside, and it is the one prune takes with
+        // no idle threshold asked for at all. This row is the last place a person
+        // sees who is in there before running it, so a zero hort never observed
+        // spends that look.
+        assert_eq!(entries[0].sessions, None);
+    }
+
+    #[test]
+    fn ls_reports_no_sessions_when_the_probe_fails_for_an_orphaned_sandbox() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo").with_token(canned_token())).unwrap();
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new().with_listed_worktree(&name);
+        let sessions = FakeSessionProbe::failing();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
+
+        let entries = command.run().unwrap();
+
+        // Same failed read as the live box above, opposite answer, and the
+        // verdict is what decides which: with no live anchor there is no pid
+        // namespace left for a session to be in, so zero is an observation. A
+        // reboot fails every one of these reads at once, and the listing that
+        // says "orphaned, idle 3d" is the one that tells the user it can go.
+        assert_eq!(entries[0].sessions, Some(0));
     }
 
     #[test]

@@ -234,11 +234,17 @@ impl PruneCommand<'_> {
         }
     }
 
-    /// The idle state of a record, derived exactly as `ls` does it: a session
-    /// probe failure reads as zero sessions, and an unreadable timestamp leaves
-    /// idle unknown rather than failing the run.
+    /// The idle state of a record, or unknown when a figure it rests on could not
+    /// be read. A session list hort failed to read is the one that matters: idle
+    /// counts a box with somebody in it as busy, and that busy answer is the only
+    /// thing standing between a sandbox in use and `prune --idle`, since `--force`
+    /// does not reach it. Read as zero sessions, a failure hands back a duration
+    /// and the box goes; unknown withholds it, and a run that removed less than it
+    /// could is the cheap way to be wrong. Unlike `ls`, this asks the same
+    /// question of every verdict, because idle decides nothing for the ones that
+    /// are debris either way.
     fn sandbox_idle(&self, record: &SandboxRecord, now: SystemTime) -> Option<IdleState> {
-        let sessions = self.sessions.session_pids(record.name()).map_or(0, |pids| pids.len());
+        let sessions = self.sessions.session_pids(record.name()).ok()?.len();
         let (Ok(created), Ok(attach)) =
             (parse_timestamp(record.created_at()), parse_timestamp(record.last_attach_at()))
         else {
@@ -968,6 +974,70 @@ mod tests {
         command.run(Some(Duration::from_secs(1800)), true, false).unwrap();
 
         assert_eq!(store.get(&name).unwrap(), None);
+    }
+
+    #[test]
+    fn prune_treats_an_unreadable_session_list_of_a_live_sandbox_as_unknown_idle() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo").with_token(canned_token())).unwrap();
+        let registry = FakeRegistry::new(vec![(name.clone(), canned_token())]);
+        let worktrees = FakeWorktreeProvider::new().with_listed_worktree(&name);
+        let sessions = FakeSessionProbe::failing();
+        let now = humantime::parse_rfc3339("2026-06-11T13:00:00Z").unwrap();
+        let clock = ScriptedClock::new(now);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches, &notify,
+        );
+
+        let report = command.run(Some(Duration::from_secs(1800)), false, true).unwrap();
+
+        // The timestamps alone say an hour untouched, which clears the half
+        // hour asked for. What hort does not know is whether somebody is typing
+        // in there right now, and a read that failed is not evidence that
+        // nobody is. Read as zero it becomes an hour idle and the box goes.
+        assert!(report.removed.is_empty());
+        assert_eq!(
+            report.skipped,
+            vec![PruneSkip { name: "demo".to_string(), reason: SkipReason::UnknownIdle }]
+        );
+    }
+
+    #[test]
+    fn prune_reads_an_unreadable_session_list_of_an_orphaned_sandbox_as_no_sessions() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo").with_token(canned_token())).unwrap();
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new().with_listed_worktree(&name);
+        let sessions = FakeSessionProbe::failing();
+        let now = humantime::parse_rfc3339("2026-06-11T13:00:00Z").unwrap();
+        let clock = ScriptedClock::new(now);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches, &notify,
+        );
+
+        let report = command.run(Some(Duration::from_secs(1800)), false, true).unwrap();
+
+        // Debris is a candidate whatever its idle says, so what this pins is
+        // that the fail-closed protection never reaches it: a run that withheld
+        // every box whose session list it could not read would quietly stop
+        // collecting orphans. A reboot fails every one of these reads at once,
+        // which makes that every box on the machine.
+        assert_eq!(report.removed, vec!["demo".to_string()]);
+        assert!(report.skipped.is_empty());
     }
 
     #[test]
