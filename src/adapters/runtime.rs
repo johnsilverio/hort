@@ -60,13 +60,16 @@ use std::time::{Duration, Instant};
 use libcontainer::container::builder::ContainerBuilder;
 use libcontainer::container::{Container, ContainerStatus};
 use libcontainer::oci_spec::runtime::{
-    Capabilities, Linux, LinuxCapabilities, LinuxCpu, LinuxIdMapping, LinuxIdMappingBuilder,
-    LinuxMemory, LinuxNamespace, LinuxNamespaceType, LinuxResources, Mount, Process, Root, Spec,
+    Arch, Capabilities, Linux, LinuxCapabilities, LinuxCpu, LinuxIdMapping, LinuxIdMappingBuilder,
+    LinuxMemory, LinuxNamespace, LinuxNamespaceType, LinuxResources, LinuxSeccomp,
+    LinuxSeccompAction, LinuxSeccompArg, LinuxSyscall, Mount, Process, Root, Spec,
     get_rootless_mounts,
 };
+use libcontainer::seccomp::initialize_seccomp;
 use libcontainer::syscall::syscall::SyscallType;
 use libcontainer::workload::default::DefaultExecutor;
 use libcontainer::workload::{Executor, ExecutorError, ExecutorValidationError};
+use serde::Deserialize;
 
 use crate::adapters::console;
 use crate::adapters::landlock;
@@ -1076,6 +1079,11 @@ fn anchor_namespace(anchor: u32, namespace: &str) -> Result<File, String> {
 /// is what the restrictions need: they are inherited by whatever is exec'd next,
 /// and applied any earlier they would fall on the code still building the
 /// session and name a root that is not the one the session will have.
+///
+/// The syscall filter is one of those restrictions, loaded here rather than
+/// declared on the session, because joining a session rebuilds the container's
+/// linux section out of the namespaces it finds plus a handful of fields, and the
+/// filter is not one of them however the session was described.
 #[derive(Clone)]
 struct ConfinedSession {
     connect_ports: Option<Vec<u16>>,
@@ -1084,6 +1092,13 @@ struct ConfinedSession {
 impl Executor for ConfinedSession {
     fn exec(&self, spec: &Spec) -> Result<(), ExecutorError> {
         landlock::restrict_session(self.connect_ports.as_deref()).map_err(ExecutorError::Other)?;
+        // Loaded here and never earlier: the climb into the sandbox needs setns,
+        // which the profile both allows and refuses, so a filter loaded before it
+        // rests on which of the two rules went in first and turns every attach
+        // into a bare "operation not permitted" the day anything reorders them.
+        initialize_seccomp(&sandbox_seccomp()).map(|_| ()).map_err(|err| {
+            ExecutorError::Other(format!("loading the sandbox syscall filter: {err}"))
+        })?;
         DefaultExecutor {}.exec(spec)
     }
 
@@ -1325,6 +1340,7 @@ fn sandbox_linux(resources: Option<&ResourceLimits>) -> Linux {
         .set_namespaces(Some(sandbox_namespaces()))
         .set_uid_mappings(Some(vec![single_id_mapping()]))
         .set_gid_mappings(Some(vec![single_id_mapping()]))
+        .set_seccomp(Some(sandbox_seccomp()))
         .set_resources(resources.map(ceiling));
     linux
 }
@@ -1362,6 +1378,147 @@ fn single_id_mapping() -> LinuxIdMapping {
         .expect("an id mapping with all three fields set has nothing left to reject")
 }
 
+/// The syscall filter every sandbox runs under, vendored verbatim from the
+/// containers project and carried inside the binary. `assets/seccomp/PROVENANCE`
+/// names the revision it came from.
+const SECCOMP_PROFILE: &str = include_str!("../../assets/seccomp/default.json");
+
+/// The two names one host answers to inside the profile: the token the rules
+/// gate on, and the entry `archMap` is keyed by.
+struct HostArchitecture {
+    profile: &'static str,
+    seccomp: Arch,
+}
+
+// A host named nowhere here cannot be resolved against the profile at all, and
+// the compile error at the first use is how it says so.
+#[cfg(target_arch = "x86_64")]
+const HOST_ARCHITECTURE: HostArchitecture =
+    HostArchitecture { profile: "amd64", seccomp: Arch::ScmpArchX86_64 };
+#[cfg(target_arch = "aarch64")]
+const HOST_ARCHITECTURE: HostArchitecture =
+    HostArchitecture { profile: "arm64", seccomp: Arch::ScmpArchAarch64 };
+
+/// The profile as it is written, which is not the shape the spec types describe.
+/// It extends them with a top level `archMap` and with a condition on every
+/// rule, naming the container each one is written for, and those types accept
+/// fields they do not know without complaint. So handing the file straight to
+/// them succeeds and drops the conditions rather than answering them, which is
+/// most of what the file means: for a container holding no capability, which is
+/// every sandbox hort builds, every rule written for a holder would arrive as a
+/// plain allow, `bpf` and `chroot` and unrestricted `socket` among them.
+/// Resolving the conditions is what the file is for, not a refinement of it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SeccompProfile {
+    default_action: LinuxSeccompAction,
+    default_errno_ret: Option<u32>,
+    arch_map: Vec<ArchitectureFamily>,
+    syscalls: Vec<ProfileRule>,
+}
+
+/// One architecture together with the ones a machine of that architecture also
+/// runs binaries of.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArchitectureFamily {
+    architecture: Arch,
+    sub_architectures: Vec<Arch>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileRule {
+    names: Vec<String>,
+    action: LinuxSeccompAction,
+    errno_ret: Option<u32>,
+    args: Option<Vec<LinuxSeccompArg>>,
+    #[serde(default)]
+    includes: RuleCondition,
+    #[serde(default)]
+    excludes: RuleCondition,
+}
+
+/// What a rule asks of the container it is written for.
+#[derive(Default, Deserialize)]
+struct RuleCondition {
+    #[serde(default)]
+    arches: Vec<String>,
+    #[serde(default)]
+    caps: Vec<String>,
+}
+
+/// The filter the sandbox runs under: the vendored profile with every condition
+/// in it answered for this host.
+fn sandbox_seccomp() -> LinuxSeccomp {
+    let profile: SeccompProfile = serde_json::from_str(SECCOMP_PROFILE)
+        .expect("the profile compiled into hort is the one vendored beside its provenance");
+    resolved_profile(&profile)
+}
+
+fn resolved_profile(profile: &SeccompProfile) -> LinuxSeccomp {
+    let rules: Vec<LinuxSyscall> = profile
+        .syscalls
+        .iter()
+        .filter(|rule| written_for_the_sandbox(rule))
+        .map(resolved_rule)
+        .collect();
+    let mut seccomp = LinuxSeccomp::default();
+    seccomp
+        .set_default_action(profile.default_action)
+        .set_default_errno_ret(profile.default_errno_ret)
+        .set_architectures(resolved_architectures(profile))
+        .set_syscalls(Some(rules));
+    seccomp
+}
+
+/// The architectures beyond the native one the filter covers. Nothing in this
+/// repo can tell this apart from naming none, because the difference only shows
+/// in a process of another architecture and this machine runs none: left out,
+/// the calls a 32-bit binary in the sandbox makes match no rule and fall to the
+/// default action, which refuses them, so the binary does not run at all. It
+/// stays because carrying the profile verbatim is worth nothing if what hort
+/// installs quietly means something narrower than what upstream wrote. A profile
+/// that names no family for this host is naming no second architecture to cover,
+/// so nothing there is an answer rather than a failure.
+fn resolved_architectures(profile: &SeccompProfile) -> Option<Vec<Arch>> {
+    let family =
+        profile.arch_map.iter().find(|family| family.architecture == HOST_ARCHITECTURE.seccomp)?;
+    let mut architectures = vec![family.architecture];
+    architectures.extend(family.sub_architectures.iter().copied());
+    Some(architectures)
+}
+
+/// Whether one rule of the profile is written for the container hort builds. The
+/// two conditions look symmetrical and are opposites: `includes` names what that
+/// container must have for the rule to apply, `excludes` what it must not.
+fn written_for_the_sandbox(rule: &ProfileRule) -> bool {
+    // A sandbox holds no capability at all, which collapses both capability
+    // halves into this one question. Grant one some day and undo this first.
+    if !rule.includes.caps.is_empty() {
+        return false;
+    }
+    if names_this_host(&rule.excludes.arches) {
+        return false;
+    }
+    rule.includes.arches.is_empty() || names_this_host(&rule.includes.arches)
+}
+
+fn names_this_host(arches: &[String]) -> bool {
+    arches.iter().any(|arch| arch == HOST_ARCHITECTURE.profile)
+}
+
+/// The rule with its conditions spent, which is the shape the spec describes.
+fn resolved_rule(rule: &ProfileRule) -> LinuxSyscall {
+    let mut syscall = LinuxSyscall::default();
+    syscall
+        .set_names(rule.names.clone())
+        .set_action(rule.action)
+        .set_errno_ret(rule.errno_ret)
+        .set_args(rule.args.clone());
+    syscall
+}
+
 fn ceiling(limits: &ResourceLimits) -> LinuxResources {
     let mut resources = LinuxResources::default();
     if let Some(bytes) = limits.memory_bytes {
@@ -1390,7 +1547,7 @@ mod tests {
 
     use libcontainer::container::ContainerStatus;
     use libcontainer::oci_spec::runtime::{
-        Capabilities, LinuxIdMappingBuilder, LinuxNamespaceType,
+        Capabilities, LinuxIdMappingBuilder, LinuxNamespaceType, LinuxSeccomp, LinuxSeccompAction,
     };
 
     use crate::adapters::liveness::ProcLivenessProbe;
@@ -1822,6 +1979,124 @@ mod tests {
 
         let linux = assembled.linux().as_ref().unwrap();
         assert_eq!(linux.resources(), &None);
+    }
+
+    /// A syscall the profile allows only on some machines, named for the one
+    /// these tests are built for. There is no portable name to put here: a group
+    /// takes that form precisely because it means nothing on another
+    /// architecture. A host this does not name has to be added both here and
+    /// wherever the profile resolves architectures, and the compile error is how
+    /// it says so.
+    #[cfg(target_arch = "x86_64")]
+    const GATED_ON_THIS_ARCHITECTURE: &str = "arch_prctl";
+    #[cfg(target_arch = "aarch64")]
+    const GATED_ON_THIS_ARCHITECTURE: &str = "set_tls";
+
+    fn seccomp_of(assembled: &Spec) -> &LinuxSeccomp {
+        assembled
+            .linux()
+            .as_ref()
+            .unwrap()
+            .seccomp()
+            .as_ref()
+            .expect("the assembled spec carries a seccomp profile")
+    }
+
+    /// Every action the assembled profile carries for `syscall`, once per rule
+    /// naming it. A syscall listed twice appears twice, which is what the
+    /// question needs: one allowing rule is enough to allow it, whatever is
+    /// written beside it.
+    fn actions_for(assembled: &Spec, syscall: &str) -> Vec<LinuxSeccompAction> {
+        seccomp_of(assembled)
+            .syscalls()
+            .as_ref()
+            .expect("the profile carries syscall rules")
+            .iter()
+            .filter(|rule| rule.names().iter().any(|name| name == syscall))
+            .map(|rule| rule.action())
+            .collect()
+    }
+
+    #[test]
+    fn spec_denies_a_syscall_the_profile_gates_on_a_capability_the_sandbox_lacks() {
+        let assembled = anchor_spec(&sandbox_spec());
+
+        // The profile is written for a container that may hold capabilities and
+        // a sandbox holds none, so every group written for a holder has to go.
+        // Keeping one costs nothing a reader would notice: with the condition
+        // gone it is an ordinary allow rule, and the refusing twin written
+        // beside it is dropped for repeating the default action. This call is
+        // the one to ask about because it opens a file by handle instead of by
+        // path, and path resolution is the whole of what a mount namespace
+        // confines. The default action is asserted with it because a rule list
+        // that never allows a call says nothing about that call unless what goes
+        // unlisted is refused.
+        assert_eq!(seccomp_of(&assembled).default_action(), LinuxSeccompAction::ScmpActErrno);
+        assert!(
+            !actions_for(&assembled, "open_by_handle_at")
+                .contains(&LinuxSeccompAction::ScmpActAllow)
+        );
+    }
+
+    #[test]
+    fn spec_allows_a_syscall_the_profile_gates_on_the_host_architecture() {
+        let assembled = anchor_spec(&sandbox_spec());
+
+        // Dropping every conditional group is the tempting way to be safe and it
+        // shuts the box instead of closing it: this group carries the call the C
+        // library makes to set up thread-local storage, and without it nothing
+        // in the sandbox reaches its first instruction.
+        assert!(
+            actions_for(&assembled, GATED_ON_THIS_ARCHITECTURE)
+                .contains(&LinuxSeccompAction::ScmpActAllow)
+        );
+    }
+
+    #[test]
+    fn spec_allows_a_syscall_the_profile_gates_on_lacking_a_capability() {
+        let assembled = anchor_spec(&sandbox_spec());
+
+        // The profile states the socket rule twice, unrestricted for a container
+        // allowed to write audit records and restricted for one that is not, and
+        // a sandbox is the second. The two conditions look symmetrical and are
+        // opposites: read this one the way the one above it reads, and the box
+        // is left unable to open a socket at all, which is every agent in it
+        // unable to reach anything.
+        assert!(actions_for(&assembled, "socket").contains(&LinuxSeccompAction::ScmpActAllow));
+    }
+
+    #[test]
+    fn spec_sets_no_new_privileges() {
+        let assembled = anchor_spec(&sandbox_spec());
+
+        // Loading a filter takes either this bit or admin rights inside the user
+        // namespace, and the runtime reads the field to decide when to load: set,
+        // it raises the bit early and loads next to the exec; absent, it loads
+        // while capabilities are still held; set to false it does neither and
+        // the load fails outright.
+        let process = assembled.process().as_ref().unwrap();
+        assert_eq!(process.no_new_privileges(), Some(true));
+    }
+
+    #[test]
+    fn session_process_sets_no_new_privileges() {
+        let spec = SessionSpec {
+            name: SandboxName::new("demo").unwrap(),
+            command: vec!["/bin/sh".to_string()],
+            cwd: PathBuf::from("/workdir"),
+            env: Vec::new(),
+            terminal: true,
+        };
+
+        // A session that asks for a terminal is handed a process file, and the
+        // file replaces the process the tenant API would have built rather than
+        // adding to it, taking with it the field that API would have copied off
+        // the sandbox. Set to false, the runtime never raises the bit and a
+        // filter load fails outright; left out, nothing raises it at all, which
+        // is a setuid binary in the box free to gain what the empty capability
+        // set is there to deny.
+        let process = session_process(&spec);
+        assert_eq!(process.no_new_privileges(), Some(true));
     }
 
     #[test]
@@ -2816,6 +3091,59 @@ mod privileged_tests {
         assert!(status.contains("CapEff:\t0000000000000000"));
         assert!(status.contains("CapBnd:\t0000000000000000"));
         assert!(status.contains("CapAmb:\t0000000000000000"));
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    /// The `Seccomp` line of a process the kernel has loaded a filter for. A
+    /// process running under none reads `0` on that line.
+    const FILTER_LOADED: &str = "Seccomp:\t2";
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn anchor_runs_under_a_seccomp_filter() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
+
+        let token = runtime.start_anchor(&spec).unwrap();
+
+        wait_for_anchor(token.pid.0);
+        let status = fs::read_to_string(format!("/proc/{}/status", token.pid.0)).unwrap();
+        assert!(status.contains(FILTER_LOADED), "the anchor runs with no filter loaded");
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn a_session_on_a_terminal_runs_under_a_seccomp_filter() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+
+        // Held while the answer is read: closing the master hangs the session's
+        // terminal up, and the wait is what keeps the read off a session that
+        // exists as a pid and has not become what it was opened as yet.
+        let session = runtime.join_session(&reporting_session(&spec.name)).unwrap();
+        assert!(
+            appeared_within_deadline(&spec.workdir.join(TERMINAL_WITNESS)),
+            "the session never reached the command it was opened for"
+        );
+
+        // Nothing a session is given carries the filter to it on its own. The
+        // tenant path rebuilds the container's linux section from the namespaces
+        // it found plus a handful of fields, and the seccomp profile is not one
+        // of them, whether the session was described by a process file or by the
+        // builder's own setters. This is the shell a person types into and the
+        // one an agent runs under, so a filter the anchor carries and this does
+        // not is a filter nothing that matters runs under.
+        let status = fs::read_to_string(format!("/proc/{}/status", session.pid)).unwrap();
+        assert!(status.contains(FILTER_LOADED), "the session runs with no filter loaded");
         runtime.teardown(&spec.name).unwrap();
     }
 

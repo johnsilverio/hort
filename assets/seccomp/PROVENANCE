@@ -1,0 +1,35 @@
+default.json is vendored verbatim from another project. It is not hort's work and it is
+not edited here: to update it, replace the file wholesale and update every line below.
+
+    upstream   https://github.com/containers/common
+    path       pkg/seccomp/seccomp.json
+    revision   8c41d98b3801a23a9e27acd06670b4d8da35e168   (2025-04-07, the head of that
+               path as of 2026-08-20; the file changes rarely, roughly yearly)
+    sha256     886ae167646b7e5db381ecf7c31e6de720a8e8da15cf3202fe1f67f424af2b75
+    license    Apache-2.0, the full text beside this file in LICENSE
+
+hort is AGPL-3.0-only. The Apache Software Foundation publishes that Apache 2.0 software
+may be included in a GPLv3 project; that statement names GPLv3 and does not name AGPLv3,
+and this line says so rather than rounding it off.
+
+Two things about the file itself, both measured rather than assumed, because either one
+silently produces a profile that is not the one this project meant to carry.
+
+It is NOT in OCI shape. It is Docker's profile format, which extends the OCI seccomp
+object with a top-level archMap and defaultErrno and with per-entry includes, excludes and
+comment. The Rust types this eventually becomes do not reject unknown fields, so a direct
+deserialize succeeds and silently drops all of it. With an empty capability set, which is
+what every hort container runs with, dropping the extensions turns eighteen
+capability-gated groups into unconditional allow rules, twenty-four names in all, bpf and
+chroot and open_by_handle_at among them. Resolving the extensions is therefore mandatory
+rather than an optimisation. Note that setns is NOT one of them, however much it looks the
+part: it sits in the unconditional allow group as well, so the naive route does not change
+its status and what refuses it is the empty capability set. That mistake has already cost
+this project one witness that stayed red against correct code.
+
+A distribution's copy is not this copy. Fedora ships a comparable file at
+/usr/share/containers/seccomp.json, and comparing the two is worth doing, but they differ:
+as of containers-common 0.67.0 the distribution copy additionally refuses AF_VSOCK sockets
+and restructures the netlink-audit rules, and that variant exists at no upstream revision
+this file could be pinned to. What is carried here is the upstream, whole, at the revision
+named above. The difference is small and known rather than accidental.
