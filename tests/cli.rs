@@ -1424,3 +1424,139 @@ fn cli_a_session_runs_in_a_mount_namespace_of_its_own() {
         .assert()
         .success();
 }
+
+/// What a throwaway repository still answers on the host, so a test can state
+/// what survived as a literal.
+fn git_output(dir: &Path, args: &[&str]) -> String {
+    let output = GitCommand::new("git").current_dir(dir).args(args).output().unwrap();
+    let complaint = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    assert!(output.status.success(), "git {args:?} failed: {complaint}");
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// A throwaway git repository with one commit on `main`, under the user's real
+/// home rather than under `/tmp`, returned with its canonicalized path.
+///
+/// The sandbox mounts a fresh tmpfs at `/tmp`, so a repository planted there
+/// reads as absent from inside a box that confines nothing whatsoever, and a
+/// witness built on that absence passes on a broken build. The `TempDir` guard
+/// must outlive the test.
+fn temp_git_repo_under_the_host_home() -> (TempDir, PathBuf) {
+    let real_home = std::env::home_dir().expect("the test runner has a home directory");
+    let dir = TempDir::new_in(real_home).unwrap();
+    let path = dir.path().canonicalize().unwrap();
+    git(&path, &["init", "-b", "main"]);
+    fs::write(path.join("README.md"), "seed\n").unwrap();
+    git(&path, &["add", "README.md"]);
+    git(
+        &path,
+        &[
+            "-c",
+            "user.name=hort tests",
+            "-c",
+            "user.email=tests@hort.invalid",
+            "commit",
+            "-m",
+            "initial",
+        ],
+    );
+    (dir, path)
+}
+
+/// Take every entry of the worktree with it, then list what is left of it.
+///
+/// A shell glob is deliberately not what does the taking: it leaves out a name
+/// that starts with a dot, and the worktree's `.git` is exactly such a name, so
+/// `rm -rf /workdir/*` spares the one entry carrying the address of the real
+/// repository. The trailing `find` prints its own starting point and one line
+/// per entry under it, so a worktree with nothing left in it prints exactly
+/// `/workdir`.
+const DESTROY_THE_WORKTREE: &str = "find /workdir -mindepth 1 -exec rm -rf {} +\nfind /workdir\n";
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_the_host_repository_keeps_its_history_after_the_worktree_is_destroyed() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", sandbox.name().as_str()])
+        .write_stdin(DESTROY_THE_WORKTREE)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("/workdir"))
+        .stdout(predicate::str::contains("/workdir/").not());
+
+    assert_eq!(git_output(&repo_path, &["log", "--format=%s", "main"]), "initial\n");
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_a_branch_the_sandbox_never_touched_survives_the_destruction() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    git(&repo_path, &["config", "user.name", "hort tests"]);
+    git(&repo_path, &["config", "user.email", "tests@hort.invalid"]);
+    git(&repo_path, &["checkout", "-q", "-b", "keeper"]);
+    fs::write(repo_path.join("keeper.txt"), "work the sandbox never sees\n").unwrap();
+    git(&repo_path, &["add", "keeper.txt"]);
+    git(&repo_path, &["commit", "-q", "-m", "on the keeper branch"]);
+    git(&repo_path, &["checkout", "-q", "main"]);
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", sandbox.name().as_str()])
+        .write_stdin(DESTROY_THE_WORKTREE)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("/workdir"))
+        .stdout(predicate::str::contains("/workdir/").not());
+
+    assert_eq!(
+        git_output(&repo_path, &["show", "keeper:keeper.txt"]),
+        "work the sandbox never sees\n"
+    );
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_a_session_cannot_read_the_repository_its_worktree_points_at() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo_under_the_host_home();
+    let sandbox = ScratchSandbox::new();
+
+    // The worktree's `.git` is a pointer file naming a host path, so the box is
+    // handed the address of the real repository and the guarantee is that the
+    // address buys it nothing. The `echo` is the control: without it a session
+    // that died on the read would satisfy the absence below by printing nothing.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", sandbox.name().as_str()])
+        .write_stdin(format!(
+            "cat /workdir/.git\ncat {}/.git/HEAD\necho the-session-ran\n",
+            repo_path.display()
+        ))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("gitdir: {}", repo_path.display())))
+        .stdout(predicate::str::contains("ref: refs/heads/main").not())
+        .stdout(predicate::str::contains("the-session-ran"));
+}
