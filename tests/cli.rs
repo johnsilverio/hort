@@ -1560,3 +1560,118 @@ fn cli_a_session_cannot_read_the_repository_its_worktree_points_at() {
         .stdout(predicate::str::contains("ref: refs/heads/main").not())
         .stdout(predicate::str::contains("the-session-ran"));
 }
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_ls_reports_orphaned_after_the_anchor_is_killed() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", sandbox.name().as_str()])
+        .assert()
+        .success();
+    let record = FileMetadataStore::new(sandbox.state_root())
+        .get(sandbox.name())
+        .unwrap()
+        .expect("up records the sandbox it built");
+    // Whoever hort itself named as the anchor, so that killing something else
+    // cannot make the listing below say what this test wants to hear.
+    let anchor = record.liveness_token().expect("up records the anchor it started");
+    let signalled = unsafe { libc::kill(anchor.pid.0 as libc::pid_t, libc::SIGKILL) };
+    assert_eq!(signalled, 0, "the anchor could not be signalled, so nothing was killed");
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .arg("ls")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("{}  orphaned  0  ", sandbox.name().as_str())))
+        .stdout(predicate::str::contains(format!("  {}  clean\n", sandbox.name().as_str())));
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_ls_reports_inconsistent_when_the_worktree_is_deleted_under_a_live_box() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", sandbox.name().as_str()])
+        .assert()
+        .success();
+    // Taking a directory away from a container that has it bound is the one
+    // thing the order of a shutdown exists to forbid, and it is the arrangement
+    // on purpose: what a file manager can do to a live box is to be reported and
+    // never prevented. What is destroyed lives inside the guard's own state
+    // home, so the blast radius is this fixture.
+    let worktree = sandbox.state_dir().join(format!("worktree-{}", sandbox.name().as_str()));
+    fs::remove_dir_all(&worktree).unwrap();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .arg("ls")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("{}  inconsistent  0  ", sandbox.name().as_str())))
+        .stdout(predicate::str::contains(format!("  {}  -\n", sandbox.name().as_str())));
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_ls_reports_lost_record_when_the_metadata_of_a_live_box_is_removed() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", sandbox.name().as_str()])
+        .assert()
+        .success();
+    // The file and never the directory holding it: the directory carries the
+    // worktree too, and a box missing both answers for two kinds of damage at
+    // once, which is a different question from the one asked here.
+    fs::remove_file(sandbox.state_dir().join("metadata.json")).unwrap();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .arg("ls")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "{}  lost-record  0  -  -  -  -\n",
+            sandbox.name().as_str()
+        )));
+}
