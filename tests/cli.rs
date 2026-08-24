@@ -1675,3 +1675,167 @@ fn cli_ls_reports_lost_record_when_the_metadata_of_a_live_box_is_removed() {
             sandbox.name().as_str()
         )));
 }
+
+/// The file a session writes into the merged root, and the bytes that say the
+/// write landed. A read back is `cat`, which complains to stderr about a file
+/// that is not there, so the content is the only thing that can reach stdout.
+const MERGED_ROOT_FILE: &str = "written-into-the-merged-root";
+const EPHEMERAL_WRITE: &str = "this-write-is-ephemeral";
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_a_write_to_the_container_root_does_not_survive_down() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", sandbox.name().as_str()])
+        .write_stdin(format!(
+            "echo {EPHEMERAL_WRITE} > /{MERGED_ROOT_FILE}\ncat /{MERGED_ROOT_FILE}\n"
+        ))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(EPHEMERAL_WRITE));
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+
+    // The same name again, because the name is what a sandbox's state is filed
+    // under and a different one would be asking about a different box. The
+    // branch the first one made is still in the repository afterwards, and
+    // reusing it is the way hort's own collision message tells a user to. The
+    // `echo` is the control: without it a session that never opened would
+    // satisfy the absence below by printing nothing at all.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", sandbox.name().as_str(), "--branch", sandbox.name().as_str()])
+        .write_stdin(format!("cat /{MERGED_ROOT_FILE}\necho the-second-box-ran\n"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("the-second-box-ran"))
+        .stdout(predicate::str::contains(EPHEMERAL_WRITE).not());
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_a_write_to_the_container_root_never_reaches_the_base_rootfs() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    // `/etc/passwd` is the control, and it is what makes the absence on the host
+    // mean anything: it is carried by the base and by nothing else hort mounts,
+    // so reading it proves the directory inspected below is the layer this write
+    // landed on top of. Without it a box with no base at all would satisfy the
+    // assertion.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", sandbox.name().as_str()])
+        .write_stdin(format!(
+            "echo {EPHEMERAL_WRITE} > /{MERGED_ROOT_FILE}\ncat /{MERGED_ROOT_FILE} /etc/passwd\n"
+        ))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(EPHEMERAL_WRITE))
+        .stdout(predicate::str::contains("root:"));
+
+    assert!(!Path::new(&rootfs).join(MERGED_ROOT_FILE).exists());
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_a_write_in_one_sandbox_is_invisible_to_another_on_the_same_base() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    // Two boxes under one state root, because that is what a person running two
+    // of them has and the writable layer of each is a directory under it: two
+    // sandboxes meeting in one of those is the leak this asks about, and a state
+    // root each would rule it out by arrangement instead of measuring it. The
+    // runtime root stays per box, since a container's own state lives there and
+    // each guard stops the box whose name it holds. The guard owning the shared
+    // state root is declared first so it falls last, or the directory the second
+    // box is standing in is taken away while it is still running.
+    let writer = ScratchSandbox::new();
+    let reader = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", writer.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", writer.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", writer.name().as_str()])
+        .write_stdin(format!(
+            "echo {EPHEMERAL_WRITE} > /{MERGED_ROOT_FILE}\ncat /{MERGED_ROOT_FILE}\n"
+        ))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(EPHEMERAL_WRITE));
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", writer.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", reader.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", reader.name().as_str()])
+        .write_stdin(format!("cat /{MERGED_ROOT_FILE}\ncat /etc/passwd\necho the-second-box-ran\n"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("the-second-box-ran"))
+        .stdout(predicate::str::contains("root:"))
+        .stdout(predicate::str::contains(EPHEMERAL_WRITE).not());
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_a_write_to_the_worktree_is_on_the_host_afterwards() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+    let worktree = sandbox.state_dir().join(format!("worktree-{}", sandbox.name().as_str()));
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", sandbox.name().as_str()])
+        .write_stdin("echo this-write-is-kept > /workdir/kept-by-the-worktree\n")
+        .assert()
+        .success();
+
+    // Read with the sandbox still standing, which is the whole window this
+    // guarantee has: the worktree is what a person commits from, and `down`
+    // takes it away on purpose once they have.
+    assert_eq!(
+        fs::read_to_string(worktree.join("kept-by-the-worktree")).ok().as_deref(),
+        Some("this-write-is-kept\n")
+    );
+}
