@@ -15,17 +15,21 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as GitCommand, Stdio};
 use std::ptr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
+use hort::adapters::liveness::ProcLivenessProbe;
 use hort::adapters::metadata::FileMetadataStore;
 use hort::adapters::notify::FileNotifyProvider;
 use hort::adapters::pasta::PastaNetworkProvider;
 use hort::adapters::runtime::LibcontainerRuntime;
-use hort::domain::model::SandboxName;
-use hort::ports::{ContainerRuntime, MetadataStore, NetworkProvider, NotifyProvider};
+use hort::domain::model::{LivenessToken, SandboxName};
+use hort::ports::{
+    ContainerRuntime, LivenessProbe, MetadataStore, NetworkProvider, NotifyProvider,
+};
 use predicates::prelude::*;
 use tempfile::TempDir;
 
@@ -1918,4 +1922,128 @@ fn cli_the_shell_a_session_opens_holds_no_capability() {
     assert!(transcript.contains("CapEff:\t0000000000000000"));
     assert!(transcript.contains("CapBnd:\t0000000000000000"));
     assert!(transcript.contains("CapAmb:\t0000000000000000"));
+}
+
+/// How often the watch below asks. Small enough that the gap it is looking for
+/// cannot fall between two samples: a teardown that took the worktree out from
+/// under a live container would leave it gone for as long as stopping that
+/// container takes, which is milliseconds, and this asks dozens of times in that
+/// span.
+const SAMPLE: Duration = Duration::from_micros(200);
+
+/// What an outside observer saw of a sandbox while it was being torn down.
+struct WhatTheTeardownLookedLike {
+    stood_on_its_worktree: bool,
+    went_together: bool,
+    lost_its_worktree_first: bool,
+}
+
+/// Watch a sandbox from the host while `tear_down` runs, asking about the anchor
+/// and about its worktree in the same sample so their order can be read off the
+/// samples rather than inferred.
+///
+/// The state before is read here rather than in the watch, so that whether the
+/// box was standing does not depend on the first sample winning a race against
+/// the command. The anchor is asked the way hort asks it, through the liveness
+/// token it recorded, so a killed process the kernel has not reaped yet reads
+/// dead rather than alive. The watch runs on for a moment after the teardown
+/// returns, because the state it left behind is the last thing this has to see.
+fn watched_while<T>(
+    worktree: &Path,
+    anchor: LivenessToken,
+    tear_down: impl FnOnce() -> T,
+) -> (WhatTheTeardownLookedLike, T) {
+    let stood_on_its_worktree = ProcLivenessProbe.is_alive(&anchor) && worktree.exists();
+    let stop = Arc::new(AtomicBool::new(false));
+    let watching = stop.clone();
+    let watched = worktree.to_path_buf();
+    let observer = std::thread::spawn(move || {
+        let mut went_together = false;
+        let mut lost_its_worktree_first = false;
+        while !watching.load(Ordering::Relaxed) {
+            let anchor_alive = ProcLivenessProbe.is_alive(&anchor);
+            let worktree_there = watched.exists();
+            went_together |= !anchor_alive && !worktree_there;
+            lost_its_worktree_first |= anchor_alive && !worktree_there;
+            sleep(SAMPLE);
+        }
+        (went_together, lost_its_worktree_first)
+    });
+
+    let outcome = tear_down();
+    sleep(Duration::from_millis(100));
+    stop.store(true, Ordering::Relaxed);
+    let (went_together, lost_its_worktree_first) = observer.join().unwrap();
+
+    (
+        WhatTheTeardownLookedLike { stood_on_its_worktree, went_together, lost_its_worktree_first },
+        outcome,
+    )
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_the_worktree_is_removed_only_after_the_container_that_held_it_is_gone() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    // An agent that announces it finished is what puts a watcher on the host, so
+    // this box comes down with the whole family standing: the anchor, a session,
+    // pasta and the watcher.
+    let (_config, config_home) = temp_config_home(&format!(
+        r#"{{ "rootfs": "{rootfs}", "agents": [{{ "command": "claude", "notify": {{ "stopHook": true }} }}] }}"#
+    ));
+    let (_repo, repo_path) = temp_git_repo();
+    let (_sink, sink_dir) = temp_notify_sink();
+    let sandbox = ScratchSandbox::new();
+    let worktree = sandbox.state_dir().join(format!("worktree-{}", sandbox.name().as_str()));
+    let witness = worktree.join(SESSION_WITNESS);
+
+    // Spawned with its input held open, so somebody is still inside the box when
+    // it is torn down. The order exists for the case where a process is holding
+    // the mounted folder, and a box nobody is in never puts it to the test.
+    let mut occupied = std::process::Command::new(assert_cmd::cargo::cargo_bin("hort"))
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .env("PATH", path_led_by(&sink_dir))
+        .current_dir(&repo_path)
+        .args(["up", sandbox.name().as_str()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut into_the_box = occupied.stdin.take().unwrap();
+    writeln!(into_the_box, "touch /workdir/{SESSION_WITNESS}").unwrap();
+    assert!(appeared_within_deadline(&witness), "no session ever reached the worktree");
+
+    let anchor = FileMetadataStore::new(sandbox.state_root())
+        .get(sandbox.name())
+        .unwrap()
+        .expect("up records the sandbox it built")
+        .liveness_token()
+        .expect("up records the anchor it started");
+
+    let (seen, torn_down) = watched_while(&worktree, anchor, || {
+        std::process::Command::new(assert_cmd::cargo::cargo_bin("hort"))
+            .env("XDG_STATE_HOME", sandbox.state_home())
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+            .env("PATH", path_led_by(&sink_dir))
+            .current_dir(&repo_path)
+            .args(["down", "--force", sandbox.name().as_str()])
+            .output()
+            .unwrap()
+    });
+
+    drop(into_the_box);
+    occupied.wait().unwrap();
+
+    assert!(torn_down.status.success(), "{}", String::from_utf8_lossy(&torn_down.stderr));
+    // The two the watch positively saw come first: an observer that never looked
+    // reports the forbidden state missing exactly as an observer that looked and
+    // never found it. Deleting a folder a process still has mounted is what
+    // corrupts I/O, so the whole guarantee is that the worktree was never once
+    // gone while the anchor holding it was still alive.
+    assert!(seen.stood_on_its_worktree);
+    assert!(seen.went_together);
+    assert!(!seen.lost_its_worktree_first);
 }
