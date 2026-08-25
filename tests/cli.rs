@@ -2400,3 +2400,525 @@ fn cli_a_declared_database_answers_inside_an_allowlisted_sandbox() {
         .assert()
         .success();
 }
+
+/// A banner nothing on this machine but the undeclared service below answers
+/// with, so a transcript that carries it says where it came from.
+const UNDECLARED_BANNER: &str = "the-undeclared-service-answered\n";
+
+/// A service answering `banner` on a host loopback port the kernel picks, given
+/// back so a project can leave it undeclared. Like the declared one it is never
+/// let go: a port with nothing behind it is refused for a reason that has
+/// nothing to do with what the sandbox was wired for, and a probe against that
+/// says nothing.
+fn a_host_service_answering(banner: &'static str) -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut dialled in listener.incoming().flatten() {
+            let _ = dialled.write_all(banner.as_bytes());
+        }
+    });
+    port
+}
+
+/// Where this machine reaches [`ALLOWLISTED_HOST`] over IPv6 right now, or
+/// `None` after saying why.
+///
+/// The address is only half of what this is for. What the witness below measures
+/// is a route that is not there, and on a machine with no IPv6 of its own there
+/// would have been no route to take away, so the probe would answer the same on
+/// a build that empties one address family and on a build that empties both.
+fn a_reachable_public_host_over_ipv6() -> Option<SocketAddr> {
+    let Ok(addresses) = format!("{ALLOWLISTED_HOST}:443").to_socket_addrs() else {
+        eprintln!(
+            "skipped: this machine does not resolve {ALLOWLISTED_HOST}, so it has no public host to test against"
+        );
+        return None;
+    };
+    for address in addresses.filter(SocketAddr::is_ipv6) {
+        if TcpStream::connect_timeout(&address, Duration::from_secs(5)).is_ok() {
+            return Some(address);
+        }
+    }
+    eprintln!(
+        "skipped: this machine does not reach {ALLOWLISTED_HOST} on 443 over IPv6, so it has no IPv6 route for a sandbox to be denied"
+    );
+    None
+}
+
+/// The port an allowlisted sandbox's own proxy answers on, taken from what the
+/// run that wired the sandbox wrote down.
+///
+/// Every probe that has to tell "the kernel would not route this" from "the
+/// sandbox may not touch this port" needs a port the sandbox may touch, and this
+/// is the one every allowlisted sandbox has.
+fn proxy_port_of(sandbox_dir: &Path) -> u16 {
+    fs::read_to_string(sandbox_dir.join("proxy.port"))
+        .expect("an allowlisted sandbox records the port its proxy answers on")
+        .trim()
+        .parse()
+        .expect("the recorded proxy port is a port")
+}
+
+/// The address pasta gave the sandbox's namespace as its router, read off the
+/// report pasta writes into the sandbox's own log.
+///
+/// There is nowhere else to ask. The routing table inside an allowlisted box is
+/// empty by design, and the address is one hort takes from the host and records
+/// nowhere. pasta names the IPv4 router before the IPv6 one, and reading the
+/// answer as an address is what makes a report that ever changes shape fail here
+/// loudly instead of quietly aiming a probe at nothing.
+fn gateway_reported_to(sandbox_dir: &Path) -> std::net::Ipv4Addr {
+    fs::read_to_string(sandbox_dir.join("output.log"))
+        .expect("pasta reports the topology it configured")
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("router: "))
+        .expect("pasta names the router of the namespace it configured")
+        .parse()
+        .expect("the router pasta named is an address")
+}
+
+/// The network namespace a process on this host is in, as the kernel names it.
+fn network_namespace_of(pid: u32) -> String {
+    fs::read_link(format!("/proc/{pid}/ns/net"))
+        .expect("a live process has a network namespace")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The anchor `up` recorded for this sandbox, asked of the record hort wrote.
+fn anchor_of(sandbox: &ScratchSandbox) -> u32 {
+    FileMetadataStore::new(sandbox.state_root())
+        .get(sandbox.name())
+        .unwrap()
+        .expect("up records the sandbox it built")
+        .liveness_token()
+        .expect("up records the anchor it started")
+        .pid
+        .0
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_the_closed_netns_is_closed_over_ipv6_too() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let Some(public) = a_reachable_public_host_over_ipv6() else { return };
+    let (_config, config_home) = temp_config_home(&format!(
+        r#"{{ "rootfs": "{rootfs}", "egress": {{ "allow": ["{ALLOWLISTED_HOST}"] }} }}"#
+    ));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", sandbox.name().as_str()])
+        .assert()
+        .success();
+
+    let proxy = proxy_port_of(&sandbox.sandbox_dir());
+    let address = public.ip();
+    // Three dials of one tool with one set of flags, so that what separates the
+    // answers is the address and the port and nothing else. The first is the
+    // control: the sandbox's own proxy, on the sandbox's own loopback, has to
+    // answer, or every silence below is the silence of a box where nothing
+    // works. The second is the claim itself, the public host over IPv6. The
+    // third is the same host on the one port this sandbox is allowed to touch,
+    // and it is there because of what the second one cannot say.
+    let probes = format!(
+        "nc -v -w 5 127.0.0.1 {proxy} < /dev/null 2>&1\necho control=$?\n\
+         nc -v -w 8 {address} 443 < /dev/null 2>&1\necho v6=$?\n\
+         nc -v -w 8 {address} {proxy} < /dev/null 2>&1\necho v6permitted=$?\n"
+    );
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["attach", sandbox.name().as_str()])
+        .write_stdin(probes)
+        .assert()
+        .success()
+        // Every status carries its own line ending, because a status is read by
+        // matching text and `1` opens `127`, which is what a shell answers for a
+        // tool it never found.
+        .stdout(predicate::str::contains(format!("(127.0.0.1:{proxy}) open")))
+        .stdout(predicate::str::contains("control=0\n"))
+        .stdout(predicate::str::contains("v6=1\n"))
+        .stdout(predicate::str::contains("v6permitted=1\n"))
+        // The address named, and named as unroutable. The line above says the
+        // sandbox got nowhere; this one says why, and it is the only one of the
+        // two that a build which stopped emptying the IPv6 table would stop
+        // producing. Without it the pair reads the same either way, because the
+        // port restriction the session runs under refuses 443 before the kernel
+        // is ever asked for a route.
+        .stdout(predicate::str::contains(format!("[{address}]:{proxy}): Network unreachable")));
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_a_host_loopback_port_the_sandbox_did_not_declare_is_refused() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let declared = a_host_service_on_loopback();
+    // A service and not an empty port. A port with nothing behind it is turned
+    // away for a reason that has nothing to do with how the sandbox was wired,
+    // so a probe against one would report a closed door on a build that left the
+    // whole of the host's loopback open.
+    let undeclared = a_host_service_answering(UNDECLARED_BANNER);
+    let (_config, config_home) = temp_config_home(&format!(
+        r#"{{ "rootfs": "{rootfs}", "egress": {{ "allow": ["{ALLOWLISTED_HOST}"] }},
+              "network": [ {{ "mode": "host", "host": "127.0.0.1", "port": {declared} }} ] }}"#
+    ));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    // Two ports of one host loopback, dialled from inside with one tool and one
+    // set of flags, so the declaration is the only thing that differs between
+    // them. The first has to answer: it is what says the tool is there, that the
+    // sandbox does reach the host's loopback where it was told to, and that a
+    // banner crossing that way is a thing this transcript can carry at all.
+    let probes = format!(
+        "nc -v -w 5 127.0.0.1 {declared} < /dev/null 2>&1\necho declared=$?\n\
+         nc -v -w 5 127.0.0.1 {undeclared} < /dev/null 2>&1\necho undeclared=$?\n"
+    );
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", sandbox.name().as_str()])
+        .write_stdin(probes)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(DATABASE_BANNER.trim()))
+        .stdout(predicate::str::contains("declared=0\n"))
+        .stdout(predicate::str::contains("undeclared=1\n"))
+        // What the undeclared service says is a thing only the undeclared
+        // service says, so the transcript not carrying it is the whole claim:
+        // nothing inside the box got to it.
+        .stdout(predicate::str::contains(UNDECLARED_BANNER.trim()).not());
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_the_gateway_address_answers_no_port() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(
+        r#"{{ "rootfs": "{rootfs}", "egress": {{ "allow": ["{ALLOWLISTED_HOST}"] }} }}"#
+    ));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", sandbox.name().as_str()])
+        .assert()
+        .success();
+
+    let proxy = proxy_port_of(&sandbox.sandbox_dir());
+    let gateway = gateway_reported_to(&sandbox.sandbox_dir());
+    // The port is the one the sandbox is allowed to touch, and it is the whole
+    // point of the pair. On any other port the answer would be the port
+    // restriction talking, which says nothing about the address; on this one the
+    // restriction stands aside and the only thing left to refuse is the kernel
+    // having no way to that address. So the two lines differ in the address and
+    // in nothing else, and one of them has to work.
+    let probes = format!(
+        "nc -v -w 5 127.0.0.1 {proxy} < /dev/null 2>&1\necho loopback=$?\n\
+         nc -v -w 5 {gateway} {proxy} < /dev/null 2>&1\necho gateway=$?\n"
+    );
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["attach", sandbox.name().as_str()])
+        .write_stdin(probes)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("(127.0.0.1:{proxy}) open")))
+        .stdout(predicate::str::contains("loopback=0\n"))
+        .stdout(predicate::str::contains("gateway=1\n"))
+        .stdout(predicate::str::contains(format!("{gateway}:{proxy}): Network unreachable")));
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_a_session_lives_in_the_network_namespace_of_its_sandbox() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(
+        r#"{{ "rootfs": "{rootfs}", "egress": {{ "allow": ["{ALLOWLISTED_HOST}"] }} }}"#
+    ));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", sandbox.name().as_str()])
+        .assert()
+        .success();
+
+    // Read from the host, because the session cannot read it: the anchor sits in
+    // a user namespace the session is not in, so from inside the box the
+    // anchor's namespace links come back as permission denied. The host is where
+    // both are visible at once.
+    let anchor = network_namespace_of(anchor_of(&sandbox));
+    // The one arrangement this whole question exists for is a session that
+    // joined the namespace of whoever opened it instead of the one the sandbox
+    // was built with. Were the sandbox never given a namespace of its own, the
+    // two would agree while the box sat wide open on the host's, so what the
+    // sandbox has has to differ from what this process has before the agreement
+    // below means anything.
+    assert_ne!(anchor, network_namespace_of(std::process::id()));
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["attach", sandbox.name().as_str()])
+        .write_stdin("readlink /proc/self/ns/net\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(anchor));
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_the_session_a_terminal_opens_lives_in_the_network_namespace_of_its_sandbox() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(
+        r#"{{ "rootfs": "{rootfs}", "egress": {{ "allow": ["{ALLOWLISTED_HOST}"] }} }}"#
+    ));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", sandbox.name().as_str()])
+        .assert()
+        .success();
+
+    let anchor = network_namespace_of(anchor_of(&sandbox));
+    assert_ne!(anchor, network_namespace_of(std::process::id()));
+
+    // The same question asked of the other kind of session, and it is a
+    // different program being asked. A session that wants a terminal is handed
+    // to the runtime as a process file that takes the place of what the tenant
+    // builder would have put together, so whatever the piped one inherits it
+    // inherits somewhere else. The two were already measured to land in one
+    // cgroup, which says nothing at all about which network namespace either is
+    // in.
+    let mut hort = std::process::Command::new(assert_cmd::cargo::cargo_bin("hort"));
+    hort.env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["attach", sandbox.name().as_str()]);
+
+    let transcript = typed_into_a_session(hort, "readlink /proc/self/ns/net\nexit\n");
+
+    // The terminal echoes back what was typed into it, and what was typed names
+    // no namespace, so the only way this string reaches the transcript is the
+    // session having answered with it.
+    assert!(transcript.contains(&anchor), "{transcript}");
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_the_agent_cannot_add_a_route_out_of_its_sandbox() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(
+        r#"{{ "rootfs": "{rootfs}", "egress": {{ "allow": ["{ALLOWLISTED_HOST}"] }} }}"#
+    ));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", sandbox.name().as_str()])
+        .assert()
+        .success();
+
+    let gateway = gateway_reported_to(&sandbox.sandbox_dir());
+    // The first line is the premise and not decoration: what this measures is
+    // that being root buys nothing here, and on a build where the session ran as
+    // an ordinary user the refusal below would be the refusal any user gets and
+    // would say nothing about who owns the namespace. The second is the control,
+    // and it is the same program doing the harmless half of the same job, so a
+    // rootfs without it fails there rather than reading as a route that could
+    // not be added.
+    let attempt = format!(
+        "echo uid=$(id -u)\n\
+         ip route show 2>&1\necho read=$?\n\
+         ip route add default via {gateway} 2>&1\necho add=$?\n"
+    );
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["attach", sandbox.name().as_str()])
+        .write_stdin(attempt)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("uid=0\n"))
+        .stdout(predicate::str::contains("read=0\n"))
+        .stdout(predicate::str::contains("add=2\n"))
+        // The kernel's own words for it, which is what separates a namespace the
+        // agent may not configure from every other reason a route might not take.
+        .stdout(predicate::str::contains("Operation not permitted"));
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_a_raw_connection_still_fails_after_the_agent_tried_to_open_a_route() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(
+        r#"{{ "rootfs": "{rootfs}", "egress": {{ "allow": ["{ALLOWLISTED_HOST}"] }} }}"#
+    ));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", sandbox.name().as_str()])
+        .assert()
+        .success();
+
+    let proxy = proxy_port_of(&sandbox.sandbox_dir());
+    let gateway = gateway_reported_to(&sandbox.sandbox_dir());
+    // The attempt first, and it has to have been made, or what follows is the
+    // ordinary run of an untouched box. Then the control, then the raw dial the
+    // agent would make. The last line is what says the attempt bought nothing at
+    // the level it was aimed at: on the one port the session may touch, the
+    // kernel still has no way out, which is the same answer this box gave before
+    // anybody reached for the routing table.
+    let after = format!(
+        "ip route add default via {gateway} 2>&1\necho add=$?\n\
+         nc -v -w 5 127.0.0.1 {proxy} < /dev/null 2>&1\necho control=$?\n\
+         nc -v -w 5 {AN_ADDRESS_OUT_THERE} 443 < /dev/null 2>&1\necho raw=$?\n\
+         nc -v -w 5 {AN_ADDRESS_OUT_THERE} {proxy} < /dev/null 2>&1\necho routed=$?\n"
+    );
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["attach", sandbox.name().as_str()])
+        .write_stdin(after)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("add=2\n"))
+        .stdout(predicate::str::contains(format!("(127.0.0.1:{proxy}) open")))
+        .stdout(predicate::str::contains("control=0\n"))
+        .stdout(predicate::str::contains("raw=1\n"))
+        .stdout(predicate::str::contains("routed=1\n"))
+        .stdout(predicate::str::contains(format!(
+            "{AN_ADDRESS_OUT_THERE}:{proxy}): Network unreachable"
+        )));
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
