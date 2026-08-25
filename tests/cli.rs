@@ -9,10 +9,12 @@
 //! did.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as GitCommand, Stdio};
+use std::ptr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -1838,4 +1840,82 @@ fn cli_a_write_to_the_worktree_is_on_the_host_afterwards() {
         fs::read_to_string(worktree.join("kept-by-the-worktree")).ok().as_deref(),
         Some("this-write-is-kept\n")
     );
+}
+
+/// The two ends of one terminal: the side a person types into, and the side
+/// hort is run on.
+fn a_terminal() -> (OwnedFd, OwnedFd) {
+    let mut master = -1;
+    let mut slave = -1;
+    let opened = unsafe {
+        libc::openpty(&mut master, &mut slave, ptr::null_mut(), ptr::null(), ptr::null())
+    };
+    assert_eq!(opened, 0, "opening a terminal to run hort on");
+    unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) }
+}
+
+/// What came back over the terminal after `script` was typed into the session
+/// `hort` opened on it.
+///
+/// The terminal is the arrangement, not a detail of it. hort allocates a pty for
+/// a session only when it was invoked on one, and a session that asks for a
+/// terminal is the one thing the runtime takes only as a process file, which
+/// replaces what the tenant builder would otherwise have assembled rather than
+/// adding to it. A script piped in lands in a session assembled somewhere else,
+/// carrying whatever that other place puts on it.
+fn typed_into_a_session(mut hort: std::process::Command, script: &str) -> String {
+    let (master, slave) = a_terminal();
+    hort.stdin(slave.try_clone().unwrap())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave.try_clone().unwrap());
+    let mut running = hort.spawn().unwrap();
+    // The read below ends when the last holder of the session's side of the
+    // terminal is gone, and hort has to be that holder. A command keeps its own
+    // copy of every stream it was handed for as long as the command itself is
+    // around, so letting it go is as load-bearing as letting this one go.
+    drop(slave);
+    drop(hort);
+
+    let mut terminal = fs::File::from(master);
+    terminal.write_all(script.as_bytes()).unwrap();
+    let mut transcript = Vec::new();
+    // A terminal nobody holds the other side of any more is reported as a
+    // failure rather than as end of input, so the read that fills the transcript
+    // is also the read that fails.
+    let _ = terminal.read_to_end(&mut transcript);
+    running.wait().unwrap();
+
+    String::from_utf8_lossy(&transcript).into_owned()
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_the_shell_a_session_opens_holds_no_capability() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+    let mut hort = std::process::Command::new(assert_cmd::cargo::cargo_bin("hort"));
+    hort.env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", sandbox.name().as_str()]);
+
+    // The shell's own pid and never `/proc/self`, which is the `cat` it started:
+    // the kernel builds a child's permitted and effective sets out of its
+    // parent's ambient one at the exec, so a shell holding a capability it never
+    // made ambient reads back as clean through anything it runs. The anchor is
+    // another process in the same namespace, and it is not the one anybody is
+    // typing into.
+    let transcript = typed_into_a_session(hort, "cat /proc/$$/status\nexit\n");
+
+    // All five sets and not the effective one alone. A process whose effective
+    // set is empty while its bounding set is not is one raise away from holding
+    // the capability, which is the whole of what an empty capability set is for.
+    assert!(transcript.contains("CapInh:\t0000000000000000"));
+    assert!(transcript.contains("CapPrm:\t0000000000000000"));
+    assert!(transcript.contains("CapEff:\t0000000000000000"));
+    assert!(transcript.contains("CapBnd:\t0000000000000000"));
+    assert!(transcript.contains("CapAmb:\t0000000000000000"));
 }
