@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 
 use crate::domain::cache::project_cache_key;
 use crate::domain::config::ResolvedConfig;
-use crate::domain::egress::{EgressPolicy, egress_degradation_warning};
+use crate::domain::egress::{
+    EgressPolicy, egress_degradation_warning, resolver_drop_in, sandbox_resolver,
+};
 use crate::domain::error::HortError;
 use crate::domain::model::{BranchName, SandboxName, SandboxRecord, Warning};
 use crate::domain::mounts::{
@@ -303,6 +305,12 @@ impl UpCommand<'_> {
             }
         };
 
+        // The posture is read here and nowhere else, because the same address is
+        // what the box's resolver file names and what the network is told to
+        // answer for, and a sandbox whose two halves disagree asks its questions
+        // where nothing is listening.
+        let resolver = sandbox_resolver(&egress);
+
         let worktree_display = worktree_path.display().to_string();
         let token = self.runtime.start_anchor(&OciSpec {
             name: name.clone(),
@@ -314,7 +322,10 @@ impl UpCommand<'_> {
                 ("HORT_WORKTREE".to_string(), worktree_display),
             ],
             mounts,
-            drop_ins: stop_hook_drop_ins(self.config),
+            drop_ins: stop_hook_drop_ins(self.config)
+                .into_iter()
+                .chain(resolver.as_deref().map(resolver_drop_in))
+                .collect(),
             resources: limits,
         })?;
 
@@ -334,6 +345,7 @@ impl UpCommand<'_> {
                 .iter()
                 .map(|database| DbForward { host: database.host.clone(), port: database.port })
                 .collect(),
+            resolver,
         };
         let built = self.store.put(&running).and_then(|()| self.network.provision(&network_spec));
         if let Err(failure) = built {
@@ -1174,11 +1186,15 @@ mod tests {
         // runtime's, so this handover is the whole of the wiring between them: a
         // build that decides right and hands nothing over comes up with an agent
         // that announces nothing, with every test of the decision still green.
+        // How many files a sandbox carries is another decision's business, so
+        // what is asked here is that this one is among them.
         let dropped = runtime.started_drop_ins();
-        assert_eq!(dropped.len(), 1);
-        assert_eq!(
-            dropped[0].path,
-            PathBuf::from("/etc/claude-code/managed-settings.d/hort-notify.json")
+        assert!(
+            dropped.iter().any(|file| {
+                file.path.as_path()
+                    == Path::new("/etc/claude-code/managed-settings.d/hort-notify.json")
+            }),
+            "the runtime was handed {dropped:?}"
         );
     }
 
@@ -1912,6 +1928,122 @@ mod tests {
         command.run(SandboxName::new("demo").unwrap(), None).unwrap();
 
         assert_eq!(network.provisioned_forwards(), vec![("127.0.0.1".to_string(), 5432)]);
+    }
+
+    /// Where a sandbox looks for the address of its name server. The path is the
+    /// libc's and not hort's, so naming it here settles nothing production has to
+    /// choose.
+    const RESOLVER_FILE: &str = "/etc/resolv.conf";
+
+    #[test]
+    fn the_resolver_file_names_the_address_the_network_was_given() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // Which address an open sandbox is given is hort's to choose, so this
+        // reads it back rather than naming one. What it holds is the part that
+        // has to survive whatever is chosen: the box asks at the same address the
+        // host was told to answer for. Two sides of one wiring, and either of
+        // them drifting alone leaves a sandbox whose name server nothing is
+        // listening at, which reads from inside exactly like having no network.
+        let address = network.provisioned_resolver().expect("an open sandbox is given a resolver");
+        let dropped = runtime.started_drop_ins();
+        let resolver = dropped
+            .iter()
+            .find(|file| file.path.as_path() == Path::new(RESOLVER_FILE))
+            .expect("an open sandbox carries a resolver file");
+        assert!(
+            resolver.content.contains(&format!("nameserver {address}")),
+            "the resolver file holds {:?}, which names no name server at {address}",
+            resolver.content
+        );
+    }
+
+    #[test]
+    fn an_allowlist_declares_no_resolver_for_the_sandbox() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = ResolvedConfig {
+            egress: Some(Egress::Allowlist { allow: vec!["api.anthropic.com".to_string()] }),
+            ..healthy_config()
+        };
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // An allowlisted sandbox is meant to have no name resolution of its own:
+        // the proxy is handed the hostname and resolves it, and a way out of the
+        // box that carries a name and comes back with an answer is a way out the
+        // allowlist never sees. It is the address given to the network that opens
+        // it, because the address is only reachable if something was told to
+        // answer for it, so this is the assertion that decides whether the
+        // posture holds.
+        assert_eq!(network.provisioned_resolver(), None);
+    }
+
+    #[test]
+    fn an_allowlist_writes_no_resolver_file_into_the_sandbox() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = ResolvedConfig {
+            egress: Some(Egress::Allowlist { allow: vec!["api.anthropic.com".to_string()] }),
+            ..healthy_config()
+        };
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), None).unwrap();
+
+        // The other face of the same refusal, apart from it because the two can
+        // drift apart: one wiring hands the address to the host and the other
+        // writes it into the box, and a build that stops doing one goes on doing
+        // the other. This face is the cheaper of the two to get wrong, since a
+        // sandbox's own root is writable and a file it can write for itself
+        // protects nothing; what it cannot do is make an address answer.
+        let dropped = runtime.started_drop_ins();
+        assert!(
+            !dropped.iter().any(|file| file.path.as_path() == Path::new(RESOLVER_FILE)),
+            "an allowlisted sandbox was handed {dropped:?}"
+        );
     }
 
     #[test]

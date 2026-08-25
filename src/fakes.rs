@@ -331,6 +331,12 @@ impl FakeNetwork {
             .unwrap_or_default()
     }
 
+    /// The address the spec provisioned last gives the sandbox for name lookups,
+    /// and `None` where the sandbox was given none.
+    pub fn provisioned_resolver(&self) -> Option<String> {
+        self.provisioned.borrow().last().and_then(|spec| spec.resolver.clone())
+    }
+
     pub fn teardowns(&self) -> Vec<SandboxName> {
         self.teardowns.borrow().clone()
     }
@@ -347,6 +353,7 @@ impl NetworkProvider for FakeNetwork {
                 .iter()
                 .map(|forward| DbForward { host: forward.host.clone(), port: forward.port })
                 .collect(),
+            resolver: spec.resolver.clone(),
         });
         if self.provision_fails {
             // An unasserted stand-in error, like the runtime's scripted start

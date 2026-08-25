@@ -413,6 +413,15 @@ pub struct NetworkSpec {
     pub netns: PathBuf,
     pub egress: EgressPolicy,
     pub db_forwards: Vec<DbForward>,
+    /// The address, seen from inside the sandbox, that name lookups are carried
+    /// from to the host's own name server. `None` leaves the sandbox with no way
+    /// to turn a name into an address at all.
+    ///
+    /// Whether a sandbox gets one is decided where the posture is read, never
+    /// here and never in the provider: the same value is what the sandbox's
+    /// resolver file names, and one decision feeding both is what keeps the two
+    /// from coming to disagree.
+    pub resolver: Option<String>,
 }
 
 /// One declared database destination, realized as a single forward to this

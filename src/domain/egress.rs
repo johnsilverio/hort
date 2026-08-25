@@ -1,14 +1,18 @@
-//! The egress policy decision: whether a sandbox's outbound host is allowed.
+//! The egress policy decision: whether a sandbox's outbound host is allowed, and
+//! what the posture entitles the sandbox to.
 //!
 //! [`EgressPolicy`] is a pure value. It answers "does this host pass?" and so
 //! decides whether the allowlist proxy is needed at all; it never resolves a
 //! name, spawns a proxy, or opens a socket. `Open` permits everything (no proxy
 //! is spawned); `Allowlist` permits only hosts matching one of its
-//! [`HostPattern`]s.
+//! [`HostPattern`]s and gets no name resolution of its own.
+
+use std::path::PathBuf;
 
 use super::config::Egress;
 use super::error::HortError;
 use super::model::{Domain, Warning};
+use crate::ports::SandboxFile;
 
 /// The outbound-egress decision for a sandbox.
 ///
@@ -78,6 +82,45 @@ impl EgressPolicy {
 /// connect to. Anything below it takes the rules and applies none of them.
 const CONNECT_RESTRICTION_ABI: u8 = 4;
 
+/// The address, seen from inside the sandbox, that name lookups are carried
+/// from to the host's own name server.
+///
+/// Two things about the value are load-bearing, and both look like details worth
+/// tidying away. It is reserved for documentation, so nothing anywhere answers
+/// there on its own: a box whose network was never told to answer for it asks
+/// into a void rather than at a stranger's resolver, and putting a real public
+/// one here would take the sandbox's name resolution out of hort's hands and
+/// break every host whose own resolver answers differently. And it is not the
+/// address a libc falls back to when it finds no resolver file, which is
+/// loopback: choosing that would leave the file hort writes doing nothing while
+/// a lookup still succeeded, so the wiring could rot with everything looking
+/// fine.
+const SANDBOX_RESOLVER: &str = "198.51.100.53";
+
+/// Where a sandbox looks for the address of its name server. The path belongs to
+/// the libc inside the box, not to hort.
+const RESOLVER_FILE: &str = "/etc/resolv.conf";
+
+/// The address a sandbox under `egress` reaches a name server at, and `None` for
+/// one that is to have no name resolution of its own.
+///
+/// An allowlist gets nothing, and that is a layer of the allowlist rather than an
+/// omission: the proxy is handed a hostname and resolves it on the host, so a way
+/// out of the box that carries a name and comes back with an address is a way out
+/// the allowlist never sees.
+pub fn sandbox_resolver(egress: &EgressPolicy) -> Option<String> {
+    matches!(egress, EgressPolicy::Open).then(|| SANDBOX_RESOLVER.to_string())
+}
+
+/// The file that points a sandbox's name lookups at `address`.
+///
+/// It goes in whatever the prepared rootfs already carries: the write lands in
+/// the sandbox's own disposable layer, so a resolver baked in by the author of an
+/// image is shadowed by the live one and nothing of the base is touched.
+pub fn resolver_drop_in(address: &str) -> SandboxFile {
+    SandboxFile { path: PathBuf::from(RESOLVER_FILE), content: format!("nameserver {address}\n") }
+}
+
 /// The advisory a build owes the user when this host cannot enforce the
 /// connect-port restriction an allowlisted sandbox is supposed to run under.
 ///
@@ -110,7 +153,7 @@ impl HostPattern {
         }
     }
 
-    /// Whether `host` — already lowercased with any trailing dot removed —
+    /// Whether `host`, already lowercased with any trailing dot removed,
     /// satisfies this pattern. `Exact` admits only the host itself; `Suffix`
     /// admits any host with at least one extra left label, anchored at the dot,
     /// never the apex.

@@ -2689,6 +2689,7 @@ mod privileged_tests {
                 Domain::new("api.anthropic.com").unwrap(),
             )]),
             db_forwards: vec![DbForward { host: "127.0.0.1".to_string(), port }],
+            resolver: None,
         }
     }
 
@@ -2698,6 +2699,7 @@ mod privileged_tests {
             netns: PathBuf::from(format!("/proc/{anchor}/ns/net")),
             egress: EgressPolicy::Open,
             db_forwards: Vec::new(),
+            resolver: None,
         }
     }
 

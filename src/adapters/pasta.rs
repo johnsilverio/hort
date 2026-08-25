@@ -3,8 +3,9 @@
 //! host. pasta provides connectivity and filters nothing; what closes an
 //! allowlist sandbox is the shape of the namespace it runs in.
 //!
-//! Open posture asks pasta to configure the namespace and stops there, so the
-//! sandbox reaches whatever the host reaches. An allowlist keeps pasta from
+//! Open posture asks pasta to configure the namespace and to answer at the
+//! address the sandbox looks names up at, and stops there, so the sandbox
+//! reaches whatever the host reaches. An allowlist keeps pasta from
 //! mapping the host's loopback, splices only the declared ports, and then empties
 //! the namespace's route tables in both address families, which leaves
 //! `127.0.0.1:<declared port>` as the only address the sandbox can reach.
@@ -214,6 +215,15 @@ fn pasta_arguments(
         ]);
     }
 
+    // pasta intercepts by destination address, so an address is a name server
+    // only because pasta was told to answer for it, and the file naming it inside
+    // the box asks a question nothing hears without this. Which address, and
+    // whether the sandbox gets one at all, was settled where the posture was
+    // read; this side only carries it through.
+    if let Some(resolver) = &spec.resolver {
+        arguments.extend(["--dns-forward".to_string(), resolver.clone()]);
+    }
+
     arguments.extend(["-P".to_string(), argument(pid_file)]);
     arguments
 }
@@ -399,6 +409,10 @@ mod tests {
     /// A destination reserved for documentation, so nothing ever answers there:
     /// enough for a database that needs a forwarder, and no traffic to anyone.
     const UNANSWERED_ADDRESS: &str = "192.0.2.1";
+    /// An address standing in for whatever one a sandbox is given to reach a name
+    /// server at. Reserved for documentation too, and deliberately not a proposal:
+    /// what this adapter owes is carrying through the address it was handed.
+    const A_RESOLVER: &str = "203.0.113.53";
 
     fn network_spec(egress: EgressPolicy, db_forwards: Vec<DbForward>) -> NetworkSpec {
         NetworkSpec {
@@ -406,6 +420,7 @@ mod tests {
             netns: PathBuf::from("/proc/1234/ns/net"),
             egress,
             db_forwards,
+            resolver: None,
         }
     }
 
@@ -548,6 +563,37 @@ mod tests {
                 "none",
                 "-T",
                 "44001",
+                "-P",
+                "/runtime/sandboxes/demo/pasta.pid",
+            ]
+        );
+    }
+
+    #[test]
+    fn pasta_carries_name_lookups_to_the_resolver_the_sandbox_was_given() {
+        let spec = NetworkSpec {
+            resolver: Some(A_RESOLVER.to_string()),
+            ..network_spec(EgressPolicy::Open, Vec::new())
+        };
+
+        let arguments = pasta_arguments(&spec, Path::new(USERNS), Path::new(PID_FILE), None);
+
+        // pasta intercepts by destination address, so an address is a name server
+        // only because pasta was told to answer for it: a sandbox given the file
+        // and not this flag asks a question nothing on the other side hears. The
+        // address is passed through and never chosen here, which is why the one
+        // above is a documentation address that means nothing to production.
+        assert_eq!(
+            arguments,
+            [
+                "--userns",
+                "/proc/4242/ns/user",
+                "--netns",
+                "/proc/1234/ns/net",
+                "--config-net",
+                "--no-netns-quit",
+                "--dns-forward",
+                "203.0.113.53",
                 "-P",
                 "/runtime/sandboxes/demo/pasta.pid",
             ]
@@ -747,6 +793,7 @@ mod privileged_tests {
             netns: PathBuf::from(format!("/proc/{anchor}/ns/net")),
             egress: EgressPolicy::Open,
             db_forwards: Vec::new(),
+            resolver: None,
         }
     }
 
@@ -756,6 +803,7 @@ mod privileged_tests {
             netns: PathBuf::from(format!("/proc/{anchor}/ns/net")),
             egress: EgressPolicy::Allowlist(Vec::new()),
             db_forwards: Vec::new(),
+            resolver: None,
         }
     }
 
@@ -770,6 +818,7 @@ mod privileged_tests {
                 Domain::new("api.anthropic.com").unwrap(),
             )]),
             db_forwards: Vec::new(),
+            resolver: None,
         }
     }
 
@@ -788,6 +837,7 @@ mod privileged_tests {
                 Domain::new("api.anthropic.com").unwrap(),
             )]),
             db_forwards: vec![DbForward { host: "127.0.0.1".to_string(), port }],
+            resolver: None,
         }
     }
 
@@ -799,6 +849,7 @@ mod privileged_tests {
             netns: PathBuf::from(format!("/proc/{anchor}/ns/net")),
             egress: EgressPolicy::Open,
             db_forwards: vec![DbForward { host: "192.0.2.1".to_string(), port }],
+            resolver: None,
         }
     }
 

@@ -2049,7 +2049,9 @@ fn cli_the_worktree_is_removed_only_after_the_container_that_held_it_is_gone() {
     assert!(!seen.lost_its_worktree_first);
 }
 
-/// The public host the two egress witnesses that need one are written against.
+/// The public host the egress witnesses that need one are written against, in
+/// both postures: what an allowlist admits, and, where there is no allowlist at
+/// all, simply a host out there that answers.
 ///
 /// A stand-in on this machine would not serve. What is under test is hort's
 /// proxy being handed a name, resolving that name itself, reading the name the
@@ -2137,6 +2139,53 @@ fn cli_a_session_in_an_open_sandbox_reaches_a_public_host() {
         .assert()
         .success()
         .stdout(predicate::str::contains("reached=0\n"));
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_a_session_in_an_open_sandbox_resolves_a_public_name() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let Some(public) = a_reachable_public_host() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    // The name is the one the allowlist witnesses use, because the guard above
+    // resolves exactly that host and a second name would leave this unguarded.
+    // Nothing here is allowlisted: this box admits everything.
+    //
+    // Two dials of the same host, one addressed and one named, so a red says
+    // which half failed instead of leaving it to be guessed: the addressed line
+    // is what the sibling witness above already holds, and the named line is the
+    // whole of what this one adds. Both statuses are anchored at the end of the
+    // line, because a shell that cannot find the tool answers 127 and nothing
+    // here should ever read that as an answer about the network.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", sandbox.name().as_str()])
+        .write_stdin(format!(
+            "nc -w 5 -z {} {}\necho addressed=$?\nnc -w 5 -z {ALLOWLISTED_HOST} 443\necho named=$?\n",
+            public.ip(),
+            public.port()
+        ))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("addressed=0\n"))
+        .stdout(predicate::str::contains("named=0\n"));
 
     Command::cargo_bin("hort")
         .unwrap()
