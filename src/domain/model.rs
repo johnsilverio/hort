@@ -294,9 +294,37 @@ pub struct CgroupCaps {
     pub cpuset: bool,
 }
 
-/// The answers the onboarding flow collects to drive config generation. An empty
-/// placeholder for now; its fields arrive with the onboarding command.
-pub struct OnboardingAnswers;
+/// What the user chose during onboarding, which is what the config generator
+/// decides from. It carries selections and never candidates: discovering that
+/// `~/.config/nvim` or a credential directory exists on the host is an effect, so
+/// the onboarding command offers the candidates and only the picks cross here.
+pub struct OnboardingAnswers {
+    /// The prepared rootfs directory the user pointed at, or `None` when they
+    /// have none yet. Having none is an answer, not a missing input.
+    pub rootfs: Option<String>,
+    /// The host dotfile paths selected for the read-only mount list.
+    pub dotfiles: Vec<String>,
+    /// The agent entries selected, each already carrying what the command found
+    /// for it.
+    pub agents: Vec<AgentChoice>,
+    /// Whether completion notifications were accepted.
+    pub notifications: bool,
+}
+
+/// One agent entry accepted during onboarding, already paired with the
+/// credential paths and the completion-hook decision the command made for it.
+///
+/// Nothing here says which tool keeps credentials where. That knowledge belongs
+/// to whoever detects it, so the generator stays agent-agnostic and never grows
+/// a table of tool names.
+pub struct AgentChoice {
+    /// The command the user typically runs, verbatim.
+    pub command: String,
+    /// Host paths to mount read-only so the agent finds its credentials.
+    pub auth_read_only: Vec<String>,
+    /// Whether this agent can announce completion through a stop hook.
+    pub stop_hook: bool,
+}
 
 #[cfg(test)]
 mod tests {
