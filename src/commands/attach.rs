@@ -177,6 +177,11 @@ impl AttachCommand<'_> {
     /// configuration is read fresh on every attach while the sandbox was built
     /// once, so a file edited to an allowlist under a standing open box would
     /// otherwise hand every tool in it an address nobody listens on.
+    ///
+    /// Every name is stated twice because which spelling a tool reads is the
+    /// tool's own choice, and the shell utilities a prepared rootfs is usually
+    /// built from read the lowercase one only. A twin that looks redundant is
+    /// the difference between a box those tools can leave and a box they cannot.
     fn proxy_environment(&self, name: &SandboxName) -> Vec<(String, String)> {
         let Some(port) = self.proxy.proxy_port(name) else {
             return Vec::new();
@@ -184,12 +189,16 @@ impl AttachCommand<'_> {
         let proxy = format!("http://{LOOPBACK}:{port}");
         vec![
             ("HTTP_PROXY".to_string(), proxy.clone()),
+            ("http_proxy".to_string(), proxy.clone()),
             ("HTTPS_PROXY".to_string(), proxy.clone()),
-            ("ALL_PROXY".to_string(), proxy),
+            ("https_proxy".to_string(), proxy.clone()),
+            ("ALL_PROXY".to_string(), proxy.clone()),
+            ("all_proxy".to_string(), proxy),
             // Every declared database is published on the sandbox's own loopback,
             // so exempting loopback exempts all of them at once. Sent to the
             // proxy instead, a database is refused for not being a TLS host.
             ("NO_PROXY".to_string(), PROXY_EXEMPTIONS.to_string()),
+            ("no_proxy".to_string(), PROXY_EXEMPTIONS.to_string()),
         ]
     }
 }
@@ -572,6 +581,45 @@ mod tests {
     }
 
     #[test]
+    fn attach_hands_the_session_the_proxy_family_in_the_lowercase_spelling() {
+        let store = InMemoryMetadataStore::new();
+        store.put(&live_record()).unwrap();
+        let probe = ScriptedLivenessProbe::new(true);
+        let runtime = FakeRuntime::new(canned_token());
+        let clock = ScriptedClock::new(humantime::parse_rfc3339("2026-06-11T13:00:00Z").unwrap());
+        let env = FakeCapabilities::new(ready_host());
+        let proxy = FakeProxyEndpoint::listening_on(PROXY_PORT);
+        let config = ResolvedConfig { egress: allowlist(), ..config_with_shell(None) };
+        let command = attach_command(
+            &store,
+            &probe,
+            &runtime,
+            &clock,
+            &env,
+            &proxy,
+            &config,
+            None,
+            Vec::new(),
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), false).unwrap();
+
+        // Which spelling a tool reads is the tool's choice and hort does not get
+        // to make it: the shell utilities a prepared rootfs is usually built
+        // from read the lowercase names only, so a box whose one way out is
+        // named in upper case reads to them as a box with no way out at all.
+        // The exemption list travels with the family, because a tool that reads
+        // the lowercase proxy name reads the lowercase exemption name too, and
+        // one without the other sends every database connection to the proxy.
+        let environment = runtime.session_env();
+        let proxy_url = format!("http://127.0.0.1:{PROXY_PORT}");
+        assert!(environment.contains(&("http_proxy".to_string(), proxy_url.clone())));
+        assert!(environment.contains(&("https_proxy".to_string(), proxy_url.clone())));
+        assert!(environment.contains(&("all_proxy".to_string(), proxy_url)));
+        assert!(environment.contains(&("no_proxy".to_string(), "127.0.0.1,localhost".to_string())));
+    }
+
+    #[test]
     fn attach_exempts_loopback_from_the_proxy() {
         let store = InMemoryMetadataStore::new();
         store.put(&live_record()).unwrap();
@@ -687,6 +735,50 @@ mod tests {
     }
 
     #[test]
+    fn attach_keeps_the_sandbox_proxy_over_a_declared_lowercase_variable_of_the_same_name() {
+        let store = InMemoryMetadataStore::new();
+        store.put(&live_record()).unwrap();
+        let probe = ScriptedLivenessProbe::new(true);
+        let runtime = FakeRuntime::new(canned_token());
+        let clock = ScriptedClock::new(humantime::parse_rfc3339("2026-06-11T13:00:00Z").unwrap());
+        let env = FakeCapabilities::new(ready_host());
+        let proxy = FakeProxyEndpoint::listening_on(PROXY_PORT);
+        let config = ResolvedConfig {
+            agents: vec![agent_forwarding(&["http_proxy"])],
+            egress: allowlist(),
+            ..config_with_shell(None)
+        };
+        let command = attach_command(
+            &store,
+            &probe,
+            &runtime,
+            &clock,
+            &env,
+            &proxy,
+            &config,
+            None,
+            vec![("http_proxy".to_string(), "http://proxy.corp:3128".to_string())],
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), false).unwrap();
+
+        // What hort states about the sandbox has to survive what the user asked
+        // to be forwarded into it, and the witness that pins that for the
+        // uppercase family looks its pair up by name, so it stays green while
+        // saying nothing about this one. Honouring the declared value here is
+        // fatal rather than merely wrong: the host's proxy lives on a network
+        // the sandbox has no route to, so the single way out of a closed
+        // namespace would point nowhere and every request would fail with
+        // nothing in the proxy log to explain it.
+        let environment = runtime.session_env();
+        let last = environment.iter().rfind(|(name, _)| name == "http_proxy");
+        assert_eq!(
+            last,
+            Some(&("http_proxy".to_string(), format!("http://127.0.0.1:{PROXY_PORT}")))
+        );
+    }
+
+    #[test]
     fn attach_names_no_proxy_in_the_open_posture() {
         let store = InMemoryMetadataStore::new();
         store.put(&live_record()).unwrap();
@@ -714,6 +806,37 @@ mod tests {
         // that was never started breaks a box that otherwise works.
         let environment = runtime.session_env();
         assert!(!environment.iter().any(|(name, _)| name.ends_with("_PROXY")));
+    }
+
+    #[test]
+    fn attach_names_no_lowercase_proxy_in_the_open_posture() {
+        let store = InMemoryMetadataStore::new();
+        store.put(&live_record()).unwrap();
+        let probe = ScriptedLivenessProbe::new(true);
+        let runtime = FakeRuntime::new(canned_token());
+        let clock = ScriptedClock::new(humantime::parse_rfc3339("2026-06-11T13:00:00Z").unwrap());
+        let env = FakeCapabilities::new(ready_host());
+        let proxy = FakeProxyEndpoint::without_proxy();
+        let config = config_with_shell(None);
+        let command = attach_command(
+            &store,
+            &probe,
+            &runtime,
+            &clock,
+            &env,
+            &proxy,
+            &config,
+            None,
+            Vec::new(),
+        );
+
+        command.run(SandboxName::new("demo").unwrap(), false).unwrap();
+
+        // An open sandbox has no proxy in any spelling, and the guard that says
+        // so for the uppercase family cannot see this one: it matches pairs by
+        // name, and the two families share no name.
+        let environment = runtime.session_env();
+        assert!(!environment.iter().any(|(name, _)| name.ends_with("_proxy")));
     }
 
     #[test]
