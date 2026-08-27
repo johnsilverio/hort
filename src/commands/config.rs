@@ -432,4 +432,41 @@ mod tests {
         assert!(prompts.questions().is_empty(), "nothing was asked");
         assert!(!path.exists(), "and nothing was written");
     }
+
+    #[test]
+    fn config_reports_no_host_precondition_of_its_own() {
+        let where_it_cannot = TempDir::new().unwrap();
+        let where_it_can = TempDir::new().unwrap();
+        let cannot_build_a_sandbox =
+            Capabilities { user_ns: false, pasta: None, ip: None, ..ready_host() };
+        // Absolute on purpose: a `~` answer expands into each run's own home, so
+        // the advisory naming it would differ for a reason that is not the host.
+        let answer = A_ROOTFS_THE_HOST_DOES_NOT_HAVE;
+        let env_without = FakeCapabilities::new(cannot_build_a_sandbox).with_missing_rootfs();
+        let env_with = FakeCapabilities::new(ready_host()).with_missing_rootfs();
+        let prompts_without = ScriptedPrompter::accepting().answering(answer);
+        let prompts_with = ScriptedPrompter::accepting().answering(answer);
+        let on_a_host_that_cannot_build_one = ConfigCommand::new(
+            &env_without,
+            &prompts_without,
+            config_path(where_it_cannot.path()),
+            where_it_cannot.path().to_path_buf(),
+        );
+        // The capable host is the control: demanding no advisory at all would
+        // also forbid the ones onboarding exists to raise.
+        let on_a_host_that_can = ConfigCommand::new(
+            &env_with,
+            &prompts_with,
+            config_path(where_it_can.path()),
+            where_it_can.path().to_path_buf(),
+        );
+
+        let said_where_it_cannot = on_a_host_that_cannot_build_one.run(false, true).unwrap();
+        let said_where_it_can = on_a_host_that_can.run(false, true).unwrap();
+
+        assert_eq!(
+            said_where_it_cannot, said_where_it_can,
+            "onboarding reads the host and builds nothing, so what building a sandbox would need of this one is never its complaint: {said_where_it_cannot:?}"
+        );
+    }
 }
