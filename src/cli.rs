@@ -19,7 +19,7 @@ use clap::{Parser, Subcommand};
 
 use crate::adapters::cache::FileCacheProvider;
 use crate::adapters::clock::SystemClock;
-use crate::adapters::config::{ConfigResolver, find_project_dir};
+use crate::adapters::config::{ConfigResolver, GLOBAL_FILE, find_project_dir};
 use crate::adapters::confirm::StdinConfirmer;
 use crate::adapters::environment::HostEnvironmentProbe;
 use crate::adapters::liveness::ProcLivenessProbe;
@@ -27,10 +27,12 @@ use crate::adapters::lock::FlockSandboxLock;
 use crate::adapters::metadata::FileMetadataStore;
 use crate::adapters::notify::FileNotifyProvider;
 use crate::adapters::pasta::PastaNetworkProvider;
+use crate::adapters::prompt::DialoguerPrompter;
 use crate::adapters::runtime::LibcontainerRuntime;
 use crate::adapters::terminal::HostTerminal;
 use crate::adapters::worktree::GitWorktreeProvider;
 use crate::commands::attach::AttachCommand;
+use crate::commands::config::ConfigCommand;
 use crate::commands::down::DownCommand;
 use crate::commands::ls::{LsCommand, LsEntry};
 use crate::commands::prune::{PruneCommand, PruneReport};
@@ -39,6 +41,7 @@ use crate::domain::config::ResolvedConfig;
 use crate::domain::error::HortError;
 use crate::domain::idle::IdleState;
 use crate::domain::model::{BranchName, SandboxName, Warning};
+use crate::domain::onboarding::onboarding_is_due;
 use crate::domain::prune::SkipReason;
 use crate::domain::reconcile::SandboxState;
 use crate::ports::SessionTerminal;
@@ -104,10 +107,14 @@ pub struct RealDeps {
     terminal: HostTerminal,
     clock: SystemClock,
     confirmer: StdinConfirmer,
+    prompts: DialoguerPrompter,
     env: HostEnvironmentProbe,
     cache: FileCacheProvider,
     notify: FileNotifyProvider,
     config: ConfigResolver,
+    /// The global configuration file: what onboarding writes, and whose absence
+    /// is what says this host has never been set up.
+    global_config_path: PathBuf,
     /// Kept so `prune` can derive a corrupt entry's canonical worktree path,
     /// which has no record to read it from.
     state_root: PathBuf,
@@ -158,6 +165,7 @@ impl RealDeps {
         let adapters_dir = project_dir.clone().unwrap_or_else(|| current_dir.clone());
         let host_home = home_dir()?;
         let runtime_root = resolve_runtime_root();
+        let config_root = resolve_config_root()?;
 
         Ok(Self {
             lock: FlockSandboxLock::new(state_root.clone()),
@@ -169,10 +177,12 @@ impl RealDeps {
             terminal: HostTerminal,
             clock: SystemClock,
             confirmer: StdinConfirmer,
+            prompts: DialoguerPrompter,
             env: HostEnvironmentProbe,
             cache: FileCacheProvider::new(state_root.clone()),
             notify: FileNotifyProvider::new(state_root.clone(), runtime_root.clone()),
-            config: ConfigResolver::new(resolve_config_root()?, adapters_dir, host_home.clone()),
+            global_config_path: config_root.join(GLOBAL_FILE),
+            config: ConfigResolver::new(config_root, adapters_dir, host_home.clone()),
             state_root,
             project_dir,
             current_dir,
@@ -247,7 +257,7 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<u8, HortError> {
             // Read here rather than at assembly: configuration is what a sandbox
             // is built out of, and a project whose configuration hort cannot
             // parse still has sandboxes to list and tear down.
-            let (config, config_warnings) = deps.config.resolve()?;
+            let (config, config_warnings) = resolve_configuration(deps)?;
             let command = UpCommand::new(
                 &deps.lock,
                 &deps.store,
@@ -278,7 +288,7 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<u8, HortError> {
         }
         CliCommand::Attach { name } => {
             let name = SandboxName::new(&name)?;
-            let (config, config_warnings) = deps.config.resolve()?;
+            let (config, config_warnings) = resolve_configuration(deps)?;
             eprint!("{}", render_warnings(&config_warnings, &[]));
             open_session(deps, name, &config)
         }
@@ -328,6 +338,35 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<u8, HortError> {
             Ok(HORT_SUCCEEDED)
         }
     }
+}
+
+/// The configuration a command runs against, opening the first-run dialogue
+/// first on a host hort has never been set up on.
+///
+/// The dialogue hangs off the two commands that need configuration rather than
+/// off the assembly every command crosses, where a plain `hort ls` would stop to
+/// ask questions nobody invoked. What the dialogue writes is then resolved like
+/// any other configuration, so the command the person typed goes on rather than
+/// having to be typed again.
+fn resolve_configuration(deps: &RealDeps) -> Result<(ResolvedConfig, Vec<Warning>), HortError> {
+    let stdin_is_tty = std::io::stdin().is_terminal();
+    if onboarding_is_due(deps.global_config_path.exists(), stdin_is_tty) {
+        let onboarding = ConfigCommand::new(
+            &deps.env,
+            &deps.prompts,
+            deps.global_config_path.clone(),
+            deps.host_home.clone(),
+        );
+        // Never forced: onboarding is offered only where there is no file, so
+        // there is nothing an unasked overwrite could take.
+        let warnings = onboarding.run(false, stdin_is_tty)?;
+        // Printed now rather than handed back with the caller's own, which reach
+        // the terminal only once the command has succeeded. What the dialogue
+        // has to say about the file it just wrote is most worth reading on the
+        // run that then stops on the very thing it warned about.
+        eprint!("{}", render_warnings(&warnings, &[]));
+    }
+    deps.config.resolve()
 }
 
 /// Open a session in `name` and hold the terminal until it ends, reporting what

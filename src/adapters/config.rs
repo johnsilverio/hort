@@ -17,7 +17,10 @@ use crate::domain::config::{Config, ResolvedConfig, expand_home, map_devcontaine
 use crate::domain::error::HortError;
 use crate::domain::model::Warning;
 
-const GLOBAL_FILE: &str = "config.json";
+/// The name of the global configuration file under the config root. Public
+/// because onboarding writes that same file, and a second spelling of it in the
+/// CLI is a name that can drift from the one the resolver reads.
+pub const GLOBAL_FILE: &str = "config.json";
 const LOCAL_FILE: &str = ".hort.json";
 const DEVCONTAINER_DIR: &str = ".devcontainer";
 const DEVCONTAINER_FILE: &str = "devcontainer.json";

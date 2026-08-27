@@ -34,6 +34,11 @@ use hort::ports::{
 use predicates::prelude::*;
 use tempfile::TempDir;
 
+/// How long a run of `hort` is given to end on its own before the test that
+/// drives it stops waiting. Long enough that no slow machine reaches it by
+/// working, short enough that a build which stopped to ask says so in seconds.
+const ANSWERED_BY: Duration = Duration::from_secs(10);
+
 fn git(dir: &Path, args: &[&str]) {
     let status = GitCommand::new("git").current_dir(dir).args(args).status().unwrap();
     assert!(status.success(), "git {args:?} failed");
@@ -125,6 +130,15 @@ fn temp_config_home(global: &str) -> (TempDir, PathBuf) {
     let path = dir.path().canonicalize().unwrap();
     fs::create_dir_all(path.join("hort")).unwrap();
     fs::write(path.join("hort").join("config.json"), global).unwrap();
+    (dir, path)
+}
+
+/// A throwaway XDG config root with nothing in it, returned with its
+/// canonicalized path: what the host of a first run looks like, before hort has
+/// ever written anything for this user.
+fn temp_config_home_of_a_first_run() -> (TempDir, PathBuf) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().canonicalize().unwrap();
     (dir, path)
 }
 
@@ -458,6 +472,67 @@ fn cli_up_names_the_rootfs_it_could_not_find() {
         .stderr(
             "rootfs directory '/nonexistent/hort/rootfs' does not exist — prepare it first with podman export, debootstrap or umoci unpack\n",
         );
+}
+
+#[test]
+fn cli_up_falls_back_to_defaults_without_a_terminal() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let (_config, config_home) = temp_config_home_of_a_first_run();
+    let (_repo, repo_path) = temp_git_repo();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .current_dir(&repo_path)
+        // A finite wait, so a build that stops to ask something comes back red
+        // here instead of never coming back at all.
+        .timeout(ANSWERED_BY)
+        .args(["up", "demo"])
+        .assert()
+        .code(1)
+        .stderr(
+            "no rootfs configured — set \"rootfs\" to a prepared rootfs directory in .hort.json or ~/.config/hort/config.json\n",
+        );
+
+    assert!(
+        !config_home.join("hort").join("config.json").exists(),
+        "and nothing was written on the way, because nobody was there to be asked"
+    );
+}
+
+#[test]
+fn cli_up_opens_onboarding_on_a_first_run() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let (_config, config_home) = temp_config_home_of_a_first_run();
+    // A home of its own, because the dialogue offers what the home it is given
+    // holds: pointed at the real one, how many questions get asked would be
+    // decided by the machine the suite runs on.
+    let home = TempDir::new().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let (_repo, repo_path) = temp_git_repo();
+    let mut hort = std::process::Command::new(assert_cmd::cargo::cargo_bin("hort"));
+    hort.env("HOME", &home_path)
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .current_dir(&repo_path)
+        .args(["up", "demo"]);
+
+    // Two answers, both no, which is what a home holding none of the offered
+    // dotfiles and no agent credentials leaves to ask: whether there is a
+    // prepared rootfs, and whether to raise a desktop notification.
+    let transcript = typed_at_the_terminal(hort, "nn");
+
+    assert!(
+        config_home.join("hort").join("config.json").exists(),
+        "a first run at a terminal writes the configuration it just asked about: {transcript}"
+    );
+    assert!(
+        transcript.contains("no rootfs configured"),
+        "and then goes on with the command that was typed, answering out of what it wrote: {transcript}"
+    );
 }
 
 #[test]
@@ -1857,6 +1932,52 @@ fn a_terminal() -> (OwnedFd, OwnedFd) {
     };
     assert_eq!(opened, 0, "opening a terminal to run hort on");
     unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) }
+}
+
+/// What came back over the terminal after `keys` was typed at a run of `hort`
+/// held on one.
+///
+/// Separate from the session reader below, and the difference is the deadline:
+/// this drives a build that is expected to stop and ask, so a build that asks
+/// something these keys do not answer would hold the terminal open forever and
+/// take the suite with it. Killing on the deadline turns that into a red test.
+fn typed_at_the_terminal(mut hort: std::process::Command, keys: &str) -> String {
+    let (master, slave) = a_terminal();
+    hort.stdin(slave.try_clone().unwrap())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave.try_clone().unwrap());
+    let mut running = hort.spawn().unwrap();
+    drop(slave);
+    drop(hort);
+
+    let mut terminal = fs::File::from(master);
+    terminal.write_all(keys.as_bytes()).unwrap();
+
+    let waiting_on = running.id();
+    let ended = Arc::new(AtomicBool::new(false));
+    let watched = ended.clone();
+    let deadline = std::thread::spawn(move || {
+        let expires = Instant::now() + ANSWERED_BY;
+        while Instant::now() < expires {
+            if watched.load(Ordering::Relaxed) {
+                return;
+            }
+            sleep(Duration::from_millis(50));
+        }
+        // Asked once more on the way out, because the run may have ended in the
+        // last interval: the flag is what stops the kill from landing on
+        // whatever the host gave that number to next.
+        if !watched.load(Ordering::Relaxed) {
+            unsafe { libc::kill(waiting_on as i32, libc::SIGKILL) };
+        }
+    });
+
+    let mut transcript = Vec::new();
+    let _ = terminal.read_to_end(&mut transcript);
+    running.wait().unwrap();
+    ended.store(true, Ordering::Relaxed);
+    deadline.join().unwrap();
+    String::from_utf8_lossy(&transcript).into_owned()
 }
 
 /// What came back over the terminal after `script` was typed into the session

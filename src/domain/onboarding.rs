@@ -107,6 +107,16 @@ pub fn generate_config(
     (document, warnings)
 }
 
+/// Whether a command that needs configuration opens onboarding before going on:
+/// hort has never been set up on this host, and there is a terminal to ask the
+/// questions on.
+///
+/// Both facts are observed by the CLI and handed in, so what decides is a
+/// question over two plain answers and the launching stays with the effects.
+pub fn onboarding_is_due(global_config_exists: bool, stdin_is_tty: bool) -> bool {
+    !global_config_exists && stdin_is_tty
+}
+
 /// The one field no amount of host detection can answer.
 fn rootfs_entry(rootfs: Option<&str>) -> Entry {
     match rootfs {
@@ -524,6 +534,22 @@ mod tests {
         assert!(
             rendered.contains(&format!("// {taught}")),
             "and it is what the file says, closing brace and all: {rendered}"
+        );
+    }
+
+    #[test]
+    fn onboarding_is_offered_only_when_no_global_config_exists() {
+        const NO_GLOBAL_CONFIG: bool = false;
+        const A_GLOBAL_CONFIG: bool = true;
+        const ON_A_TERMINAL: bool = true;
+
+        assert!(
+            onboarding_is_due(NO_GLOBAL_CONFIG, ON_A_TERMINAL),
+            "a host hort has never been set up on is where the questions are worth asking"
+        );
+        assert!(
+            !onboarding_is_due(A_GLOBAL_CONFIG, ON_A_TERMINAL),
+            "and a host that already has answers is never asked them again, which is what keeps every later run silent"
         );
     }
 }
