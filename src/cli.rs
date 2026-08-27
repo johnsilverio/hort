@@ -2,8 +2,8 @@
 //! their dispatch, and the pure `ls`, `prune` and warning renderers.
 //!
 //! Only subcommands that work end to end ship here. This slice is `up`, `attach`,
-//! `ls`, `down` and `prune`; `config` and `doctor` arrive with the tasks that
-//! make them real, so the binary never offers a command that cannot run.
+//! `ls`, `down`, `prune` and `config`; `doctor` arrives with the task that makes
+//! it real, so the binary never offers a command that cannot run.
 //!
 //! A run that opened a session leaves with the status that session exited with,
 //! which is what lets a script tell what ran inside a sandbox from what hort
@@ -93,6 +93,12 @@ pub enum CliCommand {
         /// Also remove sandboxes idle at least this long.
         #[arg(long, value_parser = humantime::parse_duration)]
         idle: Option<Duration>,
+    },
+    /// Ask what this host can do and write the global configuration.
+    Config {
+        /// Overwrite a configuration already on disk without asking.
+        #[arg(short, long)]
+        force: bool,
     },
 }
 
@@ -335,6 +341,21 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<u8, HortError> {
             );
             let report = command.run(idle, force, std::io::stdin().is_terminal())?;
             print!("{}", render_prune(&report));
+            Ok(HORT_SUCCEEDED)
+        }
+        // Straight to the dialogue rather than through the configuration
+        // helper: that helper opens this same dialogue for a command that needs
+        // a configuration it cannot find, and this command is the dialogue, so
+        // routing it there would run the questions twice on a first run.
+        CliCommand::Config { force } => {
+            let command = ConfigCommand::new(
+                &deps.env,
+                &deps.prompts,
+                deps.global_config_path.clone(),
+                deps.host_home.clone(),
+            );
+            let warnings = command.run(force, std::io::stdin().is_terminal())?;
+            eprint!("{}", render_warnings(&warnings, &[]));
             Ok(HORT_SUCCEEDED)
         }
     }

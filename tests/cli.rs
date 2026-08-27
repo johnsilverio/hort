@@ -13,6 +13,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as GitCommand, Stdio};
 use std::ptr;
@@ -532,6 +533,150 @@ fn cli_up_opens_onboarding_on_a_first_run() {
     assert!(
         transcript.contains("no rootfs configured"),
         "and then goes on with the command that was typed, answering out of what it wrote: {transcript}"
+    );
+}
+
+#[test]
+fn cli_config_refuses_without_a_terminal() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let (_config, config_home) = temp_config_home_of_a_first_run();
+    let home = TempDir::new().unwrap();
+    let anywhere = TempDir::new().unwrap();
+
+    // The string and the code, never `.failure()`: a subcommand the binary does
+    // not have is refused too, and today this very command line comes back with
+    // clap's `unrecognized subcommand` and a 2.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .current_dir(anywhere.path())
+        .arg("config")
+        .assert()
+        .code(1)
+        .stderr(
+            "hort config needs a terminal to ask you what to configure; no flag replaces it (run it from an interactive shell, or write ~/.config/hort/config.json by hand)\n",
+        );
+}
+
+#[test]
+fn cli_config_asks_nothing_when_stdin_is_redirected_at_a_terminal() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let (_config, config_home) = temp_config_home_of_a_first_run();
+    let home = TempDir::new().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let anywhere = TempDir::new().unwrap();
+    let mut hort = std::process::Command::new(assert_cmd::cargo::cargo_bin("hort"));
+    hort.env("HOME", &home_path)
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .current_dir(anywhere.path())
+        .arg("config");
+
+    let transcript = output_only_terminal(hort);
+
+    // The whole of what it had to say, so a question asked before the refusal
+    // fails here. Which of the two facts hort reads is invisible everywhere
+    // else: with stderr piped as well, the prompts refuse on their own and
+    // answer with this very string.
+    assert_eq!(
+        transcript,
+        "hort config needs a terminal to ask you what to configure; no flag replaces it (run it from an interactive shell, or write ~/.config/hort/config.json by hand)\r\n"
+    );
+}
+
+#[test]
+fn cli_config_prints_the_advisory_its_dialogue_produced() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let (_config, config_home) = temp_config_home_of_a_first_run();
+    // A home of its own, because the dialogue offers what the home it is given
+    // holds: pointed at the real one, how many questions get asked would be
+    // decided by the machine the suite runs on.
+    let home = TempDir::new().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let anywhere = TempDir::new().unwrap();
+    let mut hort = std::process::Command::new(assert_cmd::cargo::cargo_bin("hort"));
+    hort.env("HOME", &home_path)
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .current_dir(anywhere.path())
+        .arg("config");
+
+    // Two answers, both no, which is what a home holding none of the offered
+    // dotfiles and no agent credentials leaves to ask: whether there is a
+    // prepared rootfs, and whether to raise a desktop notification.
+    let transcript = typed_at_the_terminal(hort, "nn");
+
+    // The prefix and not the sentence: what the dialogue had to say is the
+    // generator's prose and may be reworded, while a run that prints none of it
+    // has dropped a degradation hort promised to report.
+    assert!(
+        transcript.contains("warning: "),
+        "what the dialogue found reaches the terminal as an advisory: {transcript}"
+    );
+}
+
+#[test]
+fn cli_config_asks_before_overwriting_an_existing_config() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let (_config, config_home) = temp_config_home(r#"{ "rootfs": "/from/an/earlier/run" }"#);
+    let home = TempDir::new().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let anywhere = TempDir::new().unwrap();
+    let global = config_home.join("hort").join("config.json");
+    let mut hort = std::process::Command::new(assert_cmd::cargo::cargo_bin("hort"));
+    hort.env("HOME", &home_path)
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .current_dir(anywhere.path())
+        .arg("config");
+
+    // Three noes for a flow that gets to ask one question, so a run that never
+    // asked it answers the two the dialogue asks instead and is caught below,
+    // rather than holding the terminal until the deadline.
+    let transcript = typed_at_the_terminal(hort, "nnn");
+
+    assert!(
+        transcript.contains(&global.display().to_string()),
+        "the file already there is what it asks about: {transcript}"
+    );
+    assert_eq!(
+        fs::read_to_string(&global).unwrap(),
+        r#"{ "rootfs": "/from/an/earlier/run" }"#,
+        "and a no leaves it exactly as it was: {transcript}"
+    );
+}
+
+#[test]
+fn cli_config_under_force_overwrites_without_asking() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let (_config, config_home) = temp_config_home(r#"{ "rootfs": "/from/an/earlier/run" }"#);
+    let home = TempDir::new().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let anywhere = TempDir::new().unwrap();
+    let global = config_home.join("hort").join("config.json");
+    let mut hort = std::process::Command::new(assert_cmd::cargo::cargo_bin("hort"));
+    hort.env("HOME", &home_path)
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .current_dir(anywhere.path())
+        .args(["config", "--force"]);
+
+    // Two noes, the whole dialogue on a home holding nothing it offers. A run
+    // that still asked about the overwrite would spend the first of them saying
+    // no to that and leave the file below untouched.
+    let transcript = typed_at_the_terminal(hort, "nn");
+
+    let written = fs::read_to_string(&global).unwrap();
+    assert!(
+        !written.contains("/from/an/earlier/run"),
+        "what was there is gone, with nobody asked about it: {transcript}"
     );
 }
 
@@ -1932,6 +2077,38 @@ fn a_terminal() -> (OwnedFd, OwnedFd) {
     };
     assert_eq!(opened, 0, "opening a terminal to run hort on");
     unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) }
+}
+
+/// What hort wrote to a terminal it was given for its output alone, with stdin
+/// coming from somewhere that is not one.
+///
+/// The arrangement is the point: `dialoguer` guards itself by looking at stderr
+/// while hort decides by looking at stdin, so this is where the two can disagree
+/// and where what hort read is observable at all.
+///
+/// The run gets a session of its own, which is what keeps a build that decides
+/// to ask something anyway off the keyboard of whoever runs the suite: with no
+/// controlling terminal there is no `/dev/tty` for a prompt to fall back to, so
+/// it fails at once instead of waiting, and that is also why this one needs no
+/// deadline.
+fn output_only_terminal(mut hort: std::process::Command) -> String {
+    let (master, slave) = a_terminal();
+    hort.stdin(Stdio::null()).stdout(slave.try_clone().unwrap()).stderr(slave.try_clone().unwrap());
+    unsafe {
+        hort.pre_exec(|| match libc::setsid() {
+            -1 => Err(std::io::Error::last_os_error()),
+            _ => Ok(()),
+        });
+    }
+    let mut running = hort.spawn().unwrap();
+    drop(slave);
+    drop(hort);
+
+    let mut terminal = fs::File::from(master);
+    let mut transcript = Vec::new();
+    let _ = terminal.read_to_end(&mut transcript);
+    running.wait().unwrap();
+    String::from_utf8_lossy(&transcript).into_owned()
 }
 
 /// What came back over the terminal after `keys` was typed at a run of `hort`
