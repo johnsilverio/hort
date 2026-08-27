@@ -1,9 +1,9 @@
 //! CLI surface: the clap v4 derive definitions for the subcommands hort exposes,
-//! their dispatch, and the pure `ls`, `prune` and warning renderers.
+//! their dispatch, and the pure `ls`, `prune`, `doctor` and warning renderers.
 //!
-//! Only subcommands that work end to end ship here. This slice is `up`, `attach`,
-//! `ls`, `down`, `prune` and `config`; `doctor` arrives with the task that makes
-//! it real, so the binary never offers a command that cannot run.
+//! Only subcommands that work end to end ship here, and with `doctor` that is now
+//! the whole surface: `up`, `attach`, `ls`, `down`, `prune`, `config` and
+//! `doctor`. A command the binary names is one the binary can run.
 //!
 //! A run that opened a session leaves with the status that session exited with,
 //! which is what lets a script tell what ran inside a sandbox from what hort
@@ -12,7 +12,7 @@
 
 use std::fs;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
@@ -33,6 +33,7 @@ use crate::adapters::terminal::HostTerminal;
 use crate::adapters::worktree::GitWorktreeProvider;
 use crate::commands::attach::AttachCommand;
 use crate::commands::config::ConfigCommand;
+use crate::commands::doctor::{ConfigurationReport, DoctorCommand, DoctorReport};
 use crate::commands::down::DownCommand;
 use crate::commands::ls::{LsCommand, LsEntry};
 use crate::commands::prune::{PruneCommand, PruneReport};
@@ -40,8 +41,9 @@ use crate::commands::up::UpCommand;
 use crate::domain::config::ResolvedConfig;
 use crate::domain::error::HortError;
 use crate::domain::idle::IdleState;
-use crate::domain::model::{BranchName, SandboxName, Warning};
+use crate::domain::model::{BranchName, Capabilities, SandboxName, Warning};
 use crate::domain::onboarding::onboarding_is_due;
+use crate::domain::preconditions::hard_preconditions_are_met;
 use crate::domain::prune::SkipReason;
 use crate::domain::reconcile::SandboxState;
 use crate::ports::SessionTerminal;
@@ -100,6 +102,8 @@ pub enum CliCommand {
         #[arg(short, long)]
         force: bool,
     },
+    /// Report what this host can do, changing nothing.
+    Doctor,
 }
 
 /// The real adapters the commands run against, assembled once at startup.
@@ -358,6 +362,25 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<u8, HortError> {
             eprint!("{}", render_warnings(&warnings, &[]));
             Ok(HORT_SUCCEEDED)
         }
+        // Resolved here and not through the configuration helper, which opens
+        // the first-run dialogue: this command reads the host and writes
+        // nothing, and a read-only report that stops to ask questions and leave
+        // a file behind is no longer one.
+        CliCommand::Doctor => {
+            let resolved = deps.config.resolve();
+            let report = match &resolved {
+                Ok((config, _)) => DoctorCommand::new(&deps.env, config).run(),
+                Err(error) => DoctorCommand::on_unreadable_configuration(&deps.env, error).run(),
+            };
+            print!("{}", render_doctor(&report));
+            if let Ok((_, config_warnings)) = &resolved {
+                eprint!("{}", render_warnings(config_warnings, &[]));
+            }
+            match hard_preconditions_are_met(&report.capabilities) {
+                true => Ok(HORT_SUCCEEDED),
+                false => Ok(HOST_CANNOT_BUILD_A_SANDBOX),
+            }
+        }
     }
 }
 
@@ -424,6 +447,10 @@ const DASH: &str = "-";
 /// What hort leaves with when it ran a command of its own rather than a session.
 const HORT_SUCCEEDED: u8 = 0;
 
+/// What `doctor` leaves with when this host is missing something no
+/// configuration can supply, so a script can gate on the report it just printed.
+const HOST_CANNOT_BUILD_A_SANDBOX: u8 = 1;
+
 /// What a shell adds to the signal number when it reports a process that was
 /// killed rather than one that returned.
 const SIGNALLED_EXIT_BASE: u8 = 128;
@@ -449,6 +476,184 @@ pub fn render_prune(report: &PruneReport) -> String {
         .iter()
         .map(|skip| format!("skipped {} ({})\n", skip.name, skip_reason_label(&skip.reason)));
     removed.chain(caches).chain(skipped).collect()
+}
+
+/// Render the `doctor` report for the terminal: one entry per capability with
+/// whether this host has it, and for one it lacks the consequence and how to
+/// get it. The configured rootfs is reported through the very error a build
+/// would raise, so the two never come to say different things about the same
+/// directory, and a configuration hort could not parse is a row of its own
+/// carrying what the parser said, with no rootfs row to draw from it. Layout is
+/// free; what is a contract is that every capability the probe reads is answered
+/// from the host rather than listed.
+pub fn render_doctor(report: &DoctorReport) -> String {
+    let host: String = host_findings(&report.capabilities).iter().map(Finding::render).collect();
+    let configuration = configuration_finding(&report.configuration).render();
+    format!("host\n{host}\nconfiguration\n{configuration}")
+}
+
+/// One line of the report: what was asked about, what this host answered, and,
+/// where the answer is a lack, what that costs and how to get it back.
+struct Finding {
+    subject: String,
+    answer: String,
+    missing: Option<String>,
+}
+
+/// Where an answer starts on its line, counted from the left margin, so the
+/// answers read as a column whatever the names in front of them are.
+const ANSWER_COLUMN: usize = 23;
+
+impl Finding {
+    fn render(&self) -> String {
+        let subject = format!("  {}", self.subject);
+        let found = format!("{subject:<ANSWER_COLUMN$}{}\n", self.answer);
+        match &self.missing {
+            // Under the row rather than out at the answer column: what a lack
+            // costs runs to a sentence or two, and a terminal folding that at
+            // column 23 leaves a paragraph nobody reads at three in the morning.
+            Some(cost) => format!("{found}    {cost}\n"),
+            None => found,
+        }
+    }
+}
+
+/// Every capability the detection reads, in the order somebody debugging works
+/// down them: what stops a sandbox existing at all, then what one would be
+/// missing once it does.
+fn host_findings(caps: &Capabilities) -> Vec<Finding> {
+    vec![
+        present_or_not(
+            "user namespaces",
+            caps.user_ns,
+            "a sandbox is a user namespace, so nothing gets built here at all. Look at the user.max_user_namespaces sysctl, and at whatever security profile your distribution ships.",
+        ),
+        found_on_path(
+            "pasta",
+            caps.pasta.as_deref(),
+            "no sandbox gets built: up refuses before it starts, because pasta is what bridges one to the network. It ships in the passt package.",
+        ),
+        found_on_path(
+            "ip",
+            caps.ip.as_deref(),
+            "only an egress allowlist needs it, to empty the sandbox's routing table; an open sandbox builds fine without it. It ships in iproute2.",
+        ),
+        delegated_controller("memory", caps.cgroup.memory, "a sandbox runs with no memory ceiling"),
+        delegated_controller(
+            "pids",
+            caps.cgroup.pids,
+            "nothing caps how many processes a sandbox forks",
+        ),
+        delegated_controller("cpu", caps.cgroup.cpu, "a sandbox runs with no CPU ceiling"),
+        delegated_controller(
+            "cpuset",
+            caps.cgroup.cpuset,
+            "a sandbox cannot be pinned to a set of cores",
+        ),
+        landlock_finding(caps.landlock_abi),
+        present_or_not(
+            "rootless overlayfs",
+            caps.overlayfs_rootless,
+            "every sandbox root is an overlay, so a build gets as far as the mount and dies there. The kernel has to offer overlay to an unprivileged user namespace.",
+        ),
+        found_on_path(
+            "notify-send",
+            caps.notify_send.as_deref(),
+            "an agent announcing that it finished gets recorded and nothing reaches the screen. It ships in libnotify.",
+        ),
+        present_or_not(
+            "git",
+            caps.git,
+            "no sandbox gets built, in a repository or in a marked folder alike: the first thing up asks is whether the project is a repository, and it asks git. Install it.",
+        ),
+    ]
+}
+
+/// The one row that is not a host fact: what came of reading the configuration
+/// and, where it read, whether the rootfs it names could carry a sandbox.
+///
+/// A rootfs that could not is reported through the very error a build would
+/// raise, so the two can never say different things about one directory, and
+/// those strings already carry both the consequence and the way out.
+fn configuration_finding(report: &ConfigurationReport) -> Finding {
+    match report {
+        ConfigurationReport::Unreadable(complaint) => Finding {
+            subject: "config file".to_string(),
+            answer: complaint.to_string(),
+            missing: Some(
+                "everything above is still what this host can do; nothing here speaks for this project until that file parses."
+                    .to_string(),
+            ),
+        },
+        ConfigurationReport::Read { rootfs: verdict } => Finding {
+            subject: "rootfs".to_string(),
+            answer: match verdict {
+                Some(unusable) => unusable.to_string(),
+                None => "ready".to_string(),
+            },
+            missing: None,
+        },
+    }
+}
+
+/// A capability the detection either observed or did not, with nothing to name
+/// beyond that.
+fn present_or_not(subject: &str, present: bool, cost: &str) -> Finding {
+    Finding {
+        subject: subject.to_string(),
+        answer: match present {
+            true => "yes".to_string(),
+            false => "no".to_string(),
+        },
+        missing: (!present).then(|| cost.to_string()),
+    }
+}
+
+/// A binary the detection went looking for on the `PATH`, answered with where it
+/// landed, because a host carrying two of them is exactly the host somebody runs
+/// this on.
+fn found_on_path(subject: &str, found: Option<&Path>, cost: &str) -> Finding {
+    Finding {
+        subject: subject.to_string(),
+        answer: match found {
+            Some(path) => path.display().to_string(),
+            None => "not on PATH".to_string(),
+        },
+        missing: found.is_none().then(|| cost.to_string()),
+    }
+}
+
+/// One cgroup controller and what a sandbox goes without where this user was not
+/// delegated it. The way to get any of them is the same systemd directive, so
+/// the row composes that half itself rather than repeating it four times.
+fn delegated_controller(controller: &str, delegated: bool, cost: &str) -> Finding {
+    Finding {
+        subject: format!("cgroup {controller}"),
+        answer: match delegated {
+            true => "delegated".to_string(),
+            false => "not delegated".to_string(),
+        },
+        missing: (!delegated).then(|| {
+            format!("{cost}. Add {controller} to Delegate= in a systemd drop-in for user@.service.")
+        }),
+    }
+}
+
+/// The Landlock row, which answers with the ABI rather than with a yes: which
+/// version the kernel offers is what decides whether the egress half of the
+/// restriction can be applied at all.
+fn landlock_finding(abi: Option<u8>) -> Finding {
+    Finding {
+        subject: "landlock".to_string(),
+        answer: match abi {
+            Some(abi) => format!("ABI {abi}"),
+            None => "unavailable".to_string(),
+        },
+        missing: abi.is_none().then(|| {
+            "an allowlisted sandbox loses the kernel restriction on which ports a session may dial; the routeless namespace, the proxy and the absent resolver still hold. ABI 4 or later carries that port half."
+                .to_string()
+        }),
+    }
 }
 
 /// Render the advisories a build produced for the terminal: what resolving the
@@ -566,7 +771,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::domain::idle::IdleState;
-    use crate::domain::model::{BranchName, SandboxName, Warning};
+    use crate::domain::model::{BranchName, Capabilities, CgroupCaps, SandboxName, Warning};
     use crate::domain::prune::{PruneSkip, SkipReason};
     use crate::domain::reconcile::SandboxState;
 
@@ -777,6 +982,143 @@ mod tests {
             removed_caches: Vec::new(),
             skipped: vec![PruneSkip { name: "/home/tester/projects/hort".to_string(), reason }],
         }
+    }
+
+    fn a_capable_host() -> Capabilities {
+        Capabilities {
+            user_ns: true,
+            pasta: Some(PathBuf::from("/usr/bin/pasta")),
+            ip: Some(PathBuf::from("/usr/bin/ip")),
+            cgroup: CgroupCaps { memory: true, pids: true, cpu: true, cpuset: true },
+            landlock_abi: Some(4),
+            overlayfs_rootless: true,
+            notify_send: Some(PathBuf::from("/usr/bin/notify-send")),
+            git: true,
+        }
+    }
+
+    fn reported(capabilities: Capabilities) -> DoctorReport {
+        DoctorReport { capabilities, configuration: ConfigurationReport::Read { rootfs: None } }
+    }
+
+    #[test]
+    fn render_doctor_tells_a_host_apart_by_every_capability_it_reports() {
+        let capable = render_doctor(&reported(a_capable_host()));
+        let each_one_missing = [
+            ("user namespaces", Capabilities { user_ns: false, ..a_capable_host() }),
+            ("pasta", Capabilities { pasta: None, ..a_capable_host() }),
+            ("ip", Capabilities { ip: None, ..a_capable_host() }),
+            (
+                "a delegated memory controller",
+                Capabilities {
+                    cgroup: CgroupCaps { memory: false, ..a_capable_host().cgroup },
+                    ..a_capable_host()
+                },
+            ),
+            (
+                "a delegated pids controller",
+                Capabilities {
+                    cgroup: CgroupCaps { pids: false, ..a_capable_host().cgroup },
+                    ..a_capable_host()
+                },
+            ),
+            (
+                "a delegated cpu controller",
+                Capabilities {
+                    cgroup: CgroupCaps { cpu: false, ..a_capable_host().cgroup },
+                    ..a_capable_host()
+                },
+            ),
+            (
+                "a delegated cpuset controller",
+                Capabilities {
+                    cgroup: CgroupCaps { cpuset: false, ..a_capable_host().cgroup },
+                    ..a_capable_host()
+                },
+            ),
+            ("Landlock", Capabilities { landlock_abi: None, ..a_capable_host() }),
+            ("rootless overlayfs", Capabilities { overlayfs_rootless: false, ..a_capable_host() }),
+            ("notify-send", Capabilities { notify_send: None, ..a_capable_host() }),
+            ("git", Capabilities { git: false, ..a_capable_host() }),
+        ];
+
+        // Asked as a difference and never as a name in the text: a report that
+        // prints a fixed list of labels contains every name a caller could look
+        // for, so a search finds them all on a report that never read anything.
+        // What separates the two is that flipping a capability changes what
+        // comes out, and it has to hold for each of them, since a report is
+        // useless for the one capability it happens to be blind to.
+        for (capability, host) in each_one_missing {
+            assert_ne!(
+                render_doctor(&reported(host)),
+                capable,
+                "a host without {capability} reads exactly like one that has it"
+            );
+        }
+    }
+
+    #[test]
+    fn render_doctor_still_answers_for_the_host_when_the_configuration_is_broken() {
+        let what_the_parser_said = "/here/.hort.json: expected value at line 1 column 14";
+        let unreadable = |host: Capabilities| {
+            render_doctor(&DoctorReport {
+                capabilities: host,
+                configuration: ConfigurationReport::Unreadable(HortError::InvalidConfig {
+                    detail: what_the_parser_said.to_string(),
+                }),
+            })
+        };
+
+        let capable = unreadable(a_capable_host());
+
+        // The parser's own words and not a sentence of hort's own, because the
+        // line and column are the whole of what sends somebody to the right
+        // place in the file.
+        assert!(capable.contains(what_the_parser_said), "{capable}");
+        // The other half of the same guarantee, and the half a witness looking
+        // only for the complaint would miss: a report that prints that one row
+        // and stops reads the same on every host, and a host whose
+        // configuration is broken is exactly the one somebody is running this
+        // on to find out what else is wrong.
+        assert_ne!(
+            capable,
+            unreadable(Capabilities { pasta: None, ..a_capable_host() }),
+            "a configuration hort could not read took the host report away with it"
+        );
+    }
+
+    #[test]
+    fn render_doctor_names_where_pasta_was_found() {
+        let found_at = "/opt/hort/bin/pasta";
+        let host = Capabilities { pasta: Some(PathBuf::from(found_at)), ..a_capable_host() };
+
+        let rendered = render_doctor(&reported(host));
+
+        // A host with two of them on the PATH is exactly the host somebody runs
+        // doctor on, and "present" alone does not say which one hort would run.
+        assert!(rendered.contains(found_at), "{rendered}");
+    }
+
+    #[test]
+    fn render_doctor_carries_the_rootfs_error_the_host_would_raise() {
+        let report = DoctorReport {
+            capabilities: a_capable_host(),
+            configuration: ConfigurationReport::Read {
+                rootfs: Some(HortError::RootfsMissing { path: "/opt/hort/rootfs".to_string() }),
+            },
+        };
+
+        let rendered = render_doctor(&report);
+
+        // Verbatim, because this line is the one place the report is obliged to
+        // say the consequence and the way out, and it is already a canonical
+        // string a build would print for the same directory.
+        assert!(
+            rendered.contains(
+                "rootfs directory '/opt/hort/rootfs' does not exist — prepare it first with podman export, debootstrap or umoci unpack"
+            ),
+            "{rendered}"
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::fmt;
 /// interpolates; the message itself is produced by `Display`. `InvalidName` is
 /// the signal a validated newtype (`SandboxName`/`BranchName`/`Domain`) returns
 /// when it rejects its input, matched as a **unit** variant.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HortError {
     /// A validated domain newtype rejected its input. Matched as a **unit**
     /// variant (`HortError::InvalidName`), never `HortError::InvalidName { .. }`.

@@ -156,6 +156,23 @@ fn temp_host_home() -> (TempDir, PathBuf) {
     (dir, path)
 }
 
+/// A throwaway directory to hand hort as the whole of its `PATH`, holding one
+/// executable file per name in `programs`, returned with its canonicalized path.
+///
+/// Nothing here is ever run: what hort reads off the `PATH` is that a file of
+/// that name is there and carries an execute bit, so an empty file is a faithful
+/// stand-in and no test has to install anything to say a host has it.
+fn temp_path_holding(programs: &[&str]) -> (TempDir, PathBuf) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().canonicalize().unwrap();
+    for program in programs {
+        let binary = path.join(program);
+        fs::write(&binary, "").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    (dir, path)
+}
+
 /// The prepared rootfs the end-to-end test builds a sandbox from, or `None`
 /// after saying what is missing, so a host without one reports why it skipped
 /// instead of failing.
@@ -746,6 +763,177 @@ fn cli_config_completes_on_its_own_at_a_terminal() {
         how_it_ended.code(),
         Some(0),
         "the dialogue is the whole of this command, so it runs out of questions and ends by itself: {transcript}"
+    );
+}
+
+#[test]
+fn cli_doctor_reports_a_host_with_pasta_differently_from_one_without() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let (_config, config_home) = temp_config_home("{}");
+    let home = TempDir::new().unwrap();
+    let anywhere = TempDir::new().unwrap();
+    let (_with, path_with_pasta) = temp_path_holding(&["pasta"]);
+    let (_without, path_without_pasta) = temp_path_holding(&[]);
+
+    let doctor = |lookup: &Path| {
+        Command::cargo_bin("hort")
+            .unwrap()
+            .env("HOME", home.path())
+            .env("XDG_STATE_HOME", &xdg_root)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("PATH", lookup)
+            .current_dir(anywhere.path())
+            .timeout(ANSWERED_BY)
+            .arg("doctor")
+            .output()
+            .unwrap()
+            .stdout
+    };
+
+    let where_pasta_is = doctor(&path_with_pasta);
+    let where_it_is_not = doctor(&path_without_pasta);
+
+    // Two hosts differing in one thing, because a report that prints a fixed
+    // list of capability names looks right on any host and says the same thing
+    // on both of these.
+    assert_ne!(
+        String::from_utf8_lossy(&where_pasta_is),
+        String::from_utf8_lossy(&where_it_is_not),
+        "the report is the same text on a host that has pasta and one that does not"
+    );
+}
+
+#[test]
+fn cli_doctor_gates_on_the_pasta_it_found() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let (_config, config_home) = temp_config_home("{}");
+    let home = TempDir::new().unwrap();
+    let anywhere = TempDir::new().unwrap();
+    let (_with, path_with_pasta) = temp_path_holding(&["pasta"]);
+    let (_without, path_without_pasta) = temp_path_holding(&[]);
+
+    let doctor = |lookup: &Path| {
+        Command::cargo_bin("hort")
+            .unwrap()
+            .env("HOME", home.path())
+            .env("XDG_STATE_HOME", &xdg_root)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("PATH", lookup)
+            .current_dir(anywhere.path())
+            .timeout(ANSWERED_BY)
+            .arg("doctor")
+            .output()
+            .unwrap()
+            .status
+            .code()
+    };
+
+    // Both arms, because a gate that answers the same number on every host
+    // passes either one alone. The zero arm reads this machine's kernel for the
+    // user-namespace half, the way the rootfs message above reads it to get
+    // past the same check.
+    assert_eq!(doctor(&path_with_pasta), Some(0), "a host that can build a sandbox gates open");
+    assert_ne!(doctor(&path_without_pasta), Some(0), "and one that cannot gates shut");
+}
+
+#[test]
+fn cli_doctor_still_reports_when_the_gate_is_closed() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let (_config, config_home) = temp_config_home("{}");
+    let home = TempDir::new().unwrap();
+    let anywhere = TempDir::new().unwrap();
+    let (_without, path_without_pasta) = temp_path_holding(&[]);
+
+    let ran = Command::cargo_bin("hort")
+        .unwrap()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("PATH", &path_without_pasta)
+        .current_dir(anywhere.path())
+        .timeout(ANSWERED_BY)
+        .arg("doctor")
+        .output()
+        .unwrap();
+
+    assert_ne!(ran.status.code(), Some(0), "the arrangement is a host that cannot build one");
+    // The report is what somebody runs doctor for, and the host it matters most
+    // on is the one that gates shut. Raised as an error instead, the whole thing
+    // would go to stderr as a single line and this would be empty.
+    assert!(!ran.stdout.is_empty(), "and it still says what it found");
+}
+
+#[test]
+fn cli_doctor_reports_a_malformed_configuration_instead_of_refusing() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    // Only the project layer is broken, so what the report names is unambiguous.
+    let (_config, config_home) = temp_config_home("{}");
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let project_path = project.path().canonicalize().unwrap();
+    fs::write(project_path.join(".hort.json"), r#"{ "rootfs": "#).unwrap();
+    let (_with, path_with_pasta) = temp_path_holding(&["pasta"]);
+
+    let ran = Command::cargo_bin("hort")
+        .unwrap()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("PATH", &path_with_pasta)
+        .current_dir(&project_path)
+        .timeout(ANSWERED_BY)
+        .arg("doctor")
+        .output()
+        .unwrap();
+
+    // The whole path and never the bare file name, which was the first form of
+    // this assertion and could not discriminate: the canonical no-rootfs message
+    // names ".hort.json" too, so a build that quietly threw the unreadable file
+    // away and reported an empty configuration matched it. Only the parser's own
+    // complaint carries the path of the file it choked on.
+    let broken = project_path.join(".hort.json");
+    assert!(
+        String::from_utf8_lossy(&ran.stdout).contains(&broken.display().to_string()),
+        "{}",
+        String::from_utf8_lossy(&ran.stdout)
+    );
+    // The gate's answer about this machine, not the parser's about this project.
+    // A read that rose through the command would leave here with the error's
+    // code and nothing at all on stdout.
+    assert_eq!(ran.status.code(), Some(0), "{}", String::from_utf8_lossy(&ran.stderr));
+}
+
+#[test]
+fn cli_doctor_leaves_a_first_run_host_as_it_found_it() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let (_config, config_home) = temp_config_home_of_a_first_run();
+    let home = TempDir::new().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let anywhere = TempDir::new().unwrap();
+    let mut hort = std::process::Command::new(assert_cmd::cargo::cargo_bin("hort"));
+    hort.env("HOME", &home_path)
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .current_dir(anywhere.path())
+        .arg("doctor");
+
+    // Nothing typed, at a terminal, on a host hort has never been set up on:
+    // the arrangement that opens the first-run dialogue for every command that
+    // needs a configuration.
+    let (how_it_ended, transcript) = ended_at_the_terminal(hort, "");
+
+    assert!(
+        how_it_ended.code().is_some(),
+        "a run that stopped to ask is still holding the terminal at the deadline and comes back as a signal: {transcript}"
+    );
+    assert!(
+        !config_home.join("hort").join("config.json").exists(),
+        "and a read-only report writes nothing, least of all a configuration nobody asked for: {transcript}"
     );
 }
 

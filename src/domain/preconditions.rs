@@ -107,6 +107,21 @@ pub fn attach_precondition_error(caps: &Capabilities) -> Option<HortError> {
     (!caps.user_ns).then_some(HortError::UserNamespacesDisabled)
 }
 
+/// Whether this host meets the preconditions that no configuration can supply:
+/// unprivileged user namespaces and pasta. `hort doctor` leaves with success on
+/// a host that meets them and with a failure on one that does not, so a script
+/// can gate on it.
+///
+/// It is a predicate and never an error, because the report is what `doctor`
+/// exists to produce and an error would take the report away on the very arm a
+/// caller wrote the gate to read. It asks about the host and nothing else: a
+/// rootfs that is not configured yet is the ordinary state of a machine that has
+/// just been set up, and closing the gate on it would tell the user their kernel
+/// is the problem.
+pub fn hard_preconditions_are_met(caps: &Capabilities) -> bool {
+    caps.user_ns && caps.pasta.is_some()
+}
+
 /// The shell a session execs, from the configuration, the shell the user runs on
 /// the host, and whether that host shell resolves inside the sandbox's rootfs.
 ///
@@ -329,6 +344,25 @@ mod tests {
         // to enter a live box over either of them locks the user out of work
         // that is sitting there uncommitted.
         assert_eq!(error, None);
+    }
+
+    #[test]
+    fn doctor_gate_opens_on_a_host_that_can_build_a_sandbox() {
+        assert!(hard_preconditions_are_met(&ready_host()));
+    }
+
+    #[test]
+    fn doctor_gate_closes_when_pasta_is_absent() {
+        let caps = Capabilities { pasta: None, ..ready_host() };
+
+        assert!(!hard_preconditions_are_met(&caps));
+    }
+
+    #[test]
+    fn doctor_gate_closes_when_user_namespaces_are_disabled() {
+        let caps = Capabilities { user_ns: false, ..ready_host() };
+
+        assert!(!hard_preconditions_are_met(&caps));
     }
 
     #[test]
