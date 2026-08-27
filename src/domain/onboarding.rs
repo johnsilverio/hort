@@ -90,6 +90,7 @@ pub fn generate_config(
         entries: vec![
             rootfs_entry(answers.rootfs.as_deref()),
             mounts_entry(&answers.dotfiles),
+            egress_entry(),
             agents_entry(&answers.agents),
             notifications_entry(answers.notifications, caps.notify_send.is_some()),
             resources_entry(&caps.cgroup),
@@ -131,6 +132,27 @@ fn mounts_entry(dotfiles: &[String]) -> Entry {
     Entry::Active {
         note: vec!["Host paths every sandbox mounts read-only, dotfiles and the like.".to_string()],
         body: object("mounts", array("readOnly", quoted_items(dotfiles))),
+    }
+}
+
+/// What the sandbox may reach on the network, which stays commented whatever
+/// this host can do: the default posture is open, so an active entry would put a
+/// sandbox behind a filter nobody asked for. It is here at all because a reader
+/// who never opens the documentation would otherwise never learn the allowlist
+/// exists.
+///
+/// The example names a domain reserved for documentation rather than any real
+/// host, because hort runs whichever agent the user brought and a generated file
+/// naming one provider's endpoint would be an opinion about who they may reach.
+fn egress_entry() -> Entry {
+    Entry::Commented {
+        note: vec![
+            "Outbound is open and unfiltered until this is uncommented. With a list, a".to_string(),
+            "sandbox reaches only these hosts, and only through tools that read".to_string(),
+            "HTTP_PROXY. A bare name matches exactly, and \"*.\" covers subdomains".to_string(),
+            "but not the name itself.".to_string(),
+        ],
+        body: vec![r#""egress": { "allow": ["api.example.com", "*.example.com"] },"#.to_string()],
     }
 }
 
@@ -447,5 +469,61 @@ mod tests {
         assert_eq!(parsed.rootfs.as_deref(), Some("~/.local/share/hort/rootfs/devbox"));
         assert_eq!(parsed.agents[0].command, "claude --dangerously-skip-permissions");
         assert_eq!(parsed.agents[0].auth.read_only, vec!["~/.claude".to_string()]);
+    }
+
+    #[test]
+    fn a_generated_config_teaches_that_an_egress_allowlist_exists() {
+        let (document, _warnings) =
+            generate_config(&host_with_everything(), &answers_with_a_rootfs());
+        let rendered = document.render();
+
+        assert!(
+            rendered.contains(r#"// "egress""#),
+            "the key that narrows outbound access is in the file, commented: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#""allow""#),
+            "and what it shows is the allowlist form, not merely that a key exists: {rendered}"
+        );
+        assert!(
+            config::parse(&rendered)
+                .expect("the generated document is valid JSONC")
+                .egress
+                .is_none(),
+            "and it sets no posture, because nobody was asked which one they wanted: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_generated_egress_entry_names_a_reserved_example_domain() {
+        let (document, _warnings) =
+            generate_config(&host_with_everything(), &answers_with_a_rootfs());
+        let rendered = document.render();
+
+        assert!(
+            rendered.contains("example.com"),
+            "the allowlist example is written with a domain reserved for documentation: {rendered}"
+        );
+        assert!(
+            !rendered.contains("anthropic.com") && !rendered.contains("github.com"),
+            "and never with a real host, which would ship an opinion about who you may reach: {rendered}"
+        );
+    }
+    #[test]
+    fn the_egress_entry_teaches_an_allowlist_hort_can_read_back() {
+        let taught = r#""egress": { "allow": ["api.example.com", "*.example.com"] },"#;
+
+        let (document, _warnings) =
+            generate_config(&host_with_everything(), &answers_with_a_rootfs());
+        let rendered = document.render();
+
+        assert!(
+            config::parse(&format!("{{{taught}}}")).is_ok(),
+            "what the file teaches is a configuration hort accepts, not one it refuses"
+        );
+        assert!(
+            rendered.contains(&format!("// {taught}")),
+            "and it is what the file says, closing brace and all: {rendered}"
+        );
     }
 }
