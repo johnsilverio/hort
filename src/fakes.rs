@@ -21,7 +21,7 @@ use crate::domain::preconditions::{ConfiguredShell, RootfsFacts};
 use crate::ports::{
     CacheProvider, Clock, Confirmer, ContainerRegistry, ContainerRuntime, CorruptEntry, DbForward,
     EnvironmentProbe, LivenessProbe, MetadataStore, NetworkProvider, NetworkSpec, Notifier,
-    NotifyProvider, NotifySpec, NotifyWatcher, OciSpec, ProxyEndpoint, RegistryEntry,
+    NotifyProvider, NotifySpec, NotifyWatcher, OciSpec, Prompter, ProxyEndpoint, RegistryEntry,
     ResourceLimits, SandboxFile, SandboxLock, SandboxMount, Session, SessionProbe, SessionSpec,
     Worktree, WorktreeProvider,
 };
@@ -1106,6 +1106,71 @@ impl Confirmer for FakeConfirmer {
     fn confirm(&self, message: &str) -> Result<bool, HortError> {
         self.prompts.borrow_mut().push(message.to_owned());
         Ok(self.answer)
+    }
+}
+
+/// Answers the onboarding questions from a script and remembers every option it
+/// was offered, so a test can assert what the dialogue put in front of the user
+/// without pinning the prose it asked with.
+pub struct ScriptedPrompter {
+    accepts: bool,
+    answer: String,
+    questions: RefCell<Vec<String>>,
+    offers: RefCell<Vec<String>>,
+}
+
+impl ScriptedPrompter {
+    /// Says yes to every question and picks everything it is offered.
+    pub fn accepting() -> Self {
+        Self::answering_nothing(true)
+    }
+
+    /// Says no to every question and picks nothing.
+    pub fn declining() -> Self {
+        Self::answering_nothing(false)
+    }
+
+    fn answering_nothing(accepts: bool) -> Self {
+        Self {
+            accepts,
+            answer: String::new(),
+            questions: RefCell::new(Vec::new()),
+            offers: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// The text handed back to every free-text question.
+    pub fn answering(mut self, answer: &str) -> Self {
+        self.answer = answer.to_owned();
+        self
+    }
+
+    /// Every question asked, in order.
+    pub fn questions(&self) -> Vec<String> {
+        self.questions.borrow().clone()
+    }
+
+    /// Every option ever put in front of the person, in the order offered.
+    pub fn offers(&self) -> Vec<String> {
+        self.offers.borrow().clone()
+    }
+}
+
+impl Prompter for ScriptedPrompter {
+    fn confirm(&self, question: &str) -> Result<bool, HortError> {
+        self.questions.borrow_mut().push(question.to_owned());
+        Ok(self.accepts)
+    }
+
+    fn ask(&self, question: &str) -> Result<String, HortError> {
+        self.questions.borrow_mut().push(question.to_owned());
+        Ok(self.answer.clone())
+    }
+
+    fn choose(&self, question: &str, options: &[String]) -> Result<Vec<String>, HortError> {
+        self.questions.borrow_mut().push(question.to_owned());
+        self.offers.borrow_mut().extend_from_slice(options);
+        Ok(if self.accepts { options.to_vec() } else { Vec::new() })
     }
 }
 

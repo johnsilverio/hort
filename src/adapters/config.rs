@@ -13,7 +13,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::domain::config::{Config, ResolvedConfig, map_devcontainer, merge, parse};
+use crate::domain::config::{Config, ResolvedConfig, expand_home, map_devcontainer, merge, parse};
 use crate::domain::error::HortError;
 use crate::domain::model::Warning;
 
@@ -126,19 +126,6 @@ fn expand_host_paths(config: &mut Config, home: &Path) {
         for path in &mut agent.auth.read_only {
             *path = expand_home(path, home);
         }
-    }
-}
-
-/// Rewrite a leading `~` as the user's home: `~` alone becomes the home, `~/x`
-/// becomes `<home>/x`. Another user's home (`~someone/x`) stays as written,
-/// since hort never consults the user database to resolve it.
-fn expand_home(value: &str, home: &Path) -> String {
-    if value == "~" {
-        return home.display().to_string();
-    }
-    match value.strip_prefix("~/") {
-        Some(tail) => home.join(tail).display().to_string(),
-        None => value.to_owned(),
     }
 }
 

@@ -4,6 +4,8 @@
 //! camelCase [`Config`] tree. Locating and reading the config files is a thin
 //! adapter concern, not this module's.
 
+use std::path::Path;
+
 use serde::Deserialize;
 
 use super::error::HortError;
@@ -139,6 +141,23 @@ pub fn parse(jsonc: &str) -> Result<Config, HortError> {
     json_strip_comments::strip(&mut stripped)
         .map_err(|e| HortError::InvalidConfig { detail: e.to_string() })?;
     serde_json::from_str(&stripped).map_err(|e| HortError::InvalidConfig { detail: e.to_string() })
+}
+
+/// Rewrite a leading `~` in a host path as the user's home: `~` alone becomes
+/// the home, `~/x` becomes `<home>/x`. Another user's home (`~someone/x`) stays
+/// as written, since hort never consults the user database to resolve it.
+///
+/// Onboarding and the configuration reader both need this and must agree: one
+/// offers a path in the shorthand and stats it expanded, the other reads the
+/// same shorthand back off the file it wrote.
+pub fn expand_home(value: &str, home: &Path) -> String {
+    if value == "~" {
+        return home.display().to_string();
+    }
+    match value.strip_prefix("~/") {
+        Some(tail) => home.join(tail).display().to_string(),
+        None => value.to_owned(),
+    }
 }
 
 /// The final configuration after merging the global and local layers, with the

@@ -32,12 +32,10 @@ const DEFAULT_SHELL: &str = "/bin/sh";
 
 /// Select the precondition error `up` must raise before building anything, or
 /// `None` to proceed. Checks run in order: user namespaces, then pasta, then
-/// `ip` when the egress posture is an allowlist, then the rootfs chain
-/// (configured, exists, default shell, configured shell, `/workdir` writable).
-/// The first three say this host cannot run this sandbox, the rest say this
+/// `ip` when the egress posture is an allowlist, then the rootfs chain. The
+/// first three say this host cannot run this sandbox, the rest say this
 /// configuration is wrong. `ip` is asked for only under an allowlist, because
-/// that is the only posture whose route tables have to be emptied. A `rootfs` of
-/// `None` means the merged config resolved no rootfs, which is itself an error.
+/// that is the only posture whose route tables have to be emptied.
 pub fn up_precondition_error(
     caps: &Capabilities,
     egress: &EgressPolicy,
@@ -55,6 +53,21 @@ pub fn up_precondition_error(
         return Some(HortError::IpMissing);
     }
 
+    rootfs_precondition_error(rootfs)
+}
+
+/// Select the error one prepared rootfs raises, or `None` when it can carry a
+/// sandbox. Checks run in order: resolved at all, on disk, carrying the default
+/// shell, carrying the shell the configuration declares, and `/workdir`
+/// writable by the mapped uid. `None` facts mean nothing resolved a rootfs,
+/// which is itself an error.
+///
+/// It stands apart from the host chain above because the two answer different
+/// questions and not every caller asks both. Building a sandbox needs the host
+/// to be capable first; onboarding asks only whether the directory somebody
+/// just typed can build one, and reporting a kernel setting there would answer
+/// a question nobody asked, before the path was even looked at.
+pub fn rootfs_precondition_error(rootfs: Option<&RootfsFacts>) -> Option<HortError> {
     let Some(rootfs) = rootfs else {
         return Some(HortError::NoRootfsConfigured);
     };

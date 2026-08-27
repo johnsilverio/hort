@@ -246,6 +246,22 @@ pub trait Confirmer {
     fn confirm(&self, message: &str) -> Result<bool, HortError>;
 }
 
+/// Asks the onboarding questions and hands back what the person answered.
+///
+/// Onboarding is a dialogue and not a single fact about the world: what it asks
+/// next depends on what detection found, so it cannot be read once by the CLI
+/// and passed in the way a confirmation is. Whether there is a terminal at all
+/// is still not this port's concern, the CLI observes that and passes a plain
+/// bool into the command, which refuses before any question is reached.
+pub trait Prompter {
+    /// A yes or no question.
+    fn confirm(&self, question: &str) -> Result<bool, HortError>;
+    /// A question answered in free text, for the one thing no detection finds.
+    fn ask(&self, question: &str) -> Result<String, HortError>;
+    /// Offer a list and hand back the options picked, in the order offered.
+    fn choose(&self, question: &str, options: &[String]) -> Result<Vec<String>, HortError>;
+}
+
 /// The current wall-clock instant, behind a port so age and idle are computed
 /// against a time the test fixes.
 pub trait Clock {
@@ -261,12 +277,14 @@ pub trait EnvironmentProbe {
     /// the session shell the configuration declares, `None` when it declares
     /// none.
     fn inspect_rootfs(&self, path: &Path, shell: Option<&str>) -> RootfsFacts;
-    /// Read what the host says about the mount sources the configuration
-    /// declared, one fact per path, in the order they were asked about.
+    /// Read what the host says about the paths a caller asks about, one fact
+    /// per path, in the order they were asked about. A build asks about the
+    /// mount sources the configuration declared; onboarding asks about
+    /// candidates no configuration has declared yet.
     ///
     /// It sits here rather than on a port of its own for the same reason the
-    /// rootfs read does: both answer what the host has to say about a path the
-    /// configuration named, and both serve the same clients through the same
+    /// rootfs read does: both answer what the host has to say about a path
+    /// somebody named, and both serve the same clients through the same
     /// adapter. A path it cannot read yields the conservative fact, so a source
     /// hort is unsure of degrades instead of taking the container down with it.
     fn inspect_mount_sources(&self, paths: &[PathBuf]) -> Vec<MountSourceFacts>;

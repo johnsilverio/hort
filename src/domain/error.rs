@@ -65,6 +65,11 @@ pub enum HortError {
     /// `--force` was not passed. The `command` placeholder renders as "down" or
     /// "prune".
     RefusedWithoutConfirmation { command: String },
+    /// `config`: the onboarding dialogue was asked for by hand under a stdin
+    /// that is not a TTY. Unit variant: the message carries no placeholder, and
+    /// no flag stands in for the terminal, because the prompts are the whole
+    /// command rather than a confirmation at the end of one.
+    ConfigNeedsTerminal,
     /// Config parsing failed: the input was not valid JSONC. Carries a
     /// human-readable detail; the rendered message is not a canonical product
     /// string, so callers match the variant, not the text.
@@ -195,6 +200,10 @@ impl fmt::Display for HortError {
             HortError::RefusedWithoutConfirmation { command } => write!(
                 f,
                 "refusing to {command} without confirmation: stdin is not a TTY (pass --force to proceed)"
+            ),
+            HortError::ConfigNeedsTerminal => write!(
+                f,
+                "hort config needs a terminal to ask you what to configure; no flag replaces it (run it from an interactive shell, or write ~/.config/hort/config.json by hand)"
             ),
             HortError::InvalidConfig { detail } => write!(f, "invalid config: {detail}"),
             HortError::InvalidTimestamp { detail } => write!(f, "invalid timestamp: {detail}"),
@@ -336,6 +345,16 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "refusing to down without confirmation: stdin is not a TTY (pass --force to proceed)"
+        );
+    }
+
+    #[test]
+    fn config_needs_terminal_error_renders_canonical_string() {
+        let error = HortError::ConfigNeedsTerminal;
+
+        assert_eq!(
+            error.to_string(),
+            "hort config needs a terminal to ask you what to configure; no flag replaces it (run it from an interactive shell, or write ~/.config/hort/config.json by hand)"
         );
     }
 
