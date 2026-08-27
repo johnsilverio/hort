@@ -681,6 +681,75 @@ fn cli_config_under_force_overwrites_without_asking() {
 }
 
 #[test]
+fn cli_up_proceeds_against_the_configuration_the_dialogue_wrote() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let (_config, config_home) = temp_config_home_of_a_first_run();
+    // A home of its own, because the dialogue offers what the home it is given
+    // holds: pointed at the real one, how many questions get asked would be
+    // decided by the machine the suite runs on.
+    let home = TempDir::new().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let (_repo, repo_path) = temp_git_repo();
+    let mut hort = std::process::Command::new(assert_cmd::cargo::cargo_bin("hort"));
+    hort.env("HOME", &home_path)
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .current_dir(&repo_path)
+        .args(["up", "demo"]);
+
+    // A yes and a path, which is what makes the answer readable at all: with the
+    // rootfs question refused, a configuration naming nothing and the one the
+    // dialogue just wrote send `up` to the very same error, and a build reading
+    // either of them looks right.
+    let transcript = typed_at_the_terminal(hort, "y/nonexistent/hort/rootfs\nn");
+
+    // What the run ends on, never what it contains: the dialogue says this same
+    // sentence as an advisory while the person is still there to fix it, so only
+    // the last word is `up` answering out of a configuration rather than the
+    // dialogue answering about a path it was handed.
+    assert!(
+        transcript.trim_end().ends_with(
+            "rootfs directory '/nonexistent/hort/rootfs' does not exist — prepare it first with podman export, debootstrap or umoci unpack"
+        ),
+        "the command that was typed goes on against the file the dialogue just wrote: {transcript}"
+    );
+}
+
+#[test]
+fn cli_config_completes_on_its_own_at_a_terminal() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let (_config, config_home) = temp_config_home_of_a_first_run();
+    // A home of its own, because the dialogue offers what the home it is given
+    // holds: pointed at the real one, how many questions get asked would be
+    // decided by the machine the suite runs on.
+    let home = TempDir::new().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let anywhere = TempDir::new().unwrap();
+    let mut hort = std::process::Command::new(assert_cmd::cargo::cargo_bin("hort"));
+    hort.env("HOME", &home_path)
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .current_dir(anywhere.path())
+        .arg("config");
+
+    // Two answers, both no, which is what a home holding none of the offered
+    // dotfiles and no agent credentials leaves to ask: whether there is a
+    // prepared rootfs, and whether to raise a desktop notification.
+    let (how_it_ended, transcript) = ended_at_the_terminal(hort, "nn");
+
+    // The status and not a line of the transcript: a run that asks one question
+    // more than it has answers for is still holding the terminal when the
+    // deadline reaches it, and comes back as a signal rather than as a status.
+    assert_eq!(
+        how_it_ended.code(),
+        Some(0),
+        "the dialogue is the whole of this command, so it runs out of questions and ends by itself: {transcript}"
+    );
+}
+
+#[test]
 fn cli_up_leaves_no_sandbox_behind_when_it_cannot_build() {
     let xdg = TempDir::new().unwrap();
     let xdg_root = xdg.path().canonicalize().unwrap();
@@ -2155,6 +2224,67 @@ fn typed_at_the_terminal(mut hort: std::process::Command, keys: &str) -> String 
     ended.store(true, Ordering::Relaxed);
     deadline.join().unwrap();
     String::from_utf8_lossy(&transcript).into_owned()
+}
+
+/// How a run of `hort` held on a terminal ended, and what the terminal saw on
+/// the way, after `keys` was typed at it.
+///
+/// Separate from the transcript reader above because the question is a different
+/// one: there the terminal is read for what hort said, here for whether the run
+/// reached an end of its own. A build that asks one question more than these
+/// keys answer never gets to a status, so the deadline kills it and what comes
+/// back is a signal, which no run that finished ever ends with.
+///
+/// The run gets a session of its own, for the reason `output_only_terminal`
+/// takes one: with no controlling terminal there is no `/dev/tty` left to fall
+/// back to, so a build that goes looking for somewhere else to ask fails here
+/// instead of reading the keyboard of whoever is running the suite.
+fn ended_at_the_terminal(
+    mut hort: std::process::Command,
+    keys: &str,
+) -> (std::process::ExitStatus, String) {
+    let (master, slave) = a_terminal();
+    hort.stdin(slave.try_clone().unwrap())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave.try_clone().unwrap());
+    unsafe {
+        hort.pre_exec(|| match libc::setsid() {
+            -1 => Err(std::io::Error::last_os_error()),
+            _ => Ok(()),
+        });
+    }
+    let mut running = hort.spawn().unwrap();
+    drop(slave);
+    drop(hort);
+
+    let mut terminal = fs::File::from(master);
+    terminal.write_all(keys.as_bytes()).unwrap();
+
+    let waiting_on = running.id();
+    let ended = Arc::new(AtomicBool::new(false));
+    let watched = ended.clone();
+    let deadline = std::thread::spawn(move || {
+        let expires = Instant::now() + ANSWERED_BY;
+        while Instant::now() < expires {
+            if watched.load(Ordering::Relaxed) {
+                return;
+            }
+            sleep(Duration::from_millis(50));
+        }
+        // Asked once more on the way out, because the run may have ended in the
+        // last interval: the flag is what stops the kill from landing on
+        // whatever the host gave that number to next.
+        if !watched.load(Ordering::Relaxed) {
+            unsafe { libc::kill(waiting_on as i32, libc::SIGKILL) };
+        }
+    });
+
+    let mut transcript = Vec::new();
+    let _ = terminal.read_to_end(&mut transcript);
+    let how_it_ended = running.wait().unwrap();
+    ended.store(true, Ordering::Relaxed);
+    deadline.join().unwrap();
+    (how_it_ended, String::from_utf8_lossy(&transcript).into_owned())
 }
 
 /// What came back over the terminal after `script` was typed into the session
