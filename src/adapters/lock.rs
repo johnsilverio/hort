@@ -144,4 +144,23 @@ mod tests {
 
         assert!(reacquired);
     }
+
+    #[test]
+    fn flock_lock_failure_names_the_state_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        // A file standing where the sandboxes directory belongs, so the lock's
+        // own directory cannot be made.
+        fs::write(dir.path().join(SANDBOXES_DIR), "not a directory").unwrap();
+        let lock = FlockSandboxLock::new(dir.path().to_path_buf());
+
+        let refusal = lock
+            .try_acquire(&SandboxName::new("demo").unwrap())
+            .expect_err("the lock file has nowhere to live");
+
+        let message = refusal.to_string();
+        assert!(
+            message.contains("state directory"),
+            "a build that cannot take its lock says which directory of hort's is unusable: {message}"
+        );
+    }
 }

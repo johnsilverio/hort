@@ -111,6 +111,11 @@ pub enum HortError {
     /// operation; the rendered message is not a canonical product string, so
     /// callers match the variant, not the text.
     NotifyProviderFailed { detail: String },
+    /// Writing the global configuration file failed: making the directory it
+    /// belongs in, or writing the file itself. Carries a human-readable detail
+    /// naming the verb and the path that failed; the rendered message is not a
+    /// canonical product string, so callers match the variant, not the text.
+    ConfigWriteFailed { detail: String },
     /// Preparing the state directory failed: creating or resolving the root hort
     /// keeps its records under. Carries a human-readable detail; the rendered
     /// message is not a canonical product string, so callers match the variant,
@@ -225,6 +230,9 @@ impl fmt::Display for HortError {
             }
             HortError::NotifyProviderFailed { detail } => {
                 write!(f, "sandbox notifications failed: {detail}")
+            }
+            HortError::ConfigWriteFailed { detail } => {
+                write!(f, "configuration write failed: {detail}")
             }
             HortError::StateIo { detail } => write!(f, "state directory error: {detail}"),
         }

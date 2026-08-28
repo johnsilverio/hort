@@ -9,7 +9,6 @@
 //! the configuration resolver.
 
 use std::fs;
-use std::io;
 use std::path::PathBuf;
 
 use crate::domain::config::expand_home;
@@ -193,14 +192,18 @@ impl ConfigCommand<'_> {
         PathBuf::from(expand_home(path, &self.host_home))
     }
 
+    /// Put the rendered document on disk, naming the step that failed.
+    ///
+    /// The two steps are reported apart because a directory that could not be
+    /// made is a different place to go and look than a file that could not be
+    /// written, and the file never existed in that case.
     fn write(&self, document: &str) -> Result<(), HortError> {
-        let written = || -> io::Result<()> {
-            if let Some(parent) = self.config_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&self.config_path, document)
-        };
-        written().map_err(|error| HortError::StateIo {
+        if let Some(parent) = self.config_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| HortError::ConfigWriteFailed {
+                detail: format!("could not create {}: {error}", parent.display()),
+            })?;
+        }
+        fs::write(&self.config_path, document).map_err(|error| HortError::ConfigWriteFailed {
             detail: format!("could not write {}: {error}", self.config_path.display()),
         })
     }
@@ -467,6 +470,60 @@ mod tests {
         assert_eq!(
             said_where_it_cannot, said_where_it_can,
             "onboarding reads the host and builds nothing, so what building a sandbox would need of this one is never its complaint: {said_where_it_cannot:?}"
+        );
+    }
+
+    #[test]
+    fn config_write_failure_names_the_configuration_and_not_the_state_root() {
+        let home = TempDir::new().unwrap();
+        let path = config_path(home.path());
+        // A directory standing where the file belongs, so the rendered document
+        // has nowhere to land.
+        fs::create_dir_all(&path).unwrap();
+        let env = FakeCapabilities::new(ready_host());
+        let prompts = ScriptedPrompter::accepting().answering(A_PREPARED_ROOTFS);
+        let command = ConfigCommand::new(&env, &prompts, path, home.path().to_path_buf());
+
+        // Forced, because something already sits at that path and the overwrite
+        // question is not what this measures.
+        let refusal = command.run(true, true).expect_err("nothing can be written there");
+
+        let message = refusal.to_string();
+        assert!(
+            message.contains("configuration"),
+            "whoever reads this is on their first run of hort, and the configuration is what failed: {message}"
+        );
+        assert!(
+            !message.contains("state directory"),
+            "and the state directory is neither where it failed nor anything the person can go and fix: {message}"
+        );
+    }
+
+    #[test]
+    fn config_write_failure_names_the_directory_it_could_not_create() {
+        let home = TempDir::new().unwrap();
+        let path = config_path(home.path());
+        let directory = path.parent().unwrap().to_path_buf();
+        // A file standing where the config root belongs, so the directory the
+        // file needs cannot be made and the write is never reached.
+        fs::write(home.path().join(".config"), "not a directory").unwrap();
+        let env = FakeCapabilities::new(ready_host());
+        let prompts = ScriptedPrompter::accepting().answering(A_PREPARED_ROOTFS);
+        let command = ConfigCommand::new(&env, &prompts, path, home.path().to_path_buf());
+
+        let refusal = command.run(false, true).expect_err("that directory cannot be made");
+
+        // The directory is a prefix of the file path, so naming the file alone
+        // satisfies the first assertion; the second is what tells the two
+        // failures apart.
+        let message = refusal.to_string();
+        assert!(
+            message.contains(&directory.display().to_string()),
+            "the directory that could not be made is the one to go and look at: {message}"
+        );
+        assert!(
+            !message.contains("config.json"),
+            "and no file was ever written, so naming one sends the reader to the wrong place: {message}"
         );
     }
 }
