@@ -564,7 +564,7 @@ fn host_findings(caps: &Capabilities) -> Vec<Finding> {
         present_or_not(
             "git",
             caps.git,
-            "no sandbox gets built, in a repository or in a marked folder alike: the first thing up asks is whether the project is a repository, and it asks git. Install it.",
+            "no sandbox gets built, in a repository or in a marked folder alike: up refuses before it starts, because git is what tells those two apart and what prepares the worktree. Install it.",
         ),
     ]
 }

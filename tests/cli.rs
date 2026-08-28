@@ -493,6 +493,50 @@ fn cli_up_names_the_rootfs_it_could_not_find() {
 }
 
 #[test]
+fn cli_up_names_the_git_it_could_not_find() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let home = TempDir::new().unwrap();
+    // A marked folder holding no repository, which is the arm that exists for a
+    // project without git and is the one a host without the binary defeats.
+    let project = TempDir::new().unwrap();
+    let project_path = project.path().canonicalize().unwrap();
+    fs::write(project_path.join(".hort.json"), "{}").unwrap();
+    // A rootfs that answers yes to everything the configuration chain asks it,
+    // so the run reaches the host question this test is about instead of
+    // stopping one step earlier on something it configured badly.
+    let rootfs = TempDir::new().unwrap();
+    let rootfs_path = rootfs.path().canonicalize().unwrap();
+    let shell = rootfs_path.join("bin").join("sh");
+    fs::create_dir_all(shell.parent().unwrap()).unwrap();
+    fs::write(&shell, "").unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+    let workdir = rootfs_path.join("workdir");
+    fs::create_dir(&workdir).unwrap();
+    fs::set_permissions(&workdir, fs::Permissions::from_mode(0o1777)).unwrap();
+    let global = format!(r#"{{ "rootfs": "{}" }}"#, rootfs_path.display());
+    let (_config, config_home) = temp_config_home(&global);
+    let (_lookup, path_without_git) = temp_path_holding(&["pasta"]);
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("PATH", &path_without_git)
+        .current_dir(&project_path)
+        .timeout(ANSWERED_BY)
+        .args(["up", "demo", "-d"])
+        .assert()
+        .code(1)
+        // The whole message and never a fragment of it: what this host produces
+        // without the check is git's own complaint about rev-parse, carried up
+        // from inside the adapter, and a user reading that is told neither what
+        // is missing nor what to do about it.
+        .stderr("git not found on PATH — hort needs it to prepare the sandbox worktree\n");
+}
+
+#[test]
 fn cli_up_falls_back_to_defaults_without_a_terminal() {
     let xdg = TempDir::new().unwrap();
     let xdg_root = xdg.path().canonicalize().unwrap();
@@ -811,8 +855,11 @@ fn cli_doctor_gates_on_the_pasta_it_found() {
     let (_config, config_home) = temp_config_home("{}");
     let home = TempDir::new().unwrap();
     let anywhere = TempDir::new().unwrap();
-    let (_with, path_with_pasta) = temp_path_holding(&["pasta"]);
-    let (_without, path_without_pasta) = temp_path_holding(&[]);
+    // git is on both, so the one thing the two hosts differ in is the one this
+    // test is named after. It is on the open arm because the gate asks for it
+    // too, and on the shut arm so that arm is shut by the absent pasta.
+    let (_with, path_with_pasta) = temp_path_holding(&["pasta", "git"]);
+    let (_without, path_without_pasta) = temp_path_holding(&["git"]);
 
     let doctor = |lookup: &Path| {
         Command::cargo_bin("hort")
@@ -876,7 +923,9 @@ fn cli_doctor_reports_a_malformed_configuration_instead_of_refusing() {
     let project = TempDir::new().unwrap();
     let project_path = project.path().canonicalize().unwrap();
     fs::write(project_path.join(".hort.json"), r#"{ "rootfs": "#).unwrap();
-    let (_with, path_with_pasta) = temp_path_holding(&["pasta"]);
+    // A host the gate opens on, so the zero this test ends on can only be the
+    // gate's answer and never a second reason to leave with one.
+    let (_with, path_with_pasta) = temp_path_holding(&["pasta", "git"]);
 
     let ran = Command::cargo_bin("hort")
         .unwrap()

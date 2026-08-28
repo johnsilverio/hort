@@ -32,10 +32,15 @@ const DEFAULT_SHELL: &str = "/bin/sh";
 
 /// Select the precondition error `up` must raise before building anything, or
 /// `None` to proceed. Checks run in order: user namespaces, then pasta, then
-/// `ip` when the egress posture is an allowlist, then the rootfs chain. The
-/// first three say this host cannot run this sandbox, the rest say this
-/// configuration is wrong. `ip` is asked for only under an allowlist, because
-/// that is the only posture whose route tables have to be emptied.
+/// git, then `ip` when the egress posture is an allowlist, then the rootfs
+/// chain. The first four say this host cannot run this sandbox, the rest say
+/// this configuration is wrong. `ip` is asked for only under an allowlist,
+/// because that is the only posture whose route tables have to be emptied.
+///
+/// git is asked for in both project modes, not only the one that builds a
+/// worktree, because hort asks git whether the project is a repository before
+/// it can tell the two apart. A host without the binary therefore also defeats
+/// the arm that exists for a project holding no repository at all.
 pub fn up_precondition_error(
     caps: &Capabilities,
     egress: &EgressPolicy,
@@ -47,6 +52,10 @@ pub fn up_precondition_error(
 
     if caps.pasta.is_none() {
         return Some(HortError::PastaMissing);
+    }
+
+    if !caps.git {
+        return Some(HortError::GitMissing);
     }
 
     if matches!(egress, EgressPolicy::Allowlist(_)) && caps.ip.is_none() {
@@ -108,9 +117,9 @@ pub fn attach_precondition_error(caps: &Capabilities) -> Option<HortError> {
 }
 
 /// Whether this host meets the preconditions that no configuration can supply:
-/// unprivileged user namespaces and pasta. `hort doctor` leaves with success on
-/// a host that meets them and with a failure on one that does not, so a script
-/// can gate on it.
+/// unprivileged user namespaces, pasta and git. `hort doctor` leaves with
+/// success on a host that meets them and with a failure on one that does not,
+/// so a script can gate on it.
 ///
 /// It is a predicate and never an error, because the report is what `doctor`
 /// exists to produce and an error would take the report away on the very arm a
@@ -119,7 +128,7 @@ pub fn attach_precondition_error(caps: &Capabilities) -> Option<HortError> {
 /// just been set up, and closing the gate on it would tell the user their kernel
 /// is the problem.
 pub fn hard_preconditions_are_met(caps: &Capabilities) -> bool {
-    caps.user_ns && caps.pasta.is_some()
+    caps.user_ns && caps.pasta.is_some() && caps.git
 }
 
 /// The shell a session execs, from the configuration, the shell the user runs on
@@ -298,6 +307,36 @@ mod tests {
     }
 
     #[test]
+    fn up_errors_when_git_is_absent_from_the_host() {
+        let caps = Capabilities { git: false, ..ready_host() };
+
+        let error = up_precondition_error(&caps, &EgressPolicy::Open, Some(&valid_rootfs()));
+
+        assert_eq!(error, Some(HortError::GitMissing));
+    }
+
+    #[test]
+    fn preconditions_prefer_user_namespaces_over_git() {
+        let caps = Capabilities { user_ns: false, git: false, ..ready_host() };
+
+        let error = up_precondition_error(&caps, &EgressPolicy::Open, Some(&valid_rootfs()));
+
+        // Installing a binary is a smaller answer than a kernel that builds no
+        // sandbox at all, and a host missing both has to hear the larger one
+        // first or it repairs the smaller and gets refused again.
+        assert_eq!(error, Some(HortError::UserNamespacesDisabled));
+    }
+
+    #[test]
+    fn up_reports_the_missing_git_before_a_missing_rootfs() {
+        let caps = Capabilities { git: false, ..ready_host() };
+
+        let error = up_precondition_error(&caps, &EgressPolicy::Open, None);
+
+        assert_eq!(error, Some(HortError::GitMissing));
+    }
+
+    #[test]
     fn up_errors_when_ip_is_missing_and_egress_is_an_allowlist() {
         let caps = Capabilities { ip: None, ..ready_host() };
 
@@ -354,6 +393,13 @@ mod tests {
     #[test]
     fn doctor_gate_closes_when_pasta_is_absent() {
         let caps = Capabilities { pasta: None, ..ready_host() };
+
+        assert!(!hard_preconditions_are_met(&caps));
+    }
+
+    #[test]
+    fn doctor_gate_closes_when_git_is_absent() {
+        let caps = Capabilities { git: false, ..ready_host() };
 
         assert!(!hard_preconditions_are_met(&caps));
     }

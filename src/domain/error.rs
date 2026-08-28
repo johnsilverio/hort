@@ -21,6 +21,8 @@ pub enum HortError {
     UserNamespacesDisabled,
     /// `up`/`attach`: the pasta binary is not on `PATH`.
     PastaMissing,
+    /// `up`: the git binary is not on `PATH`, so no sandbox can be built at all.
+    GitMissing,
     /// `up`: the `ip` binary is not on `PATH`, and an allowlist sandbox cannot be
     /// closed without it.
     IpMissing,
@@ -134,6 +136,9 @@ impl fmt::Display for HortError {
             ),
             HortError::PastaMissing => {
                 write!(f, "pasta not found on PATH — hort needs it for sandbox networking")
+            }
+            HortError::GitMissing => {
+                write!(f, "git not found on PATH — hort needs it to prepare the sandbox worktree")
             }
             HortError::IpMissing => {
                 write!(f, "ip not found on PATH — hort needs iproute2 for allowlist egress")
@@ -375,6 +380,16 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "pasta not found on PATH — hort needs it for sandbox networking"
+        );
+    }
+
+    #[test]
+    fn git_missing_error_renders_canonical_string() {
+        let error = HortError::GitMissing;
+
+        assert_eq!(
+            error.to_string(),
+            "git not found on PATH — hort needs it to prepare the sandbox worktree"
         );
     }
 
