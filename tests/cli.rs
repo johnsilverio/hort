@@ -8,10 +8,12 @@
 //! owns the name it is built under and takes it down again whatever the test
 //! did.
 
+use std::ffi::CString;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -1061,6 +1063,105 @@ fn cli_ls_lists_sandboxes_despite_a_malformed_project_config() {
         .assert()
         .success()
         .stdout(predicate::str::contains("demo"));
+}
+
+/// Report a libc call that failed as the errno that caused it, so a step of a
+/// child's preparation which did not happen is told apart from a run that
+/// happened and answered.
+fn checked(returned: libc::c_int) -> std::io::Result<()> {
+    match returned {
+        -1 => Err(std::io::Error::last_os_error()),
+        _ => Ok(()),
+    }
+}
+
+#[test]
+fn cli_names_the_working_directory_it_could_not_read() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let (_config, config_home) = temp_config_home("{}");
+    // A directory the child stands in and then unlinks, so hort runs with a
+    // working directory the kernel no longer has and `getcwd` answers ENOENT.
+    // Done in the child and never in the test process, because the whole suite
+    // shares one process and a working directory is a property of it.
+    let vanishing = TempDir::new().unwrap();
+    let stood_in = CString::new(vanishing.path().as_os_str().as_bytes()).unwrap();
+    let mut hort = std::process::Command::new(assert_cmd::cargo::cargo_bin("hort"));
+    hort.env("XDG_STATE_HOME", &xdg_root).env("XDG_CONFIG_HOME", &config_home).arg("ls");
+    unsafe {
+        hort.pre_exec(move || {
+            checked(libc::chdir(stood_in.as_ptr()))?;
+            checked(libc::rmdir(stood_in.as_ptr()))
+        });
+    }
+
+    let run = hort.output().unwrap();
+
+    let message = String::from_utf8_lossy(&run.stderr).into_owned();
+    assert!(
+        !run.status.success(),
+        "a run whose working directory is gone cannot get past assembling itself: {message}"
+    );
+    assert!(
+        message.contains("working directory"),
+        "the working directory is what hort could not read, and it is what the person has to go and fix: {message}"
+    );
+    assert!(
+        !message.contains("state directory"),
+        "and the state directory is neither where it failed nor derived from anything that did: {message}"
+    );
+    assert!(
+        message.contains("could not read"),
+        "a directory hort cannot read at all needs a different move from one it can read and not resolve, so the message says which happened: {message}"
+    );
+}
+
+#[test]
+fn cli_names_the_working_directory_it_could_not_resolve() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let (_config, config_home) = temp_config_home("{}");
+    // A directory whose parent the child closes to traversal once it is standing
+    // inside it. `getcwd` still answers, off the kernel's own record of where the
+    // process is, while resolving that same path opens it from the root and is
+    // refused, which is what separates this arm from the one above.
+    let closing = TempDir::new().unwrap();
+    let closing_path = closing.path().canonicalize().unwrap();
+    let inside = closing_path.join("inner");
+    fs::create_dir(&inside).unwrap();
+    let stood_in = CString::new(inside.as_os_str().as_bytes()).unwrap();
+    let shut = CString::new(closing_path.as_os_str().as_bytes()).unwrap();
+    let mut hort = std::process::Command::new(assert_cmd::cargo::cargo_bin("hort"));
+    hort.env("XDG_STATE_HOME", &xdg_root).env("XDG_CONFIG_HOME", &config_home).arg("ls");
+    unsafe {
+        hort.pre_exec(move || {
+            checked(libc::chdir(stood_in.as_ptr()))?;
+            checked(libc::chmod(shut.as_ptr(), 0))
+        });
+    }
+
+    let run = hort.output().unwrap();
+    // Before any assertion, because a failed one leaves the rest of the test
+    // unrun and the guard cannot take back a directory nobody may enter.
+    fs::set_permissions(&closing_path, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let message = String::from_utf8_lossy(&run.stderr).into_owned();
+    assert!(
+        !run.status.success(),
+        "a run whose working directory it cannot resolve cannot get past assembling itself: {message}"
+    );
+    assert!(
+        message.contains("working directory"),
+        "the working directory is what hort could not resolve, and it is what the person has to go and fix: {message}"
+    );
+    assert!(
+        !message.contains("state directory"),
+        "and the state directory is neither where it failed nor derived from anything that did: {message}"
+    );
+    assert!(
+        message.contains("could not resolve"),
+        "a directory hort can read and not resolve needs a different move from one it cannot read at all, so the message says which happened: {message}"
+    );
 }
 
 #[test]

@@ -160,11 +160,11 @@ impl RealDeps {
         })?;
 
         let current_dir = std::env::current_dir()
-            .map_err(|error| HortError::StateIo {
+            .map_err(|error| HortError::WorkingDirFailed {
                 detail: format!("could not read the current directory: {error}"),
             })?
             .canonicalize()
-            .map_err(|error| HortError::StateIo {
+            .map_err(|error| HortError::WorkingDirFailed {
                 detail: format!("could not resolve the current directory: {error}"),
             })?;
         // One notion of where the project is, so what the configuration is read

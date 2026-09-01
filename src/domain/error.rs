@@ -116,10 +116,17 @@ pub enum HortError {
     /// naming the verb and the path that failed; the rendered message is not a
     /// canonical product string, so callers match the variant, not the text.
     ConfigWriteFailed { detail: String },
-    /// Preparing the state directory failed: creating or resolving the root hort
-    /// keeps its records under. Carries a human-readable detail; the rendered
-    /// message is not a canonical product string, so callers match the variant,
-    /// not the text.
+    /// Establishing the directory hort was run from failed: reading it, or
+    /// resolving it to a real path. Carries a human-readable detail naming which
+    /// of the two it was; the rendered message is not a canonical product
+    /// string, so callers match the variant, not the text.
+    WorkingDirFailed { detail: String },
+    /// Reaching a file or directory hort keeps its own state in failed: the root
+    /// it keeps its records under, a sandbox's directory and the lock inside it,
+    /// a notify channel, a cache directory, or the home directory locating any
+    /// of them depends on. Carries a human-readable detail; the rendered message
+    /// is not a canonical product string, so callers match the variant, not the
+    /// text.
     StateIo { detail: String },
 }
 
@@ -233,6 +240,9 @@ impl fmt::Display for HortError {
             }
             HortError::ConfigWriteFailed { detail } => {
                 write!(f, "configuration write failed: {detail}")
+            }
+            HortError::WorkingDirFailed { detail } => {
+                write!(f, "working directory failed: {detail}")
             }
             HortError::StateIo { detail } => write!(f, "state directory error: {detail}"),
         }
