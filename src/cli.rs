@@ -320,6 +320,7 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<u8, HortError> {
             let command = DownCommand::new(
                 &deps.store,
                 &deps.runtime,
+                &deps.runtime,
                 &deps.confirmer,
                 &deps.runtime,
                 &deps.network,
@@ -458,9 +459,13 @@ const SIGNALLED_EXIT_BASE: u8 = 128;
 /// Render the `ls` rows for the terminal: one line per sandbox with its name,
 /// lowercase state, session count, age, idle, branch, and worktree dirty state. A
 /// figure with no value renders as a dash, and a sandbox with a running session
-/// renders its idle as `active`.
+/// renders its idle as `active`. A sandbox the kernel is running and hort has no
+/// record of carries the command that collects it under its row.
 pub fn render_ls(entries: &[LsEntry]) -> String {
-    entries.iter().map(|entry| format!("{}\n", render_line(entry))).collect()
+    entries
+        .iter()
+        .map(|entry| format!("{}\n{}", render_line(entry), render_advice(entry)))
+        .collect()
 }
 
 /// Render the `prune` report for the terminal: the sandboxes it removed, the
@@ -733,6 +738,23 @@ fn render_dirty(dirty: Option<bool>) -> String {
     }
 }
 
+/// What to do about a row, for the one state where naming it is not enough. A
+/// lost record is a sandbox the kernel is running that hort has no memory of, so
+/// the reader is holding a name that `up`, `attach` and `prune` all answer for a
+/// different situation. The row therefore hands over the ready command rather
+/// than the fact that one exists, and only here: the same sentence under a
+/// healthy box would be hort telling somebody to destroy a sandbox that is
+/// working exactly as it should.
+fn render_advice(entry: &LsEntry) -> String {
+    match entry.state {
+        SandboxState::LostRecord => format!(
+            "    running with no record on disk; run 'hort down {}' to stop its container and host-side helpers\n",
+            entry.name.as_str()
+        ),
+        SandboxState::Live | SandboxState::Orphaned | SandboxState::Inconsistent => String::new(),
+    }
+}
+
 fn state_label(state: SandboxState) -> &'static str {
     match state {
         SandboxState::Live => "live",
@@ -813,6 +835,39 @@ mod tests {
 
         assert!(rendered.contains("lost-record"));
         assert!(rendered.contains("-"));
+    }
+
+    #[test]
+    fn render_ls_teaches_the_collection_command_only_on_the_lost_record_row() {
+        let live = LsEntry {
+            name: SandboxName::new("demo").unwrap(),
+            state: SandboxState::Live,
+            sessions: Some(1),
+            age: Some(Duration::from_secs(3600)),
+            idle: Some(IdleState::Active),
+            branch: Some(BranchName::new("demo").unwrap()),
+            dirty: Some(false),
+        };
+        let lost = LsEntry {
+            name: SandboxName::new("ghost").unwrap(),
+            state: SandboxState::LostRecord,
+            sessions: Some(0),
+            age: None,
+            idle: None,
+            branch: None,
+            dirty: None,
+        };
+
+        let rendered = render_ls(&[live, lost]);
+
+        // A lost record is a box the kernel is running that every command used to
+        // deny the existence of, so the listing that names the state hands over
+        // the command that collects it rather than teaching that one exists. The
+        // wording around it is free; the ready command is the guarantee.
+        assert!(rendered.contains("hort down ghost"));
+        // And only there: the same advice against a healthy box would be hort
+        // telling a reader to destroy a sandbox somebody is working in.
+        assert!(!rendered.contains("hort down demo"));
     }
 
     #[test]

@@ -28,21 +28,39 @@ pub enum TeardownStep {
     RemoveMetadata,
 }
 
+/// The steps that stop something still running, in the order the kernel makes
+/// mandatory: host-side helpers, then the container that holds the worktree
+/// mount. Every plan in this module opens with exactly this sequence and they
+/// differ only in what they add after it, so the order is authored once. Written
+/// out twice it would drift the first time a step joins the family, because the
+/// compiler forces a new enum variant into every dispatch and into no plan.
+///
+/// Which host-side helpers a sandbox actually left running is the providers'
+/// answer and not this one's, the way the network step already covers pasta
+/// alone and pasta with a proxy without the plan knowing which.
+fn stop_sequence() -> Vec<TeardownStep> {
+    vec![TeardownStep::StopWatcher, TeardownStep::StopNetwork, TeardownStep::StopContainer]
+}
+
 /// Build the ordered teardown plan for a sandbox: the mandatory shutdown
 /// sequence as data, never executed here. Host-side helpers stop first, then the
 /// container, then the worktree (git mode only), then the metadata.
 pub fn teardown_plan(record: &SandboxRecord) -> Vec<TeardownStep> {
-    // Which host-side helpers a sandbox actually left running is the providers'
-    // answer and not this one's, the way the network step already covers pasta
-    // alone and pasta with a proxy without the plan knowing which.
-    let mut plan = vec![TeardownStep::StopWatcher];
-    plan.push(TeardownStep::StopNetwork);
-    plan.push(TeardownStep::StopContainer);
+    let mut plan = stop_sequence();
     if record.branch().is_some() {
         plan.push(TeardownStep::RemoveWorktree);
     }
     plan.push(TeardownStep::RemoveMetadata);
     plan
+}
+
+/// Build the ordered teardown plan for a sandbox the kernel is running and hort
+/// has no record of: the same mandatory sequence, up to and including the
+/// container, and nothing after it. It takes no record because there is none to
+/// take, which is also why it stops where it does: the worktree path lived in the
+/// record that went missing, and the record itself is already gone.
+pub fn teardown_plan_without_record() -> Vec<TeardownStep> {
+    stop_sequence()
 }
 
 /// Build the ordered undo for a build that failed once the anchor was already
@@ -135,6 +153,21 @@ mod tests {
         // decided this for itself would need a record that remembers a pid, which
         // is precisely the state a restart makes meaningless.
         assert!(plan.contains(&TeardownStep::StopWatcher));
+    }
+
+    #[test]
+    fn teardown_plan_without_record_stops_at_the_container() {
+        let plan = teardown_plan_without_record();
+
+        // A live anchor whose record is gone is collectable down to the
+        // container and no further. The two steps it leaves out are the two that
+        // would need the record: the worktree path is written there and nowhere
+        // else, so removing one would mean removing a path hort cannot name, and
+        // there is no record left to remove.
+        assert_eq!(
+            plan,
+            vec![TeardownStep::StopWatcher, TeardownStep::StopNetwork, TeardownStep::StopContainer]
+        );
     }
 
     #[test]
