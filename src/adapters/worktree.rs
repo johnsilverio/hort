@@ -66,7 +66,12 @@ impl WorktreeProvider for GitWorktreeProvider {
         if !parse_worktree_paths(&porcelain).into_iter().any(|listed| listed == path) {
             return Ok(());
         }
-        if path.exists() {
+        // git refuses to remove a working tree whose `.git` pointer was deleted
+        // under it, so sweeping the registration is the only route that collects
+        // such an entry. Which state it is in is git's own verdict, already
+        // carried by the listing read above, rather than a rule re-derived here
+        // from the pointer file.
+        if path.exists() && !is_prunable(&porcelain, &path) {
             let path_arg = path.to_string_lossy();
             run(
                 &self.repo_dir,
@@ -150,6 +155,22 @@ fn run(dir: &Path, op: &str, args: &[&str]) -> Result<String, HortError> {
 /// line, the main checkout included.
 fn parse_worktree_paths(porcelain: &str) -> Vec<PathBuf> {
     porcelain.lines().filter_map(|line| line.strip_prefix("worktree ")).map(PathBuf::from).collect()
+}
+
+/// Whether `git worktree list --porcelain` marks the record for `path` prunable,
+/// which is git's own name for an entry `git worktree prune` collects. The marker
+/// is a label that may carry a reason and belongs to the record it appears in,
+/// each of which opens with its own `worktree <path>` line.
+fn is_prunable(porcelain: &str, path: &Path) -> bool {
+    let mut in_record = false;
+    for line in porcelain.lines() {
+        if let Some(listed) = line.strip_prefix("worktree ") {
+            in_record = Path::new(listed) == path;
+        } else if in_record && (line == "prunable" || line.starts_with("prunable ")) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -402,6 +423,58 @@ mod tests {
 
         let porcelain = git(&repo, &["worktree", "list", "--porcelain"]);
         assert!(!porcelain.contains("worktree-demo"));
+    }
+
+    #[test]
+    fn git_worktree_remove_succeeds_when_the_git_pointer_vanished() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let worktree = provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+        fs::remove_file(worktree.path.join(".git")).unwrap();
+
+        // An agent that deletes the pointer file of its own worktree, which a
+        // distracted recursive remove produces, leaves a directory git refuses
+        // to remove. Without a route out of that state the sandbox the user
+        // named can only be collected by hand.
+        assert!(provider.remove(&name).is_ok());
+    }
+
+    #[test]
+    fn git_worktree_remove_clears_registration_when_the_git_pointer_vanished() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let worktree = provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+        fs::remove_file(worktree.path.join(".git")).unwrap();
+
+        provider.remove(&name).unwrap();
+
+        let porcelain = git(&repo, &["worktree", "list", "--porcelain"]);
+        assert!(!porcelain.contains("worktree-demo"));
+    }
+
+    #[test]
+    fn git_worktree_remove_leaves_the_branch_intact_when_the_git_pointer_vanished() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let worktree = provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+        let tip = commit_in_worktree(&worktree.path, "work.txt", "work\n");
+        fs::remove_file(worktree.path.join(".git")).unwrap();
+
+        provider.remove(&name).unwrap();
+
+        // Committed work survives the box that produced it, and the route that
+        // collects a worktree with no pointer is a second way into that
+        // promise. The branch is the only copy left once the worktree is gone.
+        assert_eq!(rev_parse(&repo, "refs/heads/demo"), tip);
     }
 
     #[test]
