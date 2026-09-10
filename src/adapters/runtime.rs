@@ -192,13 +192,22 @@ impl LibcontainerRuntime {
                 name.as_str()
             ))
         })?;
-        // Not redundant: delete races systemd's collection of the emptied scope, so
-        // a late StopUnit hits "Unit not loaded" and aborts before the container dir
-        // is removed. That first failure is the proof the retry needs to finish.
+        // A delete that fails has lost the handle, not answered the question: it
+        // races systemd's collection of the sandbox's scope, and from either side
+        // of that race the runtime can no longer say whether anything is still
+        // standing. Asking it a second time is worse than useless, because that
+        // call re-reads the anchor's state first, an anchor still on its way out
+        // reads as running, and it goes down a branch the first call never took.
+        // The kernel is the one source left that tells a sandbox already gone from
+        // one still holding the worktree mounted.
         if container.delete(true).is_err() {
-            container.delete(true).map_err(|err| {
-                runtime_failure(format!("teardown: stopping '{}': {err}", name.as_str()))
-            })?;
+            stop_by_signal(name)?;
+            // The delete that failed never reached the point where it takes its
+            // own state away, and that state is what refuses the next build of
+            // this name. Taking it is only ever reached once the kernel has
+            // answered that nothing of the sandbox is left, and one that will not
+            // go is no reason to fail the teardown of a container already gone.
+            let _ = fs::remove_dir_all(self.container_dir(name));
         }
         Ok(())
     }
@@ -2532,6 +2541,9 @@ mod privileged_tests {
     const POLL: Duration = Duration::from_millis(50);
     /// The file a sandbox records the ports its sessions may connect to in.
     const CONNECT_PORTS_FILE: &str = "connect.ports";
+    /// The file the embedded runtime keeps a container's cgroup path in, next to
+    /// the rest of that container's state.
+    const RUNTIME_CGROUP_RECORD: &str = "youki_config.json";
     /// The Landlock ABI that carries the network access rights. Below it the
     /// kernel drops the connect rules and reports success, so a test of them
     /// there would be measuring the kernel rather than hort.
@@ -2975,6 +2987,46 @@ mod privileged_tests {
         }
     }
 
+    /// The container's own record of where its cgroup lives, pointed at one
+    /// nothing on this host answers to, and put back however the test that moved
+    /// it ended.
+    ///
+    /// It buys the one arrangement the race itself cannot produce. A cgroup the
+    /// runtime cannot read arises on its own only once the anchor is dead, since
+    /// what takes the cgroup away is the anchor leaving it, so an anchor that is
+    /// still up and a cgroup that is already gone never meet by accident.
+    ///
+    /// Putting it back is not tidiness. Left pointing away, the scratch
+    /// sandbox's own teardown fails exactly as the one under test did, and a
+    /// real anchor is left running on the machine. Declare it after the sandbox,
+    /// so it goes first.
+    struct CgroupPathAside {
+        record: PathBuf,
+        recorded: String,
+    }
+
+    impl CgroupPathAside {
+        fn pointed_away_from(sandbox: &ScratchSandbox, name: &SandboxName) -> Self {
+            let record = sandbox
+                .runtime_root()
+                .join(CONTAINERS_DIR)
+                .join(name.as_str())
+                .join(RUNTIME_CGROUP_RECORD);
+            let recorded = fs::read_to_string(&record).unwrap();
+            let elsewhere =
+                recorded.replace(name.as_str(), &format!("{}-elsewhere", name.as_str()));
+            assert_ne!(elsewhere, recorded, "the cgroup record names no sandbox to move");
+            fs::write(&record, elsewhere).unwrap();
+            Self { record, recorded }
+        }
+    }
+
+    impl Drop for CgroupPathAside {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.record, &self.recorded);
+        }
+    }
+
     #[test]
     #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
     #[serial]
@@ -3258,6 +3310,57 @@ mod privileged_tests {
         // environment, which is what anything spawned inside the box looks like
         // once a shell in there has cleared the variable.
         assert!(stopped_within_deadline(session.pid), "the session outlived the teardown");
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn teardown_completes_for_a_dead_anchor_whose_cgroup_the_runtime_cannot_read() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+        // The session is the arrangement and not decoration: measured fifteen
+        // times over, killing the anchor of a sandbox that has one leaves the
+        // runtime unable to read the cgroup it stops the container through,
+        // while killing the anchor of a sandbox that has none never does.
+        runtime.join_session(&session_spec(&spec.name)).unwrap();
+        unsafe { libc::kill(token.pid.0 as libc::pid_t, libc::SIGKILL) };
+        assert!(stopped_within_deadline(token.pid.0), "the anchor outlived the kill");
+
+        let torn_down = runtime.teardown(&spec.name);
+
+        // A sandbox somebody killed is one hort has to be able to collect, and
+        // the runtime losing the cgroup it would have stopped the container
+        // through says nothing about whether anything is still standing. Failing
+        // here leaves `down` reporting an error over a box that is already gone,
+        // and the worktree it was told to remove on disk with no route to it.
+        assert_eq!(torn_down, Ok(()));
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn teardown_stops_a_live_anchor_whose_cgroup_the_runtime_cannot_read() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+        let _cgroup_lost = CgroupPathAside::pointed_away_from(&sandbox, &spec.name);
+
+        runtime.teardown(&spec.name).unwrap();
+
+        // The same unreadable cgroup that reaches the runtime over a sandbox
+        // already gone reaches it over one still running, and the two are told
+        // apart by asking the kernel rather than by reading the failure. Taking
+        // the failure for a finished teardown would report a box down while its
+        // anchor still holds the worktree mounted, and whoever asked for the
+        // teardown deletes that worktree next.
+        assert!(stopped_within_deadline(token.pid.0), "the anchor outlived the teardown");
     }
 
     #[test]
