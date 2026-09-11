@@ -2334,9 +2334,23 @@ mod tests {
     /// It announces itself before anything reads it because spawning comes back
     /// before the exec does: measured 464 times in 500, the pid already existed
     /// while the environment behind it still belonged to the process that started
-    /// it, so a read taken straight after spawning reads the test harness. The
-    /// wait is bounded for the same reason the name is unique: once hort reads
-    /// the process table, one of these left behind is a sandbox it reports.
+    /// it, so a read taken straight after spawning reads the test harness.
+    ///
+    /// The announcement comes from the program the process keeps, and that is
+    /// what makes it an answer rather than a hint. A process that swaps programs
+    /// once more after announcing opens a second window the signal says nothing
+    /// about, and the kernel does not report that window as a failure: while it
+    /// builds the environment of the incoming program, a read of that process's
+    /// environment succeeds and comes back empty. A scan landing there finds a
+    /// process declaring no sandbox rather than one it could not read, which is
+    /// indistinguishable from the defect these tests exist to catch. Measured at
+    /// the moment of failure, that empty read is what made this fixture fail its
+    /// own witness about once in thirty passes.
+    ///
+    /// Nothing but this handle keeps it alive: it blocks on a pipe this process
+    /// holds open, so a harness that dies with no destructor run still takes it
+    /// along. Once hort reads the process table, one of these left behind is a
+    /// sandbox it reports.
     struct HostProcess(Child);
 
     impl HostProcess {
@@ -2358,7 +2372,8 @@ mod tests {
 
         fn announcing(command: &mut Command) -> Self {
             let mut child = command
-                .args(["-c", "echo ready; exec sleep 30"])
+                .args(["-c", "echo ready; read held_open"])
+                .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .spawn()
                 .unwrap();
