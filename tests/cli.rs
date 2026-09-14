@@ -15,7 +15,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command as GitCommand, Stdio};
 use std::ptr;
@@ -2308,6 +2308,140 @@ fn cli_ls_reports_lost_record_when_the_metadata_of_a_live_box_is_removed() {
             "{}  lost-record  0  -  -  -  -\n",
             sandbox.name().as_str()
         )));
+}
+
+/// Run `hort up -d` on `sandbox` and kill it the instant the record it writes
+/// is on disk, with `SIGKILL` to its own pid and to nothing else, so that what
+/// is left is what an abrupt death at that point leaves and not what the
+/// children it had by then would have done on being signalled themselves.
+///
+/// The record is what is watched for, never the anchor, because the record
+/// coming first is the guarantee itself: a run that ends before writing one has
+/// broken that order in the other direction, and its own words say why; one
+/// that neither ends nor writes within the deadline is reported as that rather
+/// than waited on, since "no record before the anchor" is the failure this
+/// exists to catch. What stood when the signal landed is asserted here, before
+/// the product is asked anything, because a signal that arrives after hort has
+/// released its anchor leaves a different state, one the listing reads the same
+/// way, and a verdict read off that state would be measuring luck.
+fn killed_once_its_record_is_written(sandbox: &ScratchSandbox, config_home: &Path, repo: &Path) {
+    let mut up = std::process::Command::new(assert_cmd::cargo::cargo_bin("hort"))
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(repo)
+        .args(["up", "-d", sandbox.name().as_str()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let record = sandbox.state_dir().join("metadata.json");
+    let deadline = Instant::now() + ANSWERED_BY;
+    while !record.exists() {
+        if let Some(ended) = up.try_wait().unwrap() {
+            let mut said = String::new();
+            up.stderr.take().unwrap().read_to_string(&mut said).unwrap();
+            panic!("up ended ({ended}) before it wrote a record: {said}");
+        }
+        assert!(Instant::now() < deadline, "up wrote no record in {ANSWERED_BY:?}");
+        std::thread::yield_now();
+    }
+    up.kill().unwrap();
+    let ended = up.wait().unwrap();
+
+    assert_eq!(
+        ended.signal(),
+        Some(libc::SIGKILL),
+        "up ended on its own ({ended}) before the signal reached it"
+    );
+    let recorded = FileMetadataStore::new(sandbox.state_root())
+        .get(sandbox.name())
+        .unwrap()
+        .expect("the record up was killed on is there to read");
+    assert_eq!(
+        recorded.liveness_token(),
+        None,
+        "the record up was killed on already named an anchor"
+    );
+    assert!(
+        !a_process_declares(sandbox.name()),
+        "an anchor stood after the kill: the signal landed after up had released it"
+    );
+}
+
+/// Whether some process on this host says it belongs to the sandbox `name`, by
+/// the marker hort exports into everything it starts inside a box. Asked of the
+/// kernel, the way hort's own reconciliation asks it, because the listing
+/// cannot tell a record whose anchor never came up from one whose anchor came
+/// up after hort had stopped writing.
+fn a_process_declares(name: &SandboxName) -> bool {
+    let marker = format!("HORT_SANDBOX={}", name.as_str());
+    fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|process| fs::read(process.path().join("environ")).ok())
+        .any(|environ| environ.split(|byte| *byte == 0).any(|entry| entry == marker.as_bytes()))
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_ls_reports_orphaned_after_up_was_killed_once_its_record_was_written() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+    killed_once_its_record_is_written(&sandbox, &config_home, &repo_path);
+
+    // The tail is the rest of the row: the branch and the dirty probe are read
+    // off a worktree the killed run had already made, and a half-built record
+    // that broke either would put a dash there while the verdict still read
+    // `orphaned`.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .arg("ls")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("{}  orphaned  0  ", sandbox.name().as_str())))
+        .stdout(predicate::str::contains(format!("  {}  clean\n", sandbox.name().as_str())));
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_up_completes_a_sandbox_whose_up_was_killed_once_its_record_was_written() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+    killed_once_its_record_is_written(&sandbox, &config_home, &repo_path);
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", sandbox.name().as_str()])
+        .assert()
+        .success();
+
+    // Exit 0 alone is satisfied by a run that refused nothing and built
+    // nothing; the listing is what says the box the first run left half-built
+    // is now standing.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .arg("ls")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("{}  live  0  ", sandbox.name().as_str())))
+        .stdout(predicate::str::contains(format!("  {}  clean\n", sandbox.name().as_str())));
 }
 
 /// The file a session writes into the merged root, and the bytes that say the
