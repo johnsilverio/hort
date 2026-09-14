@@ -312,6 +312,34 @@ fn cli_ls_exits_zero_with_no_sandboxes() {
 }
 
 #[test]
+fn cli_ls_creates_no_state_root_on_a_host_with_no_sandbox() {
+    let xdg = TempDir::new().unwrap();
+    // The variable names a directory that is not there either, so the run has
+    // no existing state root to canonicalize and no existing parent to make one
+    // in: the arrangement that tells creating the root from creating nothing.
+    let state_home = xdg.path().canonicalize().unwrap().join("state");
+    let (_repo, repo_path) = temp_git_repo();
+
+    let ran = Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &state_home)
+        .current_dir(&repo_path)
+        .timeout(ANSWERED_BY)
+        .arg("ls")
+        .output()
+        .unwrap();
+
+    // The listing has to have answered for its silence on disk to mean
+    // anything: a run that failed before reaching the disk creates nothing too.
+    assert_eq!(ran.status.code(), Some(0), "{}", String::from_utf8_lossy(&ran.stderr));
+    assert!(
+        !state_home.exists(),
+        "listing a host with no sandbox created {}",
+        state_home.display()
+    );
+}
+
+#[test]
 fn cli_ls_reports_orphaned_sandbox() {
     let xdg = TempDir::new().unwrap();
     let xdg_root = xdg.path().canonicalize().unwrap();
@@ -985,6 +1013,42 @@ fn cli_doctor_leaves_a_first_run_host_as_it_found_it() {
     assert!(
         !config_home.join("hort").join("config.json").exists(),
         "and a read-only report writes nothing, least of all a configuration nobody asked for: {transcript}"
+    );
+}
+
+#[test]
+fn cli_doctor_creates_no_state_root_on_a_first_run_host() {
+    let xdg = TempDir::new().unwrap();
+    // The variable names a directory that is not there either. It is the
+    // stronger arrangement: a report that made the parent and stopped short of
+    // the root would still have written to a host that promised it nothing.
+    let state_home = xdg.path().canonicalize().unwrap().join("state");
+    let (_config, config_home) = temp_config_home_of_a_first_run();
+    let home = TempDir::new().unwrap();
+    let anywhere = TempDir::new().unwrap();
+
+    let ran = Command::cargo_bin("hort")
+        .unwrap()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", &state_home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .current_dir(anywhere.path())
+        .timeout(ANSWERED_BY)
+        .arg("doctor")
+        .output()
+        .unwrap();
+
+    // The report first, because a run that failed before reaching the disk
+    // creates nothing too and would pass the assertion below for free.
+    assert!(
+        !ran.stdout.is_empty(),
+        "no report was printed: {}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    assert!(
+        !state_home.exists(),
+        "a read-only report created {} on a host that had no state root",
+        state_home.display()
     );
 }
 

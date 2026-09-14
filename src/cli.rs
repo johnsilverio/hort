@@ -10,7 +10,6 @@
 //! itself did. That collides with hort's own exit codes, the same trade `ssh`
 //! makes.
 
-use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -139,9 +138,12 @@ pub struct RealDeps {
 
 impl RealDeps {
     /// Resolve the two roots and the project directory and wire the real
-    /// adapters. The state root is created if missing, and both it and the
-    /// project directory are canonicalized so a symlinked root cannot make a
-    /// record's stored worktree path disagree with the path git reports.
+    /// adapters. Nothing is created here: the state root is made by whichever
+    /// command first writes under it, so a read-only run leaves a host as it
+    /// found it. Both it and the project directory are resolved to their real
+    /// paths, the state root through its nearest existing ancestor because its
+    /// tail may not exist yet, so a symlinked root cannot make a record's stored
+    /// worktree path disagree with the path git reports.
     ///
     /// Which root an adapter is handed is decided here and nowhere else: the ones
     /// that keep a record of the sandbox get the state root, the ones whose files
@@ -152,10 +154,7 @@ impl RealDeps {
     /// configuration hort cannot parse still lists and tears down what it has.
     pub fn assemble() -> Result<Self, HortError> {
         let state_root = resolve_state_root()?;
-        fs::create_dir_all(&state_root).map_err(|error| HortError::StateIo {
-            detail: format!("could not create {}: {error}", state_root.display()),
-        })?;
-        let state_root = state_root.canonicalize().map_err(|error| HortError::StateIo {
+        let state_root = real_path(&state_root).map_err(|error| HortError::StateIo {
             detail: format!("could not resolve {}: {error}", state_root.display()),
         })?;
 
@@ -202,7 +201,7 @@ impl RealDeps {
 }
 
 /// The directory hort keeps its per-sandbox records under: `$XDG_STATE_HOME/hort`
-/// when that variable names a directory, otherwise the XDG default of
+/// when that variable is set and not empty, otherwise the XDG default of
 /// `~/.local/state/hort`.
 fn resolve_state_root() -> Result<PathBuf, HortError> {
     match xdg_hort_dir("XDG_STATE_HOME") {
@@ -212,7 +211,7 @@ fn resolve_state_root() -> Result<PathBuf, HortError> {
 }
 
 /// The directory hort reads its global configuration from: `$XDG_CONFIG_HOME/hort`
-/// when that variable names a directory, otherwise the XDG default of
+/// when that variable is set and not empty, otherwise the XDG default of
 /// `~/.config/hort`.
 fn resolve_config_root() -> Result<PathBuf, HortError> {
     match xdg_hort_dir("XDG_CONFIG_HOME") {
@@ -223,7 +222,7 @@ fn resolve_config_root() -> Result<PathBuf, HortError> {
 
 /// The directory hort keeps everything a restart makes meaningless in: the
 /// container states, and the files the host-side helpers of a sandbox write.
-/// `$XDG_RUNTIME_DIR/hort` when that variable names a directory, otherwise
+/// `$XDG_RUNTIME_DIR/hort` when that variable is set and not empty, otherwise
 /// `/run/user/<uid>/hort`.
 ///
 /// Both are emptied when the machine restarts, and that is the point rather than
@@ -253,6 +252,20 @@ fn home_dir() -> Result<PathBuf, HortError> {
     std::env::home_dir().ok_or_else(|| HortError::StateIo {
         detail: "could not determine the home directory".to_string(),
     })
+}
+
+/// The real path of `path`, which need not exist yet: its nearest existing
+/// ancestor canonicalized and the rest appended, creating nothing on the way.
+fn real_path(path: &Path) -> std::io::Result<PathBuf> {
+    match path.canonicalize() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+                return Err(error);
+            };
+            Ok(real_path(parent)?.join(name))
+        }
+        resolved => resolved,
+    }
 }
 
 /// Dispatch a parsed command to its coordinator, printing what a script reads
@@ -790,6 +803,7 @@ fn render_branch(branch: Option<&BranchName>) -> String {
 mod tests {
     use super::*;
 
+    use std::fs;
     use std::time::Duration;
 
     use crate::domain::idle::IdleState;
@@ -1228,5 +1242,23 @@ mod tests {
         let rendered = render_ls(&[entry]);
 
         assert!(rendered.contains("dirty"));
+    }
+
+    #[test]
+    fn state_root_is_the_real_path_when_the_state_home_is_a_symlink() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let real = base.join("real");
+        let link = base.join("link");
+        fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // git lists a worktree by its real path, and up decides whether to
+        // resume a half-built sandbox by comparing that listing with the path
+        // it derives from the state root, so the two have to be the same text.
+        let state_root = link.join("hort");
+
+        let resolved = real_path(&state_root).unwrap();
+
+        assert_eq!(resolved, real.join("hort"));
     }
 }
