@@ -257,11 +257,20 @@ impl LibcontainerRuntime {
     }
 
     /// The pid of a running sandbox's anchor, taken from the container state the
-    /// runtime keeps. It is the anchor's namespaces a session climbs into and the
-    /// anchor's cgroup a sandbox's processes are counted in, and naming it here
-    /// is what spares both callers from carrying it around.
+    /// runtime keeps, or from the process table once that state is gone. It is
+    /// the anchor's namespaces a session climbs into and the anchor's cgroup a
+    /// sandbox's processes are counted in, and naming it here is what spares
+    /// both callers from carrying it around.
+    ///
+    /// The state stays the first source because reading it is one exact file
+    /// read, where the process table is a walk of `/proc` that only a sandbox
+    /// whose state has been lost should have to pay for.
     fn anchor_pid(&self, name: &SandboxName, operation: &str) -> Result<u32, HortError> {
-        let container = Container::load(self.container_dir(name)).map_err(|err| {
+        let container_dir = self.container_dir(name);
+        if !container_dir.exists() {
+            return declared_anchor_pid(name, operation);
+        }
+        let container = Container::load(container_dir).map_err(|err| {
             runtime_failure(format!(
                 "{operation}: loading the container state of '{}': {err}",
                 name.as_str()
@@ -585,16 +594,9 @@ fn merged(recorded: Vec<RegistryEntry>, declared: Vec<RegistryEntry>) -> Vec<Reg
 /// gets that worktree deleted under it, which is the corruption the order of a
 /// shutdown exists to prevent.
 fn stop_by_signal(name: &SandboxName) -> Result<(), HortError> {
-    // The enumeration behind this is deliberately looser, so that a stray process
-    // carrying the marker still shows up as something to look at. Strictness
-    // belongs here, where getting it wrong signals a process a user is typing in.
-    let Some(entry) = declared_anchors()
-        .into_iter()
-        .find(|entry| entry.id == *name && heads_its_own_pid_namespace(entry.token.pid.0))
-    else {
+    let Some(anchor) = anchors_of(name).into_iter().next() else {
         return Ok(());
     };
-    let anchor = entry.token;
 
     let sessions = sessions_of(&anchor);
     for session in &sessions {
@@ -609,6 +611,46 @@ fn stop_by_signal(name: &SandboxName) -> Result<(), HortError> {
     // Killing it is also what ends a session that refused the request above,
     // since the death of that first process takes its pid namespace with it.
     kill_outright(anchor.pid.0)
+}
+
+/// The live anchors the process table says hold `name` open: every process of
+/// this user that declares the sandbox and heads a pid namespace of its own.
+///
+/// The enumeration behind this is deliberately looser, so that a stray process
+/// carrying the marker still shows up as something to look at. Strictness
+/// belongs here, where getting it wrong signals a process a user is typing in,
+/// or counts the anchor in that session's place: every session declares the
+/// sandbox exactly as its anchor does, and the pid namespace is the one thing
+/// telling them apart that no process can claim.
+fn anchors_of(name: &SandboxName) -> Vec<LivenessToken> {
+    declared_anchors()
+        .into_iter()
+        .filter(|entry| entry.id == *name && heads_its_own_pid_namespace(entry.token.pid.0))
+        .map(|entry| entry.token)
+        .collect()
+}
+
+/// The pid of the anchor the process table says holds `name` open, for when the
+/// runtime has no container state left to read it from.
+///
+/// Two anchors under one name is not something to choose between: counted, the
+/// answer would be one sandbox's sessions offered as the other's, and entered,
+/// a session would climb into whichever the listing happened to put first.
+fn declared_anchor_pid(name: &SandboxName, operation: &str) -> Result<u32, HortError> {
+    let mut anchors = anchors_of(name).into_iter();
+    let Some(anchor) = anchors.next() else {
+        return Err(runtime_failure(format!(
+            "{operation}: sandbox '{}' has no anchor",
+            name.as_str()
+        )));
+    };
+    if anchors.next().is_some() {
+        return Err(runtime_failure(format!(
+            "{operation}: more than one anchor declares sandbox '{}'",
+            name.as_str()
+        )));
+    }
+    Ok(anchor.pid.0)
 }
 
 /// Whether the process at `pid` is the first process of a pid namespace of its
@@ -2976,10 +3018,13 @@ mod privileged_tests {
     /// A sandbox's container state moved out of the directory the enumeration
     /// walks, and put back however the test that took it away ended.
     ///
-    /// Putting it back is not tidiness. With that directory gone the runtime
-    /// reads the sandbox as one it never knew and reports a successful teardown
-    /// having stopped nothing, so restoring it is what lets the scratch sandbox
-    /// take the anchor down. Declare it after the sandbox, so it goes first.
+    /// With those files gone the runtime has no handle to stop the container
+    /// through and falls back to signalling what the kernel still has of it, so
+    /// the anchor comes down either way. What putting them back decides is which
+    /// arm the scratch sandbox's own teardown runs: restored, it runs the
+    /// runtime's delete over the state it wrote, the way every other test's
+    /// does, rather than the fallback under test a second time. Declare it after
+    /// the sandbox, so it goes first.
     struct ContainerStateAside {
         home: PathBuf,
         aside: PathBuf,
@@ -3614,6 +3659,36 @@ mod privileged_tests {
         // anchor is in that same cgroup and everything downstream counts this
         // list without reading it: one extra entry is a box that reports a
         // session nobody opened.
+        assert_eq!(reported, vec![session.pid]);
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces and a prepared rootfs (HORT_TEST_ROOTFS)"]
+    #[serial]
+    fn session_pids_counts_the_session_of_a_sandbox_whose_container_state_vanished() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
+        let token = runtime.start_anchor(&spec).unwrap();
+        wait_for_anchor(token.pid.0);
+        // Joined while the state is still there, because joining reads the very
+        // files the arrangement is about to take away. It names the sandbox the
+        // way every session `attach` opens does, so two processes declare this
+        // sandbox by the time the count is asked, and an anchor found by that
+        // declaration alone is the session as readily as the anchor, which then
+        // counts the anchor in the session's place.
+        let session = runtime.join_session(&declaring_session(&spec)).unwrap();
+        wait_for_session_to_declare(session.pid, &spec.name);
+        let _state_gone = ContainerStateAside::taken_from(&sandbox, &spec.name);
+
+        let reported = runtime.session_pids(&spec.name).unwrap();
+
+        // Those files are bookkeeping the anchor does not depend on, so the
+        // session is as open after their loss as before it. Answered as unknown
+        // instead, the count takes the box's idle down with it, and `ls` shows a
+        // box a person is typing in with no session and no idle to its name.
         assert_eq!(reported, vec![session.pid]);
         runtime.teardown(&spec.name).unwrap();
     }
