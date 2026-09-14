@@ -2374,6 +2374,55 @@ fn cli_ls_reports_lost_record_when_the_metadata_of_a_live_box_is_removed() {
         )));
 }
 
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_attach_refuses_a_sandbox_whose_container_state_vanished() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", sandbox.name().as_str()])
+        .assert()
+        .success();
+    // The runtime's own bookkeeping of the container and nothing else. The
+    // anchor keeps standing, so the box is alive; the record and the worktree
+    // stay where they are, so this is the one arrangement in which every other
+    // command answers for the box and only entering it is refused. It lives
+    // under the guard's runtime root, so the blast radius is this fixture, and
+    // the guard collects the box afterwards by signal, as `down` does when the
+    // state is gone.
+    fs::remove_dir_all(sandbox.runtime_root().join("containers").join(sandbox.name().as_str()))
+        .unwrap();
+    // The path hort itself recorded, so the message is held to naming the
+    // worktree the record names and not one the test derived on its own.
+    let record = FileMetadataStore::new(sandbox.state_root())
+        .get(sandbox.name())
+        .unwrap()
+        .expect("up records the sandbox it built");
+    let name = sandbox.name().as_str();
+    let worktree = record.worktree_path().display();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["attach", name])
+        .assert()
+        .code(1)
+        .stderr(format!(
+            "sandbox '{name}' is running but its container state is gone, so no session can join it (commit what you want to keep from {worktree} on the host, then run 'hort down {name}' and 'hort up {name} --branch {name}')\n"
+        ));
+}
+
 /// Run `hort up -d` on `sandbox` and kill it the instant the record it writes
 /// is on disk, with `SIGKILL` to its own pid and to nothing else, so that what
 /// is left is what an abrupt death at that point leaves and not what the

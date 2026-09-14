@@ -176,8 +176,7 @@ impl LibcontainerRuntime {
 
     /// Stop the sandbox's container, and with it every process joined to it.
     fn stop_container(&self, name: &SandboxName) -> Result<(), HortError> {
-        let container_dir = self.container_dir(name);
-        if !container_dir.exists() {
+        if !self.has_container_state(name) {
             // Those files are bookkeeping the anchor does not depend on, so losing
             // them costs the runtime the handle it stops a container by and costs
             // the container nothing at all. What is left of the sandbox is
@@ -186,7 +185,7 @@ impl LibcontainerRuntime {
             return stop_by_signal(name);
         }
 
-        let mut container = Container::load(container_dir).map_err(|err| {
+        let mut container = Container::load(self.container_dir(name)).map_err(|err| {
             runtime_failure(format!(
                 "teardown: loading the container state of '{}': {err}",
                 name.as_str()
@@ -266,11 +265,10 @@ impl LibcontainerRuntime {
     /// read, where the process table is a walk of `/proc` that only a sandbox
     /// whose state has been lost should have to pay for.
     fn anchor_pid(&self, name: &SandboxName, operation: &str) -> Result<u32, HortError> {
-        let container_dir = self.container_dir(name);
-        if !container_dir.exists() {
+        if !self.has_container_state(name) {
             return declared_anchor_pid(name, operation);
         }
-        let container = Container::load(container_dir).map_err(|err| {
+        let container = Container::load(self.container_dir(name)).map_err(|err| {
             runtime_failure(format!(
                 "{operation}: loading the container state of '{}': {err}",
                 name.as_str()
@@ -325,6 +323,19 @@ impl ContainerRuntime for LibcontainerRuntime {
                 })
             }
         }
+    }
+
+    /// Whether this sandbox's container directory still stands under the runtime
+    /// root, which is where the embedded runtime keeps everything it loads a
+    /// container back from and where a session's join sockets are created.
+    ///
+    /// One read answers three askers: the join's precondition, the teardown's
+    /// choice between the runtime's own delete and a signal, and the anchor
+    /// lookup's choice between the state file and the process table. Asking the
+    /// same question in all three is what makes the sandbox `attach` refuses
+    /// exactly the one `down` still collects by signal and `ls` still counts.
+    fn has_container_state(&self, name: &SandboxName) -> bool {
+        self.container_dir(name).exists()
     }
 
     fn join_session(&self, spec: &SessionSpec) -> Result<Session, HortError> {
@@ -2220,6 +2231,44 @@ mod tests {
         // insisting it be there, turns that ordinary race into a failure and
         // loses the sessions that outlived it.
         assert_eq!(sessions, vec![5150]);
+    }
+
+    #[test]
+    fn has_container_state_is_true_while_the_container_directory_stands() {
+        let runtime_root = tempfile::tempdir().unwrap();
+        let name = SandboxName::new("demo").unwrap();
+        record_container(
+            runtime_root.path(),
+            name.as_str(),
+            ContainerStatus::Running,
+            Some(a_live_pid()),
+        );
+        let runtime = LibcontainerRuntime::new(runtime_root.path().to_path_buf());
+
+        // A read that answered absence for every sandbox would have `attach`
+        // refuse every live box on the machine with a message about lost
+        // state, which is why the standing case is pinned and not only the
+        // vanished one.
+        assert!(runtime.has_container_state(&name));
+    }
+
+    #[test]
+    fn has_container_state_is_false_once_the_container_directory_vanished() {
+        let runtime_root = tempfile::tempdir().unwrap();
+        let name = SandboxName::new("demo").unwrap();
+        record_container(
+            runtime_root.path(),
+            name.as_str(),
+            ContainerStatus::Running,
+            Some(a_live_pid()),
+        );
+        // This one container's directory and nothing above it, which is what a
+        // hand removal leaves: the parent still stands, so a read that looked
+        // for the parent alone would say the state is there.
+        fs::remove_dir_all(runtime_root.path().join("containers").join(name.as_str())).unwrap();
+        let runtime = LibcontainerRuntime::new(runtime_root.path().to_path_buf());
+
+        assert!(!runtime.has_container_state(&name));
     }
 
     /// Write the container state a build leaves behind, through the runtime's own

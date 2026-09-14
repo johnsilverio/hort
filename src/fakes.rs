@@ -118,6 +118,7 @@ impl MetadataStore for InMemoryMetadataStore {
 pub struct FakeRuntime {
     token: LivenessToken,
     start_fails: bool,
+    container_state: bool,
     started_env: RefCell<Vec<(String, String)>>,
     started_rootfs: RefCell<PathBuf>,
     started_workdir: RefCell<PathBuf>,
@@ -137,6 +138,7 @@ impl FakeRuntime {
         Self {
             token,
             start_fails: false,
+            container_state: true,
             started_env: RefCell::new(Vec::new()),
             started_rootfs: RefCell::new(PathBuf::new()),
             started_workdir: RefCell::new(PathBuf::new()),
@@ -154,6 +156,18 @@ impl FakeRuntime {
     /// the witness is the half-built persisted record, not the error variant.
     pub fn failing_start(token: LivenessToken) -> Self {
         Self { start_fails: true, ..Self::new(token) }
+    }
+
+    /// A runtime whose own state of the container is gone while the sandbox
+    /// stands, which is what a removal under the runtime root leaves behind.
+    ///
+    /// Its joins still succeed on purpose: a command that goes on to join after
+    /// reading this answer is exactly what the fake exists to catch, and it is
+    /// caught by the session such a join leaves in `joins`, which a join that
+    /// failed would never record.
+    pub fn without_container_state(mut self) -> Self {
+        self.container_state = false;
+        self
     }
 
     /// Record the `runtime.teardown` step on the shared teardown trace.
@@ -247,6 +261,10 @@ impl ContainerRuntime for FakeRuntime {
             });
         }
         Ok(self.token)
+    }
+
+    fn has_container_state(&self, _name: &SandboxName) -> bool {
+        self.container_state
     }
 
     fn join_session(&self, spec: &SessionSpec) -> Result<Session, HortError> {

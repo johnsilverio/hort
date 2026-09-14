@@ -48,6 +48,13 @@ pub trait ContainerRuntime {
     /// Start the sandbox's anchor process and return the kernel liveness token it
     /// runs under.
     fn start_anchor(&self, spec: &OciSpec) -> Result<LivenessToken, HortError>;
+    /// Whether the runtime still holds the container state it joins a session
+    /// through. That state is bookkeeping the anchor does not depend on, so a
+    /// sandbox stays alive without it while no session can be joined to it any
+    /// more, and this is what lets a caller say so before attempting a join
+    /// that can only fail with the runtime's own words. An unanswerable read
+    /// is absence, never an error, the way the worktree read answers.
+    fn has_container_state(&self, name: &SandboxName) -> bool;
     /// Join a new session into the running sandbox's namespaces, returning the
     /// session a caller waits on and, when the spec asked for a terminal, the
     /// pty master the sandbox allocated for it.

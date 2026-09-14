@@ -1,8 +1,9 @@
 //! `attach <name>`: open one more session inside a sandbox that is already
 //! running.
 //!
-//! It never creates anything. A name nothing knows and a name whose anchor is
-//! gone are two different answers, and both stop here. A live sandbox gets a
+//! It never creates anything. A name nothing knows, a name whose anchor is
+//! gone, and a running sandbox whose container state is gone are three
+//! different answers, and all of them stop here. A live sandbox gets a
 //! session, which is a process joined to its namespaces running a login shell in
 //! the worktree: the configured shell, else the one the user runs on the host
 //! when the sandbox's root filesystem carries it, else the shell every prepared
@@ -99,6 +100,9 @@ impl AttachCommand<'_> {
 
         if record.reconcile(self.probe) != SandboxState::Live {
             return Err(HortError::SandboxNotRunning { name: name.as_str().to_string() });
+        }
+        if !self.runtime.has_container_state(&name) {
+            return Err(container_state_gone(&record));
         }
 
         let (credentials, warnings) = self.declared_credentials();
@@ -203,6 +207,30 @@ impl AttachCommand<'_> {
     }
 }
 
+/// The refusal for a sandbox that is running while the runtime's own state of
+/// its container is gone, carrying the remedy already spelled for the mode the
+/// record was built in.
+///
+/// hort rebuilds no state, so the way out is `down` and `up` again, and what
+/// that costs differs by mode. With git, `down` removes the worktree, so the
+/// message names it and asks for the commit first, and the rebuild names the
+/// record's own branch, which survives the `down` and which a plain `up` would
+/// refuse as already existing. It is the record's branch and never the sandbox
+/// name, because a box built with `--branch` records the branch it was given.
+/// Without git there is no branch to name and `down` leaves the user's own
+/// folder where it is, so neither the worktree nor a flag is named.
+fn container_state_gone(record: &SandboxRecord) -> HortError {
+    let name = record.name().as_str();
+    let (worktree, rebuild) = match record.branch() {
+        Some(branch) => (
+            Some(record.worktree_path().display().to_string()),
+            format!("hort up {name} --branch {}", branch.as_str()),
+        ),
+        None => (None, format!("hort up {name}")),
+    };
+    HortError::ContainerStateGone { name: name.to_string(), worktree, rebuild }
+}
+
 /// What every session in a sandbox sees of it, which is the data a shell prompt
 /// renders the sandbox from. hort exports it and draws nothing itself.
 fn sandbox_environment(record: &SandboxRecord) -> Vec<(String, String)> {
@@ -220,7 +248,7 @@ mod tests {
 
     use crate::domain::config::{Agent, Auth, Cache, Egress, Mounts};
     use crate::domain::model::{
-        AnchorPid, Capabilities, CgroupCaps, LivenessToken, MountNsInode, SandboxRecord,
+        AnchorPid, BranchName, Capabilities, CgroupCaps, LivenessToken, MountNsInode, SandboxRecord,
     };
     use crate::domain::reconcile::SandboxState;
     use crate::fakes::{
@@ -237,6 +265,40 @@ mod tests {
 
     fn live_record() -> SandboxRecord {
         sample_record("demo").with_token(canned_token())
+    }
+
+    /// The record `up demo --branch feature` writes, with its anchor running:
+    /// a branch that is not the sandbox name, which is what tells a rebuild
+    /// naming the record's branch from one naming the sandbox.
+    fn live_record_on_branch(branch: &str) -> SandboxRecord {
+        SandboxRecord::new(
+            SandboxName::new("demo").unwrap(),
+            Some(BranchName::new(branch).unwrap()),
+            PathBuf::from("/state/sandboxes/demo/worktree-demo"),
+            PathBuf::from("/state/sandboxes/demo/overlay"),
+            "2026-06-11T12:00:00Z".to_string(),
+            "2026-06-11T12:00:00Z".to_string(),
+            None,
+            PathBuf::from("/home/tester/projects/demo"),
+        )
+        .with_token(canned_token())
+    }
+
+    /// The record a build without git writes, with its anchor running: no
+    /// branch, and a worktree path that is the user's own project folder rather
+    /// than anything hort made.
+    fn live_no_git_record() -> SandboxRecord {
+        SandboxRecord::new(
+            SandboxName::new("demo").unwrap(),
+            None,
+            PathBuf::from("/home/tester/project"),
+            PathBuf::from("/state/sandboxes/demo/overlay"),
+            "2026-06-11T12:00:00Z".to_string(),
+            "2026-06-11T12:00:00Z".to_string(),
+            None,
+            PathBuf::from("/home/tester/project"),
+        )
+        .with_token(canned_token())
     }
 
     /// A host that can run hort: user namespaces, and the tooling a build needs.
@@ -390,6 +452,84 @@ mod tests {
         assert_eq!(
             result.unwrap_err(),
             HortError::UnknownSandboxOnAttach { name: "demo".to_string() }
+        );
+        assert!(runtime.joins().is_empty());
+    }
+
+    #[test]
+    fn attach_refuses_a_live_sandbox_whose_container_state_is_gone() {
+        let store = InMemoryMetadataStore::new();
+        store.put(&live_record_on_branch("feature")).unwrap();
+        let probe = ScriptedLivenessProbe::new(true);
+        let runtime = FakeRuntime::new(canned_token()).without_container_state();
+        let clock = ScriptedClock::new(humantime::parse_rfc3339("2026-06-11T13:00:00Z").unwrap());
+        let env = FakeCapabilities::new(ready_host());
+        let proxy = FakeProxyEndpoint::without_proxy();
+        let config = config_with_shell(None);
+        let command = attach_command(
+            &store,
+            &probe,
+            &runtime,
+            &clock,
+            &env,
+            &proxy,
+            &config,
+            None,
+            Vec::new(),
+        );
+
+        let result = command.run(SandboxName::new("demo").unwrap(), false);
+
+        // The anchor holds the namespaces whether or not a file still describes
+        // the container, so the box is alive and every other command answers
+        // for it; but a session is joined through that file, and left to the
+        // runtime the refusal blames a state file and names no way out. hort
+        // rebuilds no state there, and the way out costs the worktree, since
+        // `down` removes it in git mode: so the message says to commit first,
+        // and hands over the rebuild with the branch that survives the `down`,
+        // which a plain `up` would refuse as already existing. It is the
+        // record's branch and never the sandbox name: a box built with
+        // `--branch feature` records `feature`, and `up demo --branch demo`
+        // would refuse it or reopen a different branch.
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "sandbox 'demo' is running but its container state is gone, so no session can join it (commit what you want to keep from /state/sandboxes/demo/worktree-demo on the host, then run 'hort down demo' and 'hort up demo --branch feature')"
+        );
+        assert!(runtime.joins().is_empty());
+    }
+
+    #[test]
+    fn attach_names_no_branch_in_the_rebuild_of_a_no_git_sandbox_whose_container_state_is_gone() {
+        let store = InMemoryMetadataStore::new();
+        store.put(&live_no_git_record()).unwrap();
+        let probe = ScriptedLivenessProbe::new(true);
+        let runtime = FakeRuntime::new(canned_token()).without_container_state();
+        let clock = ScriptedClock::new(humantime::parse_rfc3339("2026-06-11T13:00:00Z").unwrap());
+        let env = FakeCapabilities::new(ready_host());
+        let proxy = FakeProxyEndpoint::without_proxy();
+        let config = config_with_shell(None);
+        let command = attach_command(
+            &store,
+            &probe,
+            &runtime,
+            &clock,
+            &env,
+            &proxy,
+            &config,
+            None,
+            Vec::new(),
+        );
+
+        let result = command.run(SandboxName::new("demo").unwrap(), false);
+
+        // Without git there is no branch for `--branch` to name and `up` refuses
+        // the flag outright, so the ready-made command carried in git mode would
+        // send the user into a second refusal. Nor is there anything to commit
+        // first: `down` leaves the user's own folder where it is, and it may
+        // not be a repository at all, so the commit clause is gone too.
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "sandbox 'demo' is running but its container state is gone, so no session can join it (run 'hort down demo' and 'hort up demo')"
         );
         assert!(runtime.joins().is_empty());
     }

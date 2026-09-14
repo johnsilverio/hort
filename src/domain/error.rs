@@ -61,6 +61,14 @@ pub enum HortError {
     SandboxNotRunning { name: String },
     /// `attach`: no sandbox of this name is known ("what's alive" wording).
     UnknownSandboxOnAttach { name: String },
+    /// `attach`: the sandbox is running but the runtime's own state of its
+    /// container is gone, so no session can be joined to it. Carries the values
+    /// the message names, already rendered: the sandbox name; the worktree path
+    /// when `down` would remove it, which is git mode, and `None` without git,
+    /// where the message drops the commit clause with it; and the bare command
+    /// that rebuilds the sandbox, which names the record's branch in git mode
+    /// and no flag without git.
+    ContainerStateGone { name: String, worktree: Option<String>, rebuild: String },
     /// `down`: no sandbox of this name is known ("what exists" wording).
     UnknownSandboxOnDown { name: String },
     /// `down`/`prune`: confirmation was required but stdin is not a TTY and
@@ -211,6 +219,14 @@ impl fmt::Display for HortError {
             HortError::UnknownSandboxOnAttach { name } => {
                 write!(f, "no sandbox named '{name}' (run 'hort ls' to see what's alive)")
             }
+            HortError::ContainerStateGone { name, worktree: Some(worktree), rebuild } => write!(
+                f,
+                "sandbox '{name}' is running but its container state is gone, so no session can join it (commit what you want to keep from {worktree} on the host, then run 'hort down {name}' and '{rebuild}')"
+            ),
+            HortError::ContainerStateGone { name, worktree: None, rebuild } => write!(
+                f,
+                "sandbox '{name}' is running but its container state is gone, so no session can join it (run 'hort down {name}' and '{rebuild}')"
+            ),
             HortError::UnknownSandboxOnDown { name } => {
                 write!(f, "no sandbox named '{name}' (run 'hort ls' to see what exists)")
             }
@@ -275,6 +291,20 @@ mod tests {
         assert_eq!(
             absent.to_string(),
             "no sandbox named 'demo' (run 'hort ls' to see what's alive)"
+        );
+    }
+
+    #[test]
+    fn container_state_gone_error_renders_canonical_string() {
+        let error = HortError::ContainerStateGone {
+            name: "demo".to_string(),
+            worktree: Some("/state/sandboxes/demo/worktree-demo".to_string()),
+            rebuild: "hort up demo --branch demo".to_string(),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "sandbox 'demo' is running but its container state is gone, so no session can join it (commit what you want to keep from /state/sandboxes/demo/worktree-demo on the host, then run 'hort down demo' and 'hort up demo --branch demo')"
         );
     }
 
