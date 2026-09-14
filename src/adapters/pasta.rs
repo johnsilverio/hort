@@ -31,7 +31,7 @@
 
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{self, PipeWriter, Read, Write};
+use std::io::{self, PipeReader, PipeWriter, Read, Write};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -327,24 +327,39 @@ fn stop_pasta(pid: libc::pid_t) -> Result<(), String> {
 /// namespace, so that namespace has a path pasta can be pointed at: pasta insists
 /// on a path and refuses an inherited descriptor. It is scoped to provisioning
 /// because pasta outlives it, so it never becomes something teardown has to stop.
+///
+/// It lives exactly as long as it is held. It parks on a pipe whose writing end
+/// only the process that spawned it keeps, and leaves when that end closes,
+/// which is that process letting go of it or dying with it in hand. Parked on a
+/// signal its spawner sent on drop instead, it outlived every spawner that died
+/// first, by `SIGKILL`, a crash or the OOM killer, and stayed for as long as the
+/// machine was up: inside the namespaces of a sandbox that may no longer exist,
+/// holding everything its spawner had open, the build lock among it, so every
+/// later `up` of that name was refused as one already in progress.
 struct OwningUserNamespaceHolder {
     pid: libc::pid_t,
+    /// Taken on drop, so the holder is let go of before it is collected.
+    tether: Option<PipeWriter>,
 }
 
 impl OwningUserNamespaceHolder {
     fn spawn(owner: BorrowedFd<'_>) -> Result<Self, String> {
         let (mut ready_reader, ready_writer) =
             io::pipe().map_err(|err| format!("creating a pipe: {err}"))?;
+        let (tether_reader, tether_writer) =
+            io::pipe().map_err(|err| format!("creating a pipe: {err}"))?;
 
         match unsafe { libc::fork() } {
             -1 => Err(format!("forking the namespace holder: {}", io::Error::last_os_error())),
             0 => {
                 drop(ready_reader);
-                park_in(owner, ready_writer);
+                drop(tether_writer);
+                park_in(owner, ready_writer, tether_reader);
             }
             pid => {
                 drop(ready_writer);
-                let holder = Self { pid };
+                drop(tether_reader);
+                let holder = Self { pid, tether: Some(tether_writer) };
                 // Reading the announcement is what keeps pasta from being pointed
                 // at a path that does not name the owning namespace yet.
                 let mut signal = [0u8; 1];
@@ -365,21 +380,27 @@ impl OwningUserNamespaceHolder {
 
 impl Drop for OwningUserNamespaceHolder {
     fn drop(&mut self) {
-        unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        drop(self.tether.take());
         let mut status = 0;
         unsafe { libc::waitpid(self.pid, &mut status, 0) };
     }
 }
 
-/// Join the owning namespace, announce it, and stay there until killed. Leaving
+/// Join the owning namespace, announce it, and stay there until the other end of
+/// `tether` closes. Nothing is ever written on it: the read returns once the last
+/// copy of that end is gone, and only an interruption is not that. Leaving
 /// without unwinding matters here as much as in any forked child: what the
 /// unwinding would clean up belongs to the process on the other side of the fork.
-fn park_in(owner: BorrowedFd<'_>, mut ready: PipeWriter) -> ! {
+fn park_in(owner: BorrowedFd<'_>, mut ready: PipeWriter, mut tether: PipeReader) -> ! {
     if enter(&[owner]).is_err() || ready.write_all(&HANDSHAKE).is_err() {
         unsafe { libc::_exit(1) }
     }
+    let mut signal = [0u8; 1];
     loop {
-        unsafe { libc::pause() };
+        match tether.read(&mut signal) {
+            Err(interruption) if interruption.kind() == io::ErrorKind::Interrupted => continue,
+            _ => unsafe { libc::_exit(0) },
+        }
     }
 }
 
@@ -753,6 +774,7 @@ mod privileged_tests {
     use super::*;
 
     use std::fs;
+    use std::io::{BufRead, BufReader};
     use std::net::TcpStream;
     use std::thread::sleep;
     use std::time::{Duration, Instant};
@@ -1185,5 +1207,226 @@ mod privileged_tests {
         assert!(TcpStream::connect(("127.0.0.1", port)).is_ok());
         provider.teardown(&spec.name).unwrap();
         runtime.teardown(&spec.name).unwrap();
+    }
+
+    /// How long a holder gets to leave once the process that spawned it has.
+    const HOLDER_DEADLINE: Duration = Duration::from_secs(5);
+
+    /// What the process that spawns the holder does once it has reported the
+    /// holder's pid.
+    enum Spawner {
+        /// Parks with the holder still in hand, which is where `up` is when a
+        /// crash or the OOM killer reaches it in the middle of provisioning.
+        ParksHoldingIt,
+        /// Lets go of it and leaves, the way provisioning does once pasta is up.
+        DropsItAndLeaves,
+    }
+
+    /// A process this test forked and answers for: killed and collected when
+    /// this is dropped, so a test that dies on an assertion strands nothing, and
+    /// never signalled again once it has been collected, because its pid is then
+    /// the kernel's to hand to a stranger.
+    struct Forked {
+        pid: Option<libc::pid_t>,
+    }
+
+    impl Forked {
+        fn pid(&self) -> libc::pid_t {
+            self.pid.expect("a process not yet collected")
+        }
+
+        /// End it the way a crash or the OOM killer would, with no chance to
+        /// clean up after itself, and take the status that says so.
+        fn kill(&mut self) -> i32 {
+            let pid = self.pid.take().expect("a process not yet collected");
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            collect(pid)
+        }
+
+        /// Take the status of one that left on its own.
+        fn collect(&mut self) -> i32 {
+            collect(self.pid.take().expect("a process not yet collected"))
+        }
+
+        /// Forget one this test watched leave, collecting it if it fell to this
+        /// process: the orphan of a killed process becomes a child of the nearest
+        /// reaper, and an earlier test in this binary may have made this process
+        /// one.
+        fn left(mut self) {
+            if let Some(pid) = self.pid.take() {
+                let mut status = 0;
+                unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            }
+        }
+    }
+
+    impl Drop for Forked {
+        fn drop(&mut self) {
+            if let Some(pid) = self.pid.take() {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                collect(pid);
+            }
+        }
+    }
+
+    fn collect(pid: libc::pid_t) -> i32 {
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        status
+    }
+
+    /// A user namespace of this test's own for the holder to enter, made by a
+    /// child that unshares one and parks there, and opened the way the provider
+    /// opens the one owning a sandbox's network namespace: by path, from the
+    /// host. The child is that namespace's only process, so the namespace lives
+    /// exactly as long as the child does.
+    fn an_owning_user_namespace() -> (Forked, File) {
+        let (mut announcement, mut announce) = io::pipe().unwrap();
+        let pid = match unsafe { libc::fork() } {
+            -1 => panic!("forking the namespace's process: {}", io::Error::last_os_error()),
+            0 => {
+                drop(announcement);
+                if unsafe { libc::unshare(libc::CLONE_NEWUSER) } == -1
+                    || announce.write_all(&HANDSHAKE).is_err()
+                {
+                    unsafe { libc::_exit(1) }
+                }
+                loop {
+                    unsafe { libc::pause() };
+                }
+            }
+            pid => pid,
+        };
+        drop(announce);
+        let process = Forked { pid: Some(pid) };
+        let mut signal = [0u8; 1];
+        assert!(
+            matches!(announcement.read(&mut signal), Ok(1)),
+            "no user namespace could be made: unprivileged user namespaces are unavailable here"
+        );
+        let namespace = File::open(format!("/proc/{pid}/ns/user"))
+            .expect("the user namespace of a process of this test");
+        (process, namespace)
+    }
+
+    /// A fork of this test that spawns the holder into `owner`, reports the
+    /// holder's pid over a pipe, and then does with the holder what `then` says.
+    /// A fork, because the spawner is what dies in the witness and the test
+    /// process cannot be the one to die.
+    fn a_process_spawning_the_holder(owner: BorrowedFd<'_>, then: Spawner) -> (Forked, Forked) {
+        let (report, mut reporting) = io::pipe().unwrap();
+        let pid = match unsafe { libc::fork() } {
+            -1 => panic!("forking the holder's spawner: {}", io::Error::last_os_error()),
+            0 => {
+                drop(report);
+                let Ok(holder) = OwningUserNamespaceHolder::spawn(owner) else {
+                    unsafe { libc::_exit(1) }
+                };
+                if writeln!(reporting, "{}", holder.pid).is_err() {
+                    unsafe { libc::_exit(1) }
+                }
+                match then {
+                    Spawner::ParksHoldingIt => loop {
+                        unsafe { libc::pause() };
+                    },
+                    Spawner::DropsItAndLeaves => {
+                        drop(holder);
+                        unsafe { libc::_exit(0) }
+                    }
+                }
+            }
+            pid => pid,
+        };
+        drop(reporting);
+        let spawner = Forked { pid: Some(pid) };
+        let mut reported = String::new();
+        BufReader::new(report).read_line(&mut reported).unwrap();
+        let holder = reported.trim().parse().expect(
+            "the holder's pid, reported only once the holder announced itself from inside the namespace",
+        );
+        (spawner, Forked { pid: Some(holder) })
+    }
+
+    /// Whether the holder stops standing in the process table, waiting for it: a
+    /// process leaving takes a moment.
+    fn gone_within_deadline(pid: libc::pid_t) -> bool {
+        let deadline = Instant::now() + HOLDER_DEADLINE;
+        while Instant::now() < deadline {
+            if !standing(pid) {
+                return true;
+            }
+            sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// Whether the pid still names a running process, asked of the kernel's own
+    /// state line rather than of a signal or of the entry under /proc. A process
+    /// that died with nobody to collect it keeps both, and the one not collecting
+    /// would be this very process, whenever an earlier test in the binary made it
+    /// the reaper of every orphan. Such a corpse reads as gone.
+    fn standing(pid: libc::pid_t) -> bool {
+        let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else { return false };
+        let state =
+            status.lines().find_map(|line| line.strip_prefix("State:\t")).unwrap_or_default();
+        !state.starts_with(['Z', 'X'])
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces"]
+    #[serial]
+    fn the_namespace_holder_does_not_outlive_the_process_that_spawned_it() {
+        let (_owner, namespace) = an_owning_user_namespace();
+        let (mut spawner, holder) =
+            a_process_spawning_the_holder(namespace.as_fd(), Spawner::ParksHoldingIt);
+        assert!(
+            standing(holder.pid()),
+            "the holder was not standing before its spawner was killed"
+        );
+
+        let death = spawner.kill();
+
+        // Only the process that spawned the holder ever stops it, and a crash or
+        // the OOM killer gives that process no chance to. What is left otherwise
+        // is a process nothing records, parked for as long as the machine is up,
+        // inside the namespaces of a sandbox that may no longer exist and with
+        // everything its spawner had open, the build lock among it, so every
+        // later `up` of that name is refused as one already in progress.
+        assert!(
+            libc::WIFSIGNALED(death) && libc::WTERMSIG(death) == libc::SIGKILL,
+            "the spawner did not die of SIGKILL"
+        );
+        assert!(
+            gone_within_deadline(holder.pid()),
+            "the namespace holder {} was still standing {HOLDER_DEADLINE:?} after the process that spawned it was killed",
+            holder.pid()
+        );
+        holder.left();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces"]
+    #[serial]
+    fn the_namespace_holder_is_gone_once_the_process_that_spawned_it_drops_it() {
+        let (_owner, namespace) = an_owning_user_namespace();
+        let (mut spawner, holder) =
+            a_process_spawning_the_holder(namespace.as_fd(), Spawner::DropsItAndLeaves);
+
+        let departure = spawner.collect();
+
+        // pasta outlives the holder, which is what keeps the holder out of the
+        // teardown plan: nothing ever comes back for it. The moment its spawner
+        // lets go of it is therefore the only moment it can leave, and one that
+        // stays past it stays for good.
+        assert!(
+            libc::WIFEXITED(departure) && libc::WEXITSTATUS(departure) == 0,
+            "the spawner did not leave on its own"
+        );
+        assert!(
+            gone_within_deadline(holder.pid()),
+            "the namespace holder {} was still standing {HOLDER_DEADLINE:?} after the process that spawned it dropped it",
+            holder.pid()
+        );
+        holder.left();
     }
 }
