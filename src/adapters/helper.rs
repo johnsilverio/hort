@@ -13,6 +13,12 @@
 //! while it builds a sandbox: held by a process that only leaves when the sandbox
 //! does, it makes the name read as still being built for as long as the sandbox
 //! lives.
+//!
+//! A fork is also born into the process group of the command that forked it, and
+//! that group is what a terminal's interrupt signals, so a build interrupted at
+//! the keyboard would take every helper it had started with it. A helper
+//! therefore leads a session of its own, the step pasta takes for itself, and
+//! the whole family is out of that reach the same way.
 
 use std::fs::{self, File};
 use std::io::{self, PipeWriter, Read, Write};
@@ -50,8 +56,9 @@ impl HostHelper {
     /// Start one in a process that outlives this call, serving with `kept` as the
     /// only descriptors it carries over from here, and record what it is. By the
     /// time this returns the started process has already let go of everything
-    /// else it inherited. One that cannot be recorded is stopped rather than left
-    /// running: nothing else knows it exists.
+    /// else it inherited and leads a session of its own, so a signal to this
+    /// process's group does not reach it. One that cannot be recorded is stopped
+    /// rather than left running: nothing else knows it exists.
     pub fn start(
         &self,
         sandbox_dir: &Path,
@@ -169,7 +176,8 @@ pub fn splice(client: &TcpStream, upstream: &TcpStream) {
 }
 
 /// Serve from the forked child, after making it into something the host can
-/// recognize and something that holds nothing of the command that forked it.
+/// recognize, something that holds nothing of the command that forked it, and
+/// something a signal to that command's process group does not reach.
 /// Leaving without unwinding matters as much as in any forked child: what the
 /// unwinding would clean up belongs to the process on the other side of the fork.
 fn serve_detached(
@@ -185,7 +193,9 @@ fn serve_detached(
     // copies the table inside the fork, so the child is already holding all of it
     // while the rest of the fork runs and while it waits for a CPU, which is far
     // longer than its own path to this call. The announcement comes last for the
-    // opposite reason, since it is what releases the caller.
+    // opposite reason: it is what releases the caller, so everything the caller
+    // is promised about the started process, its own session included, already
+    // holds when it is written.
     //
     // No test pins this order, and that is a finding rather than a gap. One was
     // written and deleted: all it can observe is whether a file the caller let
@@ -196,7 +206,8 @@ fn serve_detached(
     // order right is that it cannot be written wrong: an announcement cannot
     // come before a sweep that is the first line.
     close_inherited_descriptors(carried);
-    if name_process(process_name).is_err()
+    if lead_own_session().is_err()
+        || name_process(process_name).is_err()
         || redirect(streams).is_err()
         || announced(announce).is_err()
     {
@@ -255,6 +266,18 @@ fn name_process(name: &str) -> Result<(), ()> {
     let mut named = [0u8; PROCESS_NAME_LIMIT];
     named[..name.len()].copy_from_slice(name.as_bytes());
     if unsafe { libc::prctl(libc::PR_SET_NAME, named.as_ptr()) } == -1 {
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Lead a session of this process's own, out of the process group of the
+/// command that forked it. That group is what a terminal's interrupt and a
+/// shell's job control signal, and a helper is meant to outlive the command.
+/// A freshly forked child is never a group leader, which is the one thing that
+/// could make this fail.
+fn lead_own_session() -> Result<(), ()> {
+    if unsafe { libc::setsid() } == -1 {
         return Err(());
     }
     Ok(())
@@ -401,5 +424,27 @@ mod tests {
         assert!(started.is_ok());
 
         A_HELPER.stop(sandbox.path()).unwrap();
+    }
+
+    #[test]
+    fn a_started_helper_leads_a_session_of_its_own() {
+        let sandbox = tempfile::tempdir().unwrap();
+        A_HELPER.start(sandbox.path(), &[], || sleep(LINGERS)).unwrap();
+        let pid = A_HELPER.recorded(sandbox.path()).expect("the pid start recorded");
+
+        let session = session_of(pid);
+
+        A_HELPER.stop(sandbox.path()).unwrap();
+        // A helper born into the session of the process that started it is in
+        // the group a terminal's interrupt signals during a build, and goes down
+        // with the build; one leading its own session is out of that reach.
+        assert_eq!(session, pid, "the test process's own session is {}", session_of(0));
+    }
+
+    /// The session a process belongs to, asked of the kernel. A session is
+    /// named by the pid of its leader, so a process whose session carries its
+    /// own pid is one that leads it.
+    fn session_of(pid: libc::pid_t) -> libc::pid_t {
+        unsafe { libc::getsid(pid) }
     }
 }
