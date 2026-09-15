@@ -297,6 +297,7 @@ pub struct FakeNetwork {
     teardowns: RefCell<Vec<SandboxName>>,
     provision_fails: bool,
     teardown_fails: bool,
+    nothing_standing: bool,
     trace: Option<TeardownTrace>,
 }
 
@@ -309,6 +310,14 @@ impl FakeNetwork {
     /// container already standing and no networking around it.
     pub fn failing_provision() -> Self {
         Self { provision_fails: true, ..Self::default() }
+    }
+
+    /// A provider that finds no helper of a sandbox standing: the state a live
+    /// box is in once its pasta died under it, or once the `up` that built it
+    /// died before wiring it. Every other provider here answers that the network
+    /// stands, which is what a healthy box looks like.
+    pub fn nothing_standing() -> Self {
+        Self { nothing_standing: true, ..Self::default() }
     }
 
     /// Script the helper stop as failing too, standing in for a helper that will
@@ -327,6 +336,11 @@ impl FakeNetwork {
 
     pub fn provisioned(&self) -> Vec<SandboxName> {
         self.provisioned.borrow().iter().map(|spec| spec.name.clone()).collect()
+    }
+
+    /// The network namespace path of the spec provisioned last.
+    pub fn provisioned_netns(&self) -> Option<PathBuf> {
+        self.provisioned.borrow().last().map(|spec| spec.netns.clone())
     }
 
     /// The egress policy of the spec provisioned last.
@@ -381,6 +395,10 @@ impl NetworkProvider for FakeNetwork {
             });
         }
         Ok(())
+    }
+
+    fn standing(&self, _spec: &NetworkSpec) -> bool {
+        !self.nothing_standing
     }
 
     fn teardown(&self, name: &SandboxName) -> Result<(), HortError> {

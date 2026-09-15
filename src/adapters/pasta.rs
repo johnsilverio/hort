@@ -19,7 +19,9 @@
 //!
 //! The pid pasta records lives in a file rather than in the sandbox's metadata
 //! record, so nothing writes that record outside the build lock. Teardown reads
-//! the process's command line before signalling it, because a pid is reusable.
+//! the process's command line before signalling it, because a pid is reusable,
+//! and the same question is what tells a sandbox whose network is standing from
+//! one whose helpers are gone while its anchor lives on.
 //!
 //! That file, and every other file the helpers of one sandbox write, lives under
 //! the runtime root and never under the one hort keeps its records in. pasta is a
@@ -99,9 +101,10 @@ impl PastaNetworkProvider {
         // The proxy goes up first because the port it lands on is one of the
         // ports pasta is told to splice: started afterwards, it would be a way
         // out that nothing inside the sandbox can reach.
-        let proxy_port = match spec.egress {
-            EgressPolicy::Open => None,
-            EgressPolicy::Allowlist(_) => Some(proxy::start(&sandbox_dir, &spec.egress)?),
+        let proxy_port = if proxy::required(&spec.egress) {
+            Some(proxy::start(&sandbox_dir, &spec.egress)?)
+        } else {
+            None
         };
         // A declared database is reachable in both postures: what an allowlist
         // decides is what the sandbox may reach on its way out, not which
@@ -148,27 +151,44 @@ impl PastaNetworkProvider {
     }
 
     fn stop_pasta_of(&self, name: &SandboxName) -> Result<(), String> {
-        let pid_file = self.pid_file(name);
-        let Ok(recorded) = fs::read_to_string(&pid_file) else {
-            // Nothing recorded the sandbox's pasta, so there is nothing this can
-            // be asked to stop: a sandbox torn down twice, or never wired.
-            return Ok(());
-        };
-
-        let outcome = match recorded.trim().parse() {
+        let outcome = match self.recorded_pasta(name) {
             // A pid outlives the process it named, so the recorded one is only
             // acted on while it still names the pasta that was recorded.
-            Ok(pid) if is_pasta(pid) => stop_pasta(pid),
+            Some(pid) if is_pasta(pid) => stop_pasta(pid),
+            // Nothing recorded the sandbox's pasta, so there is nothing this can
+            // be asked to stop: a sandbox torn down twice, or never wired.
             _ => Ok(()),
         };
-        let _ = fs::remove_file(&pid_file);
+        let _ = fs::remove_file(self.pid_file(name));
         outcome
+    }
+
+    /// Whether the pasta this sandbox recorded is still running, asked the way
+    /// teardown asks before it signals: the file names a process, and that
+    /// process's command line still names pasta.
+    fn pasta_running(&self, name: &SandboxName) -> bool {
+        self.recorded_pasta(name).is_some_and(is_pasta)
+    }
+
+    fn recorded_pasta(&self, name: &SandboxName) -> Option<libc::pid_t> {
+        fs::read_to_string(self.pid_file(name)).ok()?.trim().parse().ok()
     }
 }
 
 impl NetworkProvider for PastaNetworkProvider {
     fn provision(&self, spec: &NetworkSpec) -> Result<(), HortError> {
         self.wire(spec).map_err(network_failure)
+    }
+
+    /// Each helper is owed by the rule `wire` starts it by, so what this reads
+    /// is whether the wiring that posture calls for is all still there: pasta
+    /// carries every sandbox, the proxy carries an allowlisted one, and a
+    /// forwarder carries each database the splice does not land on.
+    fn standing(&self, spec: &NetworkSpec) -> bool {
+        let sandbox_dir = self.sandbox_dir(&spec.name);
+        self.pasta_running(&spec.name)
+            && proxy::standing(&sandbox_dir, &spec.egress)
+            && forwarder::standing(&sandbox_dir, &spec.db_forwards)
     }
 
     fn teardown(&self, name: &SandboxName) -> Result<(), HortError> {
@@ -767,6 +787,163 @@ mod tests {
         // goes out with no proxy set at all.
         assert_eq!(port, Some(PROXY_PORT));
     }
+
+    /// A process hort recognizes as a sandbox's pasta, recorded as such in
+    /// `sandbox_dir`, with no pasta at all: a sleep started under pasta's name,
+    /// which is what the recognition reads off the command line. Asked of the
+    /// predicate production asks before it is handed over, so a read that finds
+    /// the network not standing finds it for the reason its test names, never
+    /// because the stand-in went unrecognized.
+    struct RecordedStandInPasta {
+        process: std::process::Child,
+    }
+
+    impl RecordedStandInPasta {
+        fn in_sandbox(sandbox_dir: &Path, scratch: &Path) -> Self {
+            let program = scratch.join(PASTA);
+            std::os::unix::fs::symlink("/bin/sleep", &program).unwrap();
+            // Bounded rather than endless: a test that dies before its guard
+            // runs leaves this to leave on its own.
+            let process = Command::new(&program).arg("60").spawn().unwrap();
+            fs::write(sandbox_dir.join("pasta.pid"), format!("{}\n", process.id())).unwrap();
+            // The spawn is handed back before the kernel has installed the new
+            // program's argument vector, so for a moment the command line reads
+            // empty and the process is recognized as nothing.
+            let recognized = Instant::now() + Duration::from_secs(2);
+            while !is_pasta(process.id() as libc::pid_t) && Instant::now() < recognized {
+                sleep(Duration::from_millis(5));
+            }
+            assert!(
+                is_pasta(process.id() as libc::pid_t),
+                "the stand-in was not recognized as pasta, so nothing below measures the read"
+            );
+            Self { process }
+        }
+    }
+
+    impl Drop for RecordedStandInPasta {
+        fn drop(&mut self) {
+            let _ = self.process.kill();
+            let _ = self.process.wait();
+        }
+    }
+
+    #[test]
+    fn network_is_not_standing_without_a_pasta_pid_file() {
+        let runtime_root = tempfile::tempdir().unwrap();
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
+
+        let standing = provider.standing(&network_spec(EgressPolicy::Open, Vec::new()));
+
+        // A sandbox whose pasta was never recorded is one whose pasta was never
+        // started, or one already torn down: nothing carries its traffic either
+        // way, and a read that said otherwise would leave `up` refusing the box
+        // as a duplicate of a healthy one.
+        assert!(!standing);
+    }
+
+    #[test]
+    fn network_is_not_standing_when_the_recorded_pid_is_no_longer_pasta() {
+        let runtime_root = tempfile::tempdir().unwrap();
+        let sandbox_dir = runtime_root.path().join("sandboxes").join("demo");
+        fs::create_dir_all(&sandbox_dir).unwrap();
+        // The test process itself: a live pid that is certainly not pasta. A pid
+        // outlives the process it named, and pasta's file outlives pasta, so
+        // what the file names is not what is running.
+        fs::write(sandbox_dir.join("pasta.pid"), format!("{}\n", std::process::id())).unwrap();
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
+
+        let standing = provider.standing(&network_spec(EgressPolicy::Open, Vec::new()));
+
+        assert!(!standing);
+    }
+
+    #[test]
+    fn network_is_not_standing_when_an_allowlisted_sandbox_has_no_proxy() {
+        let runtime_root = tempfile::tempdir().unwrap();
+        let sandbox_dir = runtime_root.path().join("sandboxes").join("demo");
+        fs::create_dir_all(&sandbox_dir).unwrap();
+        let _pasta = RecordedStandInPasta::in_sandbox(&sandbox_dir, runtime_root.path());
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
+
+        let standing = provider.standing(&network_spec(allowlist(), Vec::new()));
+
+        // Under an allowlist the proxy is the only way out, so a box whose pasta
+        // stands and whose proxy is gone reaches nothing it is permitted to. A
+        // read that stopped at pasta would call that box healthy.
+        assert!(!standing);
+    }
+
+    #[test]
+    fn network_is_not_standing_when_a_declared_database_has_no_forwarder() {
+        let runtime_root = tempfile::tempdir().unwrap();
+        let sandbox_dir = runtime_root.path().join("sandboxes").join("demo");
+        fs::create_dir_all(&sandbox_dir).unwrap();
+        let _pasta = RecordedStandInPasta::in_sandbox(&sandbox_dir, runtime_root.path());
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
+
+        let standing =
+            provider.standing(&network_spec(EgressPolicy::Open, vec![remote_database_on(5432)]));
+
+        // A database that answers anywhere but the host's loopback is reached
+        // only through the forwarder, so without it the declared connection is
+        // a port inside the box that nothing listens on.
+        assert!(!standing);
+    }
+
+    /// The proxy and the forwarder a test started under `sandbox_dir`, stopped
+    /// when this is dropped: a test that dies before its own stop, on an
+    /// assertion or on a read that panics, would otherwise leave two helpers
+    /// holding their ports for as long as the machine is up.
+    struct StartedHelpers {
+        sandbox_dir: PathBuf,
+    }
+
+    impl Drop for StartedHelpers {
+        fn drop(&mut self) {
+            let _ = proxy::stop(&self.sandbox_dir);
+            let _ = forwarder::stop(&self.sandbox_dir);
+        }
+    }
+
+    #[test]
+    fn network_is_standing_when_every_helper_the_posture_requires_is_running() {
+        let runtime_root = tempfile::tempdir().unwrap();
+        let sandbox_dir = runtime_root.path().join("sandboxes").join("demo");
+        fs::create_dir_all(&sandbox_dir).unwrap();
+        let _helpers = StartedHelpers { sandbox_dir: sandbox_dir.clone() };
+        let _pasta = RecordedStandInPasta::in_sandbox(&sandbox_dir, runtime_root.path());
+        let port = a_declared_port();
+        proxy::start(&sandbox_dir, &allowlist()).unwrap();
+        forwarder::start(&sandbox_dir, &[remote_database_on(port)]).unwrap();
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
+
+        let standing =
+            provider.standing(&network_spec(allowlist(), vec![remote_database_on(port)]));
+
+        // The control for the refusals above: with pasta, the proxy and the
+        // forwarder all recorded and running, a read that still refused would
+        // send `up` to provision a box that is healthy, stopping helpers the
+        // sessions inside are using.
+        assert!(standing);
+    }
+
+    #[test]
+    fn network_is_standing_without_a_forwarder_for_a_database_on_the_host_loopback() {
+        let runtime_root = tempfile::tempdir().unwrap();
+        let sandbox_dir = runtime_root.path().join("sandboxes").join("demo");
+        fs::create_dir_all(&sandbox_dir).unwrap();
+        let _pasta = RecordedStandInPasta::in_sandbox(&sandbox_dir, runtime_root.path());
+        let provider = PastaNetworkProvider::new(runtime_root.path().to_path_buf());
+
+        let standing =
+            provider.standing(&network_spec(EgressPolicy::Open, vec![database_on(5432)]));
+
+        // A database answering on the host's own loopback is reached by pasta's
+        // splice and gets no forwarder of its own, so demanding one would read
+        // every healthy box with a host-installed database as half-built.
+        assert!(standing);
+    }
 }
 
 #[cfg(all(test, feature = "privileged-tests"))]
@@ -1205,6 +1382,63 @@ mod privileged_tests {
         // alongside the proxy, the forwarding would exist only in the posture
         // that has one, and an open sandbox would reach nothing it declared.
         assert!(TcpStream::connect(("127.0.0.1", port)).is_ok());
+        provider.teardown(&spec.name).unwrap();
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+    #[serial]
+    fn network_is_standing_after_provision() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
+        let token = runtime.start_anchor(&spec).unwrap();
+        let provider = sandbox.network();
+        let network = open_network(&spec.name, token.pid.0);
+        provider.provision(&network).unwrap();
+
+        let standing = provider.standing(&network);
+
+        // The read exists to tell a live box that was wired from one that was
+        // not, and this is the half it has to get right on a real pasta: one
+        // that could not recognize the pasta it had just started would send
+        // every `up` of a healthy name back through provisioning.
+        assert!(standing);
+        provider.teardown(&spec.name).unwrap();
+        runtime.teardown(&spec.name).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+    #[serial]
+    fn network_is_not_standing_once_its_pasta_is_killed() {
+        let Some(rootfs) = prepared_rootfs() else { return };
+        let sandbox = ScratchSandbox::new();
+        let runtime = sandbox.runtime();
+        let spec = sandbox.spec(rootfs);
+        let token = runtime.start_anchor(&spec).unwrap();
+        let provider = sandbox.network();
+        let network = open_network(&spec.name, token.pid.0);
+        provider.provision(&network).unwrap();
+        let pasta = recorded_pasta_pid(&sandbox.sandbox_dir());
+        // The arm that already ships: a helper dying under a live box. pasta
+        // handles the signal and leaves cleanly, and its pid file stays behind
+        // naming a process that is gone.
+        let signalled = unsafe { libc::kill(pasta as libc::pid_t, libc::SIGTERM) };
+        assert_eq!(signalled, 0, "pasta could not be signalled, so nothing was killed");
+        assert!(
+            stopped_being_pasta_within_deadline(pasta),
+            "pasta {pasta} was still running {PASTA_DEADLINE:?} after the signal, so the arrangement was not produced"
+        );
+
+        let standing = provider.standing(&network);
+
+        // The anchor still stands, so the kernel's liveness answer is the one a
+        // healthy box gets; this read is the only thing on the machine that can
+        // tell the two apart.
+        assert!(!standing);
         provider.teardown(&spec.name).unwrap();
         runtime.teardown(&spec.name).unwrap();
     }

@@ -105,6 +105,19 @@ pub fn start(sandbox_dir: &Path, policy: &EgressPolicy) -> Result<u16, String> {
     Ok(port)
 }
 
+/// Whether this posture sends the sandbox out through a proxy at all. Only an
+/// allowlist does: the proxy is what holds each connection to the list, and an
+/// open sandbox reaches the host's network directly.
+pub fn required(policy: &EgressPolicy) -> bool {
+    matches!(policy, EgressPolicy::Allowlist(_))
+}
+
+/// Whether the proxy this posture requires is running under `sandbox_dir`, as
+/// the process its pid file recorded. A posture that requires none has it.
+pub fn standing(sandbox_dir: &Path, policy: &EgressPolicy) -> bool {
+    !required(policy) || PROXY.running(sandbox_dir)
+}
+
 /// Stop this sandbox's proxy, if the recorded process is still it. Stopping a
 /// sandbox that never had one is not a failure.
 pub fn stop(sandbox_dir: &Path) -> Result<(), String> {

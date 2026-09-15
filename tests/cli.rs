@@ -8,7 +8,7 @@
 //! owns the name it is built under and takes it down again whatever the test
 //! did.
 
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -1694,6 +1694,34 @@ fn stopped_being_the_watcher_within_deadline(pid: u32) -> bool {
     false
 }
 
+/// Whether the process at `pid` is still a sandbox's pasta, asked the way the
+/// network teardown itself asks it: by the program its command line names,
+/// since a pid outlives the process it named and pasta's pid file outlives pasta.
+fn names_pasta(pid: u32) -> bool {
+    let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else { return false };
+    let program = cmdline.split(|byte| *byte == 0).next().unwrap_or_default();
+    Path::new(OsStr::from_bytes(program)).file_name() == Some(OsStr::new("pasta"))
+}
+
+fn stopped_being_pasta_within_deadline(pid: u32) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if !names_pasta(pid) {
+            return true;
+        }
+        sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+/// The pid this sandbox's pasta recorded itself under, read from the file hort
+/// stops it by.
+fn recorded_pasta_pid(sandbox: &ScratchSandbox) -> u32 {
+    let recorded = fs::read_to_string(sandbox.sandbox_dir().join("pasta.pid"))
+        .expect("the pid file of the sandbox's pasta");
+    recorded.trim().parse().expect("a pid")
+}
+
 #[test]
 #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
 fn cli_a_completion_inside_the_box_is_raised_on_the_host() {
@@ -2555,6 +2583,63 @@ fn cli_up_completes_a_sandbox_whose_up_was_killed_once_its_record_was_written() 
         .success()
         .stdout(predicate::str::contains(format!("{}  live  0  ", sandbox.name().as_str())))
         .stdout(predicate::str::contains(format!("  {}  clean\n", sandbox.name().as_str())));
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_up_brings_the_network_of_a_live_sandbox_back() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", sandbox.name().as_str()])
+        .assert()
+        .success();
+    // The arm that already ships, a helper dying under a live box: pasta
+    // handles the signal and leaves cleanly, its pid file stays behind naming a
+    // process that is gone, and the anchor stands on. The box is live by every
+    // measure the kernel offers and reaches nothing, which is the state an `up`
+    // killed between the anchor and the network leaves without any signal to
+    // pasta at all.
+    let pasta = recorded_pasta_pid(&sandbox);
+    let signalled = unsafe { libc::kill(pasta as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(signalled, 0, "pasta could not be signalled, so nothing was killed");
+    assert!(
+        stopped_being_pasta_within_deadline(pasta),
+        "pasta {pasta} was still running after the signal, so the arrangement was not produced"
+    );
+    let anchor = FileMetadataStore::new(sandbox.state_root())
+        .get(sandbox.name())
+        .unwrap()
+        .expect("up records the sandbox it built")
+        .liveness_token()
+        .expect("up records the anchor it started");
+    assert!(
+        ProcLivenessProbe.is_alive(&anchor),
+        "the anchor did not survive its pasta, so the run below would resume an orphan and not a live box"
+    );
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", sandbox.name().as_str()])
+        .assert()
+        .success();
+
+    // Exit 0 alone is satisfied by a run that refused nothing and wired
+    // nothing; the file hort stops pasta by naming a running pasta again is
+    // what says the box carries traffic once more.
+    let revived = recorded_pasta_pid(&sandbox);
+    assert!(names_pasta(revived), "pasta.pid names {revived}, which is not a running pasta");
 }
 
 /// The file a session writes into the merged root, and the bytes that say the

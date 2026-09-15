@@ -4,11 +4,13 @@
 //! preconditions, and refuses a cache aimed at a path the read-only mount
 //! covering it does not have, all before it takes anything. Then it acquires
 //! the per-name build lock, decides admission against the recorded and live
-//! state, creates or reuses the worktree (or mounts the project folder itself
-//! where there is no git), and persists the metadata record before the
-//! container starts, then records the anchor's liveness token, provisions
-//! networking and starts the watcher that turns a completion written inside the
-//! box into a notification on the host. A failure once the anchor is standing
+//! state and against whether a live box's network is still standing, creates or
+//! reuses the worktree (or mounts the project folder itself where there is no
+//! git), and persists the metadata record before the container starts, then
+//! records the anchor's liveness token, provisions networking and starts the
+//! watcher that turns a completion written inside the box into a notification
+//! on the host. A live box whose network is gone keeps its anchor and gets only
+//! the network built again. A failure once the anchor is standing
 //! undoes the build, stopping the host-side helpers and then the container while
 //! leaving the worktree and the record for the next run. The watcher is the one
 //! step that degrades instead: it warns and the sandbox stays up. Always
@@ -22,7 +24,7 @@ use crate::domain::egress::{
     EgressPolicy, egress_degradation_warning, resolver_drop_in, sandbox_resolver,
 };
 use crate::domain::error::HortError;
-use crate::domain::model::{BranchName, SandboxName, SandboxRecord, Warning};
+use crate::domain::model::{BranchName, LivenessToken, SandboxName, SandboxRecord, Warning};
 use crate::domain::mounts::{
     cache_landing_error, cache_landings, cache_mount_plan, declared_read_only_sources,
     read_only_mount_plan,
@@ -244,7 +246,27 @@ impl UpCommand<'_> {
             }
         };
 
-        if let Some(error) = up_error(&name, false, existing, intent) {
+        // A live record names the anchor its box stands on, and that anchor can
+        // be standing over no network at all: the `up` that started it died
+        // before wiring it, or a helper died under it. The kernel calls both
+        // live, so the provider is asked whether the wiring the posture calls
+        // for is there, and a box missing it is finished rather than refused.
+        let recorded_anchor = match existing {
+            Some(SandboxState::Live) => stored.as_ref().and_then(SandboxRecord::liveness_token),
+            _ => None,
+        };
+        let posture = NetworkPosture::declared(self.config, egress);
+        let anchoring = match recorded_anchor {
+            Some(anchor) => {
+                Anchoring::Recorded { anchor, network: posture.attached_to(&name, &anchor) }
+            }
+            None => Anchoring::Pending(posture),
+        };
+        let network_standing = match &anchoring {
+            Anchoring::Recorded { network, .. } => self.network.standing(network),
+            Anchoring::Pending(_) => true,
+        };
+        if let Some(error) = up_error(&name, false, existing, network_standing, intent) {
             return Err(error);
         }
 
@@ -305,29 +327,33 @@ impl UpCommand<'_> {
             }
         };
 
-        // The posture is read here and nowhere else, because the same address is
-        // what the box's resolver file names and what the network is told to
-        // answer for, and a sandbox whose two halves disagree asks its questions
-        // where nothing is listening.
-        let resolver = sandbox_resolver(&egress);
-
-        let worktree_display = worktree_path.display().to_string();
-        let token = self.runtime.start_anchor(&OciSpec {
-            name: name.clone(),
-            rootfs,
-            overlay: overlay_path,
-            workdir: worktree_path,
-            env: vec![
-                ("HORT_SANDBOX".to_string(), name.as_str().to_string()),
-                ("HORT_WORKTREE".to_string(), worktree_display),
-            ],
-            mounts,
-            drop_ins: stop_hook_drop_ins(self.config)
-                .into_iter()
-                .chain(resolver.as_deref().map(resolver_drop_in))
-                .collect(),
-            resources: limits,
-        })?;
+        let (token, network_spec) = match anchoring {
+            // The anchor is what makes the box live, and it is standing. A second
+            // one would be a second container under the same name, while every
+            // session already inside keeps the namespaces of the first. Only the
+            // network is built, into the namespace of the anchor on record.
+            Anchoring::Recorded { anchor, network } => (anchor, network),
+            Anchoring::Pending(posture) => {
+                let worktree_display = worktree_path.display().to_string();
+                let token = self.runtime.start_anchor(&OciSpec {
+                    name: name.clone(),
+                    rootfs,
+                    overlay: overlay_path,
+                    workdir: worktree_path,
+                    env: vec![
+                        ("HORT_SANDBOX".to_string(), name.as_str().to_string()),
+                        ("HORT_WORKTREE".to_string(), worktree_display),
+                    ],
+                    mounts,
+                    drop_ins: stop_hook_drop_ins(self.config)
+                        .into_iter()
+                        .chain(posture.resolver.as_deref().map(resolver_drop_in))
+                        .collect(),
+                    resources: limits,
+                })?;
+                (token, posture.attached_to(&name, &token))
+            }
+        };
 
         // Past here the anchor is standing, so a failure leaves a container that
         // is alive, reaches nothing and reports itself healthy, which is worse
@@ -335,18 +361,6 @@ impl UpCommand<'_> {
         // remaining steps was the one that broke, and the failure that comes back
         // is the one that caused it rather than anything the undo produced.
         let running = record.with_token(token);
-        let network_spec = NetworkSpec {
-            name: name.clone(),
-            netns: PathBuf::from(format!("/proc/{}/ns/net", token.pid.0)),
-            egress,
-            db_forwards: self
-                .config
-                .network
-                .iter()
-                .map(|database| DbForward { host: database.host.clone(), port: database.port })
-                .collect(),
-            resolver,
-        };
         let built = self.store.put(&running).and_then(|()| self.network.provision(&network_spec));
         if let Err(failure) = built {
             self.rollback(&running);
@@ -406,6 +420,60 @@ impl UpCommand<'_> {
             }
         }
     }
+}
+
+/// A sandbox's network as the configuration describes it, before it is known
+/// which anchor it attaches to. One description serves both the question asked
+/// of a live box and the wiring of whichever anchor the build ends up standing
+/// on, so the two cannot describe different networks.
+struct NetworkPosture {
+    egress: EgressPolicy,
+    db_forwards: Vec<DbForward>,
+    resolver: Option<String>,
+}
+
+impl NetworkPosture {
+    /// The posture is read here and nowhere else, because the same address is
+    /// what the box's resolver file names and what the network is told to
+    /// answer for, and a sandbox whose two halves disagree asks its questions
+    /// where nothing is listening.
+    fn declared(config: &ResolvedConfig, egress: EgressPolicy) -> Self {
+        let resolver = sandbox_resolver(&egress);
+        Self {
+            egress,
+            db_forwards: config
+                .network
+                .iter()
+                .map(|database| DbForward { host: database.host.clone(), port: database.port })
+                .collect(),
+            resolver,
+        }
+    }
+
+    /// The network of the sandbox standing on `anchor`: pasta attaches to the
+    /// anchor's own network namespace, so the path derives from its pid and from
+    /// nothing else, whether the anchor was just started or read off the record.
+    fn attached_to(self, name: &SandboxName, anchor: &LivenessToken) -> NetworkSpec {
+        NetworkSpec {
+            name: name.clone(),
+            netns: PathBuf::from(format!("/proc/{}/ns/net", anchor.pid.0)),
+            egress: self.egress,
+            db_forwards: self.db_forwards,
+            resolver: self.resolver,
+        }
+    }
+}
+
+/// Which anchor the sandbox's network attaches to, as far as the build has
+/// settled it by the time admission is decided.
+enum Anchoring {
+    /// The anchor a live record names, with the network its box should have:
+    /// what admission reads, and what a resume provisions without starting a
+    /// second anchor.
+    Recorded { anchor: LivenessToken, network: NetworkSpec },
+    /// One the build has yet to start, so the network is still waiting for the
+    /// namespace it attaches to.
+    Pending(NetworkPosture),
 }
 
 #[cfg(test)]
@@ -2565,5 +2633,79 @@ mod tests {
         // leave every other witness here green while `up` handed back a sandbox
         // it had just killed.
         assert!(trace.borrow().is_empty());
+    }
+
+    /// A token no record carries, for the runtime to mint: a resume that reached
+    /// `start_anchor` would hand the network this one instead of the record's.
+    fn a_token_no_record_carries() -> LivenessToken {
+        LivenessToken { pid: AnchorPid(9999), mnt_ns: MountNsInode(1111) }
+    }
+
+    #[test]
+    fn up_starts_no_anchor_for_a_live_sandbox_whose_network_is_down() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo").with_token(canned_token())).unwrap();
+        let probe = ScriptedLivenessProbe::new(true);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new()
+            .with_existing_branch("demo")
+            .with_listed_worktree(&SandboxName::new("demo").unwrap());
+        let runtime = FakeRuntime::new(a_token_no_record_carries());
+        let network = FakeNetwork::nothing_standing();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        command
+            .run(SandboxName::new("demo").unwrap(), None)
+            .expect("a live sandbox whose network is down is half-built, and up finishes it");
+
+        // The anchor is what makes the box live, and it is standing. A second
+        // one would be a second container under the same name, joining the
+        // scope of the first, while every session already inside keeps the
+        // namespaces of the old one. What is missing is the network, and only
+        // that is built.
+        assert!(runtime.started_env().is_empty());
+    }
+
+    #[test]
+    fn up_provisions_the_network_of_a_live_sandbox_into_the_namespace_of_its_recorded_anchor() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo").with_token(canned_token())).unwrap();
+        let probe = ScriptedLivenessProbe::new(true);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new()
+            .with_existing_branch("demo")
+            .with_listed_worktree(&SandboxName::new("demo").unwrap());
+        let runtime = FakeRuntime::new(a_token_no_record_carries());
+        let network = FakeNetwork::nothing_standing();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        command
+            .run(SandboxName::new("demo").unwrap(), None)
+            .expect("a live sandbox whose network is down is half-built, and up finishes it");
+
+        // The namespace pasta attaches to is the anchor's, and the anchor here
+        // is the one the record names, never one the runtime would mint: wired
+        // into any other namespace the box looks provisioned from the host and
+        // still resolves nothing from inside, which is the state this resume
+        // exists to end.
+        assert_eq!(network.provisioned_netns(), Some(PathBuf::from("/proc/1234/ns/net")));
     }
 }

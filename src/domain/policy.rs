@@ -1,8 +1,8 @@
 //! Command-admission policy: pure error selection over observed sandbox state.
-//! `up` asks one question, is the same-named anchor alive, and decides which
-//! error to raise (if any) before doing any work. The selection is a pure
-//! function of the reconciled state and the branch intent; the command runs the
-//! effects.
+//! `up` asks two questions, is the same-named anchor alive and is the network
+//! it stands on still there, and decides which error to raise (if any) before
+//! doing any work. The selection is a pure function of the reconciled state,
+//! the network fact and the branch intent; the command runs the effects.
 
 use crate::domain::error::HortError;
 use crate::domain::model::{BranchName, SandboxName};
@@ -24,21 +24,33 @@ pub enum BranchIntent {
 }
 
 /// Select the error `up` must raise before building the sandbox, or `None` to
-/// proceed. Checks run in precedence order: a held lock first, then a colliding
-/// live sandbox of the same name, then the branch target.
+/// proceed. Checks run in precedence order: a held lock first, then a same-named
+/// sandbox that is already whole, then the branch target.
+///
+/// A live sandbox is whole only while its network is standing. One whose anchor
+/// is up and whose helpers are not is half-built, whether the `up` that made it
+/// died before wiring it or a helper died under it, and the kernel's liveness
+/// answer alone cannot tell the two apart. Such a run goes on and finishes the
+/// network. A lost or inconsistent record is refused whatever the network says:
+/// the first hort cannot rebuild from what it has, and the second is missing its
+/// worktree, which no provisioning brings back.
 pub fn up_error(
     name: &SandboxName,
     lock_held: bool,
     existing: Option<SandboxState>,
+    network_standing: bool,
     branch: BranchIntent,
 ) -> Option<HortError> {
     if lock_held {
         return Some(HortError::UpInProgress { name: name.as_str().to_string() });
     }
 
-    if let Some(SandboxState::Live | SandboxState::LostRecord | SandboxState::Inconsistent) =
-        existing
-    {
+    let whole = match existing {
+        Some(SandboxState::Live) => network_standing,
+        Some(SandboxState::LostRecord | SandboxState::Inconsistent) => true,
+        Some(SandboxState::Orphaned) | None => false,
+    };
+    if whole {
         return Some(HortError::DuplicateName { name: name.as_str().to_string() });
     }
 
@@ -68,6 +80,7 @@ mod tests {
             &name,
             false,
             Some(SandboxState::Live),
+            true,
             BranchIntent::CreateNew { branch_taken: false },
         );
 
@@ -82,6 +95,7 @@ mod tests {
             &name,
             false,
             Some(SandboxState::LostRecord),
+            true,
             BranchIntent::CreateNew { branch_taken: false },
         );
 
@@ -96,6 +110,7 @@ mod tests {
             &name,
             false,
             Some(SandboxState::Orphaned),
+            true,
             BranchIntent::CreateNew { branch_taken: false },
         );
 
@@ -106,7 +121,8 @@ mod tests {
     fn up_selects_no_error_when_name_and_branch_are_free() {
         let name = SandboxName::new("demo").unwrap();
 
-        let error = up_error(&name, false, None, BranchIntent::CreateNew { branch_taken: false });
+        let error =
+            up_error(&name, false, None, true, BranchIntent::CreateNew { branch_taken: false });
 
         assert_eq!(error, None);
     }
@@ -115,7 +131,8 @@ mod tests {
     fn up_selects_branch_exists_for_new_branch_collision() {
         let name = SandboxName::new("demo").unwrap();
 
-        let error = up_error(&name, false, None, BranchIntent::CreateNew { branch_taken: true });
+        let error =
+            up_error(&name, false, None, true, BranchIntent::CreateNew { branch_taken: true });
 
         assert_eq!(error, Some(HortError::BranchExists { name: "demo".to_string() }));
     }
@@ -129,6 +146,7 @@ mod tests {
             &name,
             false,
             None,
+            true,
             BranchIntent::UseExisting { branch, checked_out_elsewhere: true },
         );
 
@@ -139,7 +157,7 @@ mod tests {
     fn up_selects_branch_requires_git_for_branch_flag_without_git() {
         let name = SandboxName::new("demo").unwrap();
 
-        let error = up_error(&name, false, None, BranchIntent::NoGit { branch_flag: true });
+        let error = up_error(&name, false, None, true, BranchIntent::NoGit { branch_flag: true });
 
         assert_eq!(error, Some(HortError::BranchRequiresGit));
     }
@@ -153,6 +171,7 @@ mod tests {
             &name,
             false,
             None,
+            true,
             BranchIntent::UseExisting { branch, checked_out_elsewhere: false },
         );
 
@@ -163,7 +182,7 @@ mod tests {
     fn up_selects_no_error_in_no_git_without_branch_flag() {
         let name = SandboxName::new("demo").unwrap();
 
-        let error = up_error(&name, false, None, BranchIntent::NoGit { branch_flag: false });
+        let error = up_error(&name, false, None, true, BranchIntent::NoGit { branch_flag: false });
 
         assert_eq!(error, None);
     }
@@ -176,6 +195,7 @@ mod tests {
             &name,
             true,
             Some(SandboxState::Live),
+            true,
             BranchIntent::CreateNew { branch_taken: false },
         );
 
@@ -190,9 +210,29 @@ mod tests {
             &name,
             false,
             Some(SandboxState::Live),
+            true,
             BranchIntent::CreateNew { branch_taken: true },
         );
 
         assert_eq!(error, Some(HortError::DuplicateName { name: "demo".to_string() }));
+    }
+
+    #[test]
+    fn up_proceeds_when_a_live_sandbox_has_no_network_standing() {
+        let name = SandboxName::new("demo").unwrap();
+
+        let error = up_error(
+            &name,
+            false,
+            Some(SandboxState::Live),
+            false,
+            BranchIntent::CreateNew { branch_taken: false },
+        );
+
+        // The anchor stands and nothing carries its traffic: the box is
+        // half-built, which is what reentrancy exists to finish. Refused as a
+        // duplicate, it stays a live box with no route that only `down` can
+        // reach, and nothing else on the machine can tell it from a healthy one.
+        assert_eq!(error, None);
     }
 }

@@ -4,8 +4,8 @@
 //! A helper outlives the command that started it, so what it is has to be
 //! recognizable later: a pid is reusable, and by the time a sandbox goes down the
 //! process a file names may be something else entirely. So a helper says what it
-//! is in the process table before anything records it, and nothing is signalled
-//! without asking again.
+//! is in the process table before anything records it, and nothing is signalled,
+//! or counted as still running, without asking again.
 //!
 //! A helper is forked rather than executed, and that is what makes the descriptor
 //! sweep load-bearing. `O_CLOEXEC` only protects what execs, so a fork keeps every
@@ -99,9 +99,7 @@ impl HostHelper {
     /// Stop the one this sandbox has running, if the recorded process is still
     /// it. Stopping a sandbox that never had one is not a failure.
     pub fn stop(&self, sandbox_dir: &Path) -> Result<(), String> {
-        let pid_file = self.pid_file_in(sandbox_dir);
-        let recorded = fs::read_to_string(&pid_file).ok().and_then(|pid| pid.trim().parse().ok());
-        let outcome = match recorded {
+        let outcome = match self.recorded(sandbox_dir) {
             // A pid outlives the process it named, so the recorded one is only
             // acted on while it still names what was recorded.
             Some(pid) if self.names(pid) => {
@@ -111,12 +109,23 @@ impl HostHelper {
             }
             _ => Ok(()),
         };
-        let _ = fs::remove_file(&pid_file);
+        let _ = fs::remove_file(self.pid_file_in(sandbox_dir));
         outcome
+    }
+
+    /// Whether the one this sandbox recorded is still running, asked the way
+    /// `stop` asks before it signals: the file names a process, and that process
+    /// still says it is this helper. A sandbox that never had one has none.
+    pub fn running(&self, sandbox_dir: &Path) -> bool {
+        self.recorded(sandbox_dir).is_some_and(|pid| self.names(pid))
     }
 
     fn pid_file_in(&self, sandbox_dir: &Path) -> PathBuf {
         sandbox_dir.join(self.pid_file)
+    }
+
+    fn recorded(&self, sandbox_dir: &Path) -> Option<libc::pid_t> {
+        fs::read_to_string(self.pid_file_in(sandbox_dir)).ok()?.trim().parse().ok()
     }
 
     fn record(&self, sandbox_dir: &Path, pid: libc::pid_t) -> Result<(), String> {

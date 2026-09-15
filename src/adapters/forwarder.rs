@@ -94,12 +94,7 @@ impl BoundForward {
 /// Start this sandbox's database forwarding in a process that outlives this
 /// call, and record what that process is.
 pub fn start(sandbox_dir: &Path, forwards: &[DbForward]) -> Result<(), String> {
-    let needed: Vec<DbForward> = one_database_per_port(forwards)?
-        .into_iter()
-        .filter(|forward| !reached_by_the_splice(forward))
-        .map(|forward| DbForward { host: forward.host.clone(), port: forward.port })
-        .collect();
-
+    let needed = needing_a_forwarder(forwards)?;
     if needed.is_empty() {
         return Ok(());
     }
@@ -109,10 +104,29 @@ pub fn start(sandbox_dir: &Path, forwards: &[DbForward]) -> Result<(), String> {
     FORWARDING.start(sandbox_dir, &kept, || forwarder.serve())
 }
 
+/// Whether the forwarding these declarations require is running under
+/// `sandbox_dir`, as the process its pid file recorded. Declarations that
+/// require none have it; ones that cannot be made sense of do not.
+pub fn standing(sandbox_dir: &Path, forwards: &[DbForward]) -> bool {
+    needing_a_forwarder(forwards)
+        .is_ok_and(|needed| needed.is_empty() || FORWARDING.running(sandbox_dir))
+}
+
 /// Stop this sandbox's forwarding, if the recorded process is still it. Stopping
 /// a sandbox that never had any is not a failure.
 pub fn stop(sandbox_dir: &Path) -> Result<(), String> {
     FORWARDING.stop(sandbox_dir)
+}
+
+/// The declared databases the sandbox reaches only through a listener of hort's
+/// own: one per port, minus those the splice already lands on. The one rule
+/// that decides both whether a forwarder is started and whether one is owed.
+fn needing_a_forwarder(forwards: &[DbForward]) -> Result<Vec<DbForward>, String> {
+    Ok(one_database_per_port(forwards)?
+        .into_iter()
+        .filter(|forward| !reached_by_the_splice(forward))
+        .map(|forward| DbForward { host: forward.host.clone(), port: forward.port })
+        .collect())
 }
 
 /// The declared databases, refusing a port declared for more than one of them.

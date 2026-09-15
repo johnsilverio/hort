@@ -74,6 +74,17 @@ pub trait ContainerRuntime {
 pub trait NetworkProvider {
     /// Wire up egress: pasta always, plus the SNI proxy in allowlist mode.
     fn provision(&self, spec: &NetworkSpec) -> Result<(), HortError>;
+    /// Whether the egress this sandbox should have is standing: every host-side
+    /// helper the posture in `spec` requires is alive and is still the process
+    /// its pid file recorded. pasta always, the proxy only under an allowlist,
+    /// the forwarder only for a declared database the splice does not reach.
+    ///
+    /// This is what tells a live sandbox that was never wired, or whose helpers
+    /// died under it, from a healthy one: the anchor stands either way, so the
+    /// kernel's liveness answer cannot. An unanswerable read is not standing,
+    /// which is the safe direction, since provisioning again is idempotent and
+    /// starts by stopping whatever the name still has.
+    fn standing(&self, spec: &NetworkSpec) -> bool;
     /// Stop pasta and, if running, the proxy for this sandbox.
     fn teardown(&self, name: &SandboxName) -> Result<(), HortError>;
 }
