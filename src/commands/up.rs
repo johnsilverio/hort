@@ -238,7 +238,15 @@ impl UpCommand<'_> {
                 (BranchIntent::CreateNew { branch_taken }, Some(own_branch))
             }
             (true, Some(target)) => {
-                let checked_out_elsewhere = self.worktrees.is_checked_out(target)?;
+                // Asked of the worktree git reports and never of `own` or the
+                // record: owning a half-built box says nothing about which
+                // branch its worktree holds, and a checkout made on the host
+                // inside that worktree moves the branch without the record.
+                let checked_out_elsewhere = self
+                    .worktrees
+                    .checked_out_at(target)?
+                    .iter()
+                    .any(|holder| *holder != worktree_path);
                 (
                     BranchIntent::UseExisting { branch: target.clone(), checked_out_elsewhere },
                     Some(target.clone()),
@@ -2707,5 +2715,150 @@ mod tests {
         // still resolves nothing from inside, which is the state this resume
         // exists to end.
         assert_eq!(network.provisioned_netns(), Some(PathBuf::from("/proc/1234/ns/net")));
+    }
+
+    /// The record of a sandbox built on an existing branch, as `up` writes it.
+    fn record_built_on(name: &str, branch: &str) -> SandboxRecord {
+        SandboxRecord::new(
+            SandboxName::new(name).unwrap(),
+            Some(BranchName::new(branch).unwrap()),
+            PathBuf::from(format!("/state/sandboxes/{name}/worktree-{name}")),
+            PathBuf::from(format!("/state/sandboxes/{name}/overlay")),
+            "2026-06-11T12:00:00Z".to_string(),
+            "2026-06-11T12:00:00Z".to_string(),
+            None,
+            PathBuf::from("/project"),
+        )
+    }
+
+    #[test]
+    fn up_resumes_an_orphaned_sandbox_on_the_branch_its_own_worktree_holds() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        store.put(&record_built_on("demo", "feature")).unwrap();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new()
+            .with_existing_branch("feature")
+            .with_listed_worktree(&SandboxName::new("demo").unwrap())
+            .with_branch_checked_out_in("feature", &SandboxName::new("demo").unwrap());
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        let result = command
+            .run(SandboxName::new("demo").unwrap(), Some(BranchName::new("feature").unwrap()));
+
+        // The worktree holding the branch is the one this resume reuses, so it
+        // is not another worktree, and the repeated command is the one a user
+        // types after a reboot.
+        assert_eq!(result, Ok(Vec::new()));
+        let persisted = store.get(&SandboxName::new("demo").unwrap()).unwrap();
+        assert_eq!(persisted.unwrap().liveness_token(), Some(canned_token()));
+    }
+
+    #[test]
+    fn up_finishes_a_live_sandbox_whose_network_is_down_on_the_branch_its_own_worktree_holds() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        store.put(&record_built_on("demo", "feature").with_token(canned_token())).unwrap();
+        let probe = ScriptedLivenessProbe::new(true);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new()
+            .with_existing_branch("feature")
+            .with_listed_worktree(&SandboxName::new("demo").unwrap())
+            .with_branch_checked_out_in("feature", &SandboxName::new("demo").unwrap());
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::nothing_standing();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        let result = command
+            .run(SandboxName::new("demo").unwrap(), Some(BranchName::new("feature").unwrap()));
+
+        assert_eq!(result, Ok(Vec::new()));
+        assert_eq!(network.provisioned_netns(), Some(PathBuf::from("/proc/1234/ns/net")));
+    }
+
+    #[test]
+    fn up_resumes_on_the_branch_the_host_checked_out_in_the_sandbox_worktree() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        store.put(&record_built_on("demo", "feature")).unwrap();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        // Git is a host activity: a checkout made on the host in the worktree
+        // moves what the worktree holds and leaves the record naming the branch
+        // the sandbox was built with.
+        let worktrees = FakeWorktreeProvider::new()
+            .with_existing_branch("feature")
+            .with_existing_branch("other")
+            .with_listed_worktree(&SandboxName::new("demo").unwrap())
+            .with_branch_checked_out_in("other", &SandboxName::new("demo").unwrap());
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        let result =
+            command.run(SandboxName::new("demo").unwrap(), Some(BranchName::new("other").unwrap()));
+
+        assert_eq!(result, Ok(Vec::new()));
+    }
+
+    #[test]
+    fn up_refuses_to_resume_a_half_built_sandbox_on_a_branch_checked_out_in_the_main_checkout() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        store.put(&record_built_on("demo", "feature")).unwrap();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new()
+            .with_existing_branch("feature")
+            .with_existing_branch("main")
+            .with_listed_worktree(&SandboxName::new("demo").unwrap())
+            .with_branch_checked_out_in("feature", &SandboxName::new("demo").unwrap())
+            .with_checked_out_branch("main");
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        let result =
+            command.run(SandboxName::new("demo").unwrap(), Some(BranchName::new("main").unwrap()));
+
+        // Owning a half-built sandbox says nothing about which branch it holds:
+        // the worktree holding this one is somebody else's, and resuming would
+        // put the box on a branch nothing checked out for it.
+        assert_eq!(result, Err(HortError::BranchCheckedOut { branch: "main".to_string() }));
     }
 }

@@ -665,7 +665,7 @@ pub struct FakeWorktreeProvider {
     creates: RefCell<Vec<BranchName>>,
     is_git_repo: bool,
     existing_branches: Vec<BranchName>,
-    checked_out_branches: Vec<BranchName>,
+    checked_out_branches: Vec<(BranchName, PathBuf)>,
     dirty_worktrees: Vec<SandboxName>,
     failing_dirty_probes: Vec<SandboxName>,
     prune_stale_calls: RefCell<usize>,
@@ -706,9 +706,19 @@ impl FakeWorktreeProvider {
         self
     }
 
-    /// Script a branch as checked out in some worktree.
+    /// Script a branch as checked out in a worktree no sandbox owns, the main
+    /// checkout of the project.
     pub fn with_checked_out_branch(mut self, branch: &str) -> Self {
-        self.checked_out_branches.push(BranchName::new(branch).unwrap());
+        self.checked_out_branches.push((BranchName::new(branch).unwrap(), fake_main_checkout()));
+        self
+    }
+
+    /// Script a branch as checked out in the canonical worktree of `name`, which
+    /// is where a sandbox built with that branch holds it, and where the host
+    /// leaves it after checking another branch out in that worktree.
+    pub fn with_branch_checked_out_in(mut self, branch: &str, name: &SandboxName) -> Self {
+        self.checked_out_branches
+            .push((BranchName::new(branch).unwrap(), fake_worktree_path(name)));
         self
     }
 
@@ -795,8 +805,13 @@ impl WorktreeProvider for FakeWorktreeProvider {
         Ok(self.existing_branches.contains(branch))
     }
 
-    fn is_checked_out(&self, branch: &BranchName) -> Result<bool, HortError> {
-        Ok(self.checked_out_branches.contains(branch))
+    fn checked_out_at(&self, branch: &BranchName) -> Result<Vec<PathBuf>, HortError> {
+        Ok(self
+            .checked_out_branches
+            .iter()
+            .filter(|(held, _)| held == branch)
+            .map(|(_, path)| path.clone())
+            .collect())
     }
 
     fn is_dirty(&self, name: &SandboxName) -> Result<bool, HortError> {
@@ -814,6 +829,11 @@ impl WorktreeProvider for FakeWorktreeProvider {
         *self.prune_stale_calls.borrow_mut() += 1;
         Ok(())
     }
+}
+
+/// The project's own checkout, the one worktree that belongs to no sandbox.
+fn fake_main_checkout() -> PathBuf {
+    PathBuf::from("/project")
 }
 
 fn fake_worktree_path(name: &SandboxName) -> PathBuf {

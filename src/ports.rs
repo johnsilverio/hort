@@ -150,9 +150,12 @@ pub trait WorktreeProvider {
     fn is_git_repo(&self) -> Result<bool, HortError>;
     /// Whether a branch of this name already exists in the repository.
     fn branch_exists(&self, branch: &BranchName) -> Result<bool, HortError>;
-    /// Whether this branch is checked out in any worktree, the main checkout
-    /// included.
-    fn is_checked_out(&self, branch: &BranchName) -> Result<bool, HortError>;
+    /// Where this branch is checked out: the path of every worktree git reports
+    /// holding it, the main checkout included, in the order git lists them. An
+    /// empty list means no worktree holds it. Whether a holder is somebody
+    /// else's is the caller's question, because only the caller knows which
+    /// worktree it is standing on.
+    fn checked_out_at(&self, branch: &BranchName) -> Result<Vec<PathBuf>, HortError>;
     /// Whether this sandbox's worktree has uncommitted changes; untracked files
     /// count. The first behavioral consumer is `prune`.
     fn is_dirty(&self, name: &SandboxName) -> Result<bool, HortError>;

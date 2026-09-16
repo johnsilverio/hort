@@ -63,15 +63,16 @@ impl WorktreeProvider for GitWorktreeProvider {
     fn remove(&self, name: &SandboxName) -> Result<(), HortError> {
         let path = self.worktree_path(name);
         let porcelain = run(&self.repo_dir, "worktree list", &["worktree", "list", "--porcelain"])?;
-        if !parse_worktree_paths(&porcelain).into_iter().any(|listed| listed == path) {
+        let records = parse_worktree_records(&porcelain);
+        let Some(record) = records.iter().find(|record| record.path == path) else {
             return Ok(());
-        }
+        };
         // git refuses to remove a working tree whose `.git` pointer was deleted
         // under it, so sweeping the registration is the only route that collects
         // such an entry. Which state it is in is git's own verdict, already
         // carried by the listing read above, rather than a rule re-derived here
         // from the pointer file.
-        if path.exists() && !is_prunable(&porcelain, &path) {
+        if path.exists() && !record.is_prunable() {
             let path_arg = path.to_string_lossy();
             run(
                 &self.repo_dir,
@@ -86,8 +87,9 @@ impl WorktreeProvider for GitWorktreeProvider {
 
     fn list(&self) -> Result<Vec<Worktree>, HortError> {
         let porcelain = run(&self.repo_dir, "worktree list", &["worktree", "list", "--porcelain"])?;
-        Ok(parse_worktree_paths(&porcelain)
+        Ok(parse_worktree_records(&porcelain)
             .into_iter()
+            .map(|record| record.path)
             .filter(|path| path.exists())
             .map(|path| Worktree { path })
             .collect())
@@ -109,10 +111,13 @@ impl WorktreeProvider for GitWorktreeProvider {
         Ok(output.status.success())
     }
 
-    fn is_checked_out(&self, branch: &BranchName) -> Result<bool, HortError> {
+    fn checked_out_at(&self, branch: &BranchName) -> Result<Vec<PathBuf>, HortError> {
         let porcelain = run(&self.repo_dir, "worktree list", &["worktree", "list", "--porcelain"])?;
-        let checked_out = format!("branch refs/heads/{}", branch.as_str());
-        Ok(porcelain.lines().any(|line| line == checked_out))
+        Ok(parse_worktree_records(&porcelain)
+            .into_iter()
+            .filter(|record| record.holds(branch))
+            .map(|record| record.path)
+            .collect())
     }
 
     fn is_dirty(&self, name: &SandboxName) -> Result<bool, HortError> {
@@ -150,27 +155,41 @@ fn run(dir: &Path, op: &str, args: &[&str]) -> Result<String, HortError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// The host paths of every worktree in `git worktree list --porcelain` output,
-/// in listed order and unfiltered: each record opens with a `worktree <path>`
-/// line, the main checkout included.
-fn parse_worktree_paths(porcelain: &str) -> Vec<PathBuf> {
-    porcelain.lines().filter_map(|line| line.strip_prefix("worktree ")).map(PathBuf::from).collect()
+/// One worktree as `git worktree list --porcelain` reports it: the host path on
+/// the `worktree <path>` line that opens the record, and the attribute lines
+/// that follow it up to the next record.
+struct WorktreeRecord<'a> {
+    path: PathBuf,
+    attributes: Vec<&'a str>,
 }
 
-/// Whether `git worktree list --porcelain` marks the record for `path` prunable,
-/// which is git's own name for an entry `git worktree prune` collects. The marker
-/// is a label that may carry a reason and belongs to the record it appears in,
-/// each of which opens with its own `worktree <path>` line.
-fn is_prunable(porcelain: &str, path: &Path) -> bool {
-    let mut in_record = false;
+impl WorktreeRecord<'_> {
+    /// Whether git marks this worktree prunable, its own name for an entry
+    /// `git worktree prune` collects. The marker may carry a reason.
+    fn is_prunable(&self) -> bool {
+        self.attributes.iter().any(|line| *line == "prunable" || line.starts_with("prunable "))
+    }
+
+    /// Whether this worktree has `branch` checked out. The whole line is matched,
+    /// because a branch whose name only starts with this one is a different branch.
+    fn holds(&self, branch: &BranchName) -> bool {
+        let checked_out = format!("branch refs/heads/{}", branch.as_str());
+        self.attributes.iter().any(|line| *line == checked_out)
+    }
+}
+
+/// Every worktree record in `git worktree list --porcelain` output, in listed
+/// order and unfiltered, the main checkout included.
+fn parse_worktree_records(porcelain: &str) -> Vec<WorktreeRecord<'_>> {
+    let mut records: Vec<WorktreeRecord<'_>> = Vec::new();
     for line in porcelain.lines() {
         if let Some(listed) = line.strip_prefix("worktree ") {
-            in_record = Path::new(listed) == path;
-        } else if in_record && (line == "prunable" || line.starts_with("prunable ")) {
-            return true;
+            records.push(WorktreeRecord { path: PathBuf::from(listed), attributes: Vec::new() });
+        } else if let Some(record) = records.last_mut() {
+            record.attributes.push(line);
         }
     }
-    false
+    records
 }
 
 #[cfg(test)]
@@ -533,24 +552,54 @@ mod tests {
     }
 
     #[test]
-    fn git_worktree_is_checked_out_detects_branch_in_main_checkout() {
-        let (_repo, repo) = temp_dir();
-        let (_state, state_root) = temp_dir();
-        init_repo_with_commit(&repo);
-        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
-
-        assert!(provider.is_checked_out(&BranchName::new("main").unwrap()).unwrap());
-    }
-
-    #[test]
-    fn git_worktree_is_checked_out_reports_false_for_unchecked_branch() {
+    fn git_worktree_reports_a_branch_checked_out_in_a_sandbox_worktree_at_that_worktree() {
         let (_repo, repo) = temp_dir();
         let (_state, state_root) = temp_dir();
         init_repo_with_commit(&repo);
         git(&repo, &["branch", "feature-x"]);
         let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("work").unwrap();
+        provider.create(&name, &BranchName::new("feature-x").unwrap()).unwrap();
 
-        assert!(!provider.is_checked_out(&BranchName::new("feature-x").unwrap()).unwrap());
+        let holders = provider.checked_out_at(&BranchName::new("feature-x").unwrap()).unwrap();
+
+        // Spelled the way the sandbox's own worktree path is derived, because a
+        // caller tells its own worktree from another one by comparing the two.
+        assert_eq!(holders, vec![canonical_worktree(&state_root, &name)]);
+    }
+
+    #[test]
+    fn git_worktree_reports_a_branch_checked_out_in_the_main_checkout_at_the_repository() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        provider
+            .create(&SandboxName::new("work").unwrap(), &BranchName::new("feature-x").unwrap())
+            .unwrap();
+
+        let holders = provider.checked_out_at(&BranchName::new("main").unwrap()).unwrap();
+
+        assert_eq!(holders, vec![repo]);
+    }
+
+    #[test]
+    fn git_worktree_reports_no_worktree_for_a_branch_no_worktree_holds() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        git(&repo, &["branch", "feature"]);
+        git(&repo, &["branch", "feature-x"]);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        // A branch whose name the held one starts with, so that answering by
+        // the start of a name reads a free branch as taken.
+        provider
+            .create(&SandboxName::new("work").unwrap(), &BranchName::new("feature-x").unwrap())
+            .unwrap();
+
+        let holders = provider.checked_out_at(&BranchName::new("feature").unwrap()).unwrap();
+
+        assert_eq!(holders, Vec::<PathBuf>::new());
     }
 
     #[test]
