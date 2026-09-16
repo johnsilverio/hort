@@ -10,7 +10,9 @@
 //! records the anchor's liveness token, provisions networking and starts the
 //! watcher that turns a completion written inside the box into a notification
 //! on the host. A live box whose network is gone keeps its anchor and gets only
-//! the network built again. A failure once the anchor is standing
+//! the network built again, while a box whose anchor died first has whatever
+//! it left running stopped, helpers and then container, before a new anchor is
+//! built. A failure once the anchor is standing
 //! undoes the build, stopping the host-side helpers and then the container while
 //! leaving the worktree and the record for the next run. The watcher is the one
 //! step that degrades instead: it warns and the sandbox stays up. Always
@@ -342,6 +344,15 @@ impl UpCommand<'_> {
             // network is built, into the namespace of the anchor on record.
             Anchoring::Recorded { anchor, network } => (anchor, network),
             Anchoring::Pending(posture) => {
+                // An anchor killed outright takes nothing on the host with it:
+                // its helpers stay attached and the runtime keeps its container
+                // under this name, refusing to build that name again. A reboot
+                // wipes both, and collecting them here makes a kill complete
+                // the same way. Nothing is running for a box that never had an
+                // anchor, which is why the stop is harmless there.
+                if existing == Some(SandboxState::Orphaned) {
+                    self.stop_up_to_container(&record);
+                }
                 let worktree_display = worktree_path.display().to_string();
                 let token = self.runtime.start_anchor(&OciSpec {
                     name: name.clone(),
@@ -371,7 +382,7 @@ impl UpCommand<'_> {
         let running = record.with_token(token);
         let built = self.store.put(&running).and_then(|()| self.network.provision(&network_spec));
         if let Err(failure) = built {
-            self.rollback(&running);
+            self.stop_up_to_container(&running);
             return Err(failure);
         }
 
@@ -403,13 +414,15 @@ impl UpCommand<'_> {
         self.config.notifications.as_ref().and_then(|sink| sink.message.as_deref())
     }
 
-    /// Undo a build that failed with its anchor already standing: the mandatory
-    /// teardown order truncated at the container, so the helpers stop before the
-    /// namespace they are attached to. Every step is attempted whatever the one
-    /// before it did, because a helper that will not die is exactly the
-    /// arrangement where giving up early leaves the container standing. What it
-    /// cannot stop is left to `ls` and `prune`, like any other orphan.
-    fn rollback(&self, record: &SandboxRecord) {
+    /// Stop what a sandbox has running, in the mandatory teardown order truncated
+    /// at the container, so the helpers stop before the namespace they are
+    /// attached to. It undoes a build that failed with its anchor already
+    /// standing, and it collects what a dead anchor left before a resume builds
+    /// another. Every step is attempted whatever the one before it did, because a
+    /// helper that will not die is exactly the arrangement where giving up early
+    /// leaves the container standing. What it cannot stop is left to `ls` and
+    /// `prune`, like any other orphan.
+    fn stop_up_to_container(&self, record: &SandboxRecord) {
         for step in rollback_plan(record) {
             match step {
                 TeardownStep::StopWatcher => {
@@ -2860,5 +2873,80 @@ mod tests {
         // the worktree holding this one is somebody else's, and resuming would
         // put the box on a branch nothing checked out for it.
         assert_eq!(result, Err(HortError::BranchCheckedOut { branch: "main".to_string() }));
+    }
+
+    #[test]
+    fn up_completes_an_orphaned_sandbox_whose_container_state_outlived_its_anchor() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo").with_token(canned_token())).unwrap();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new()
+            .with_existing_branch("demo")
+            .with_listed_worktree(&SandboxName::new("demo").unwrap());
+        let runtime = FakeRuntime::new(a_token_no_record_carries()).with_stale_container_state();
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        let result = command.run(SandboxName::new("demo").unwrap(), None);
+
+        // An anchor killed outright leaves the runtime holding its container
+        // under this name, and a runtime refuses to build a name it holds. A
+        // reboot wipes that state and the same run completes, so what is left of
+        // the dead box is collected before the build rather than refused over.
+        assert_eq!(result, Ok(Vec::new()));
+        let persisted = store.get(&SandboxName::new("demo").unwrap()).unwrap();
+        assert_eq!(persisted.unwrap().liveness_token(), Some(a_token_no_record_carries()));
+    }
+
+    #[test]
+    fn up_collects_what_an_orphaned_sandbox_left_in_the_teardown_order_up_to_its_container() {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new().with_trace(trace.clone());
+        store.put(&sample_record("demo").with_token(canned_token())).unwrap();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new()
+            .with_existing_branch("demo")
+            .with_listed_worktree(&SandboxName::new("demo").unwrap())
+            .with_trace(trace.clone());
+        let runtime = FakeRuntime::new(a_token_no_record_carries())
+            .with_stale_container_state()
+            .with_trace(trace.clone());
+        let network = FakeNetwork::new().with_trace(trace.clone());
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new().with_trace(trace.clone());
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        let _ = command.run(SandboxName::new("demo").unwrap(), None);
+
+        // A killed anchor takes nothing on the host with it: its pasta is still
+        // attached, so the helpers go before the container the same way they do
+        // in a teardown. The collection stops there, because the worktree can
+        // hold work and the record is what this very run is completing.
+        assert_eq!(
+            *trace.borrow(),
+            vec![
+                "notify.teardown".to_string(),
+                "network.teardown".to_string(),
+                "runtime.teardown".to_string()
+            ]
+        );
     }
 }

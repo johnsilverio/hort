@@ -2585,6 +2585,81 @@ fn cli_up_completes_a_sandbox_whose_up_was_killed_once_its_record_was_written() 
         .stdout(predicate::str::contains(format!("  {}  clean\n", sandbox.name().as_str())));
 }
 
+/// Whether the anchor `anchor` names stopped being alive, asked the way hort's
+/// own reconciliation asks it, within a deadline a killed process has no reason
+/// to need.
+fn stopped_being_the_anchor_within_deadline(anchor: &LivenessToken) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if !ProcLivenessProbe.is_alive(anchor) {
+            return true;
+        }
+        sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_up_completes_a_sandbox_whose_anchor_was_killed() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", sandbox.name().as_str()])
+        .assert()
+        .success();
+    let anchor = FileMetadataStore::new(sandbox.state_root())
+        .get(sandbox.name())
+        .unwrap()
+        .expect("up records the sandbox it built")
+        .liveness_token()
+        .expect("up records the anchor it started");
+    let signalled = unsafe { libc::kill(anchor.pid.0 as libc::pid_t, libc::SIGKILL) };
+    assert_eq!(signalled, 0, "the anchor could not be signalled, so nothing was killed");
+    assert!(
+        stopped_being_the_anchor_within_deadline(&anchor),
+        "the anchor was still alive after the kill, so the run below would meet a live box"
+    );
+    // What separates this from the box a reboot leaves: the runtime root is
+    // wiped by a reboot and survives a kill, so a run that found it gone would
+    // be completing the easier arrangement and saying nothing about this one.
+    assert!(
+        sandbox.runtime_root().join("containers").join(sandbox.name().as_str()).is_dir(),
+        "the runtime kept no state of the killed container, so this is not the arrangement a kill leaves"
+    );
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", sandbox.name().as_str()])
+        .assert()
+        .success();
+
+    // Exit 0 alone is satisfied by a run that refused nothing and built
+    // nothing; the listing is what says the box the killed anchor left behind
+    // is standing again.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .arg("ls")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("{}  live  0  ", sandbox.name().as_str())));
+}
+
 #[test]
 #[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
 fn cli_up_brings_the_network_of_a_live_sandbox_back() {

@@ -5,7 +5,7 @@
 // command tasks that come next, so they read as unused until then.
 #![allow(dead_code)]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -119,6 +119,7 @@ pub struct FakeRuntime {
     token: LivenessToken,
     start_fails: bool,
     container_state: bool,
+    stale_state: Cell<bool>,
     started_env: RefCell<Vec<(String, String)>>,
     started_rootfs: RefCell<PathBuf>,
     started_workdir: RefCell<PathBuf>,
@@ -139,6 +140,7 @@ impl FakeRuntime {
             token,
             start_fails: false,
             container_state: true,
+            stale_state: Cell::new(false),
             started_env: RefCell::new(Vec::new()),
             started_rootfs: RefCell::new(PathBuf::new()),
             started_workdir: RefCell::new(PathBuf::new()),
@@ -167,6 +169,16 @@ impl FakeRuntime {
     /// failed would never record.
     pub fn without_container_state(mut self) -> Self {
         self.container_state = false;
+        self
+    }
+
+    /// A runtime still holding the state of a container whose anchor died
+    /// without a teardown, which is what a killed anchor leaves under a runtime
+    /// root that no reboot has wiped. Like the real runtime it refuses to build
+    /// a container under that name again, and it keeps refusing until a
+    /// teardown collects the state.
+    pub fn with_stale_container_state(self) -> Self {
+        self.stale_state.set(true);
         self
     }
 
@@ -260,6 +272,12 @@ impl ContainerRuntime for FakeRuntime {
                 detail: "fake runtime: start_anchor scripted to fail".to_string(),
             });
         }
+        if self.stale_state.get() {
+            return Err(HortError::ContainerRuntimeFailed {
+                detail: "start_anchor: building the container: container already exists"
+                    .to_string(),
+            });
+        }
         Ok(self.token)
     }
 
@@ -282,6 +300,7 @@ impl ContainerRuntime for FakeRuntime {
 
     fn teardown(&self, name: &SandboxName) -> Result<(), HortError> {
         self.teardowns.borrow_mut().push(name.clone());
+        self.stale_state.set(false);
         if let Some(trace) = &self.trace {
             trace.borrow_mut().push("runtime.teardown".to_string());
         }
