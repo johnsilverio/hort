@@ -50,7 +50,7 @@ That single change is what makes the rest possible:
 
 **It's quick to start and trivial to install.** hort is one static binary, written in Rust, that you drop into `~/.local/bin`. There's no daemon to reach and no image to pull, because you bring a prepared root filesystem, so a box comes up fast.
 
-**Your repository is never on the line.** The real `.git` stays on the host. The agent only ever sees a throwaway worktree on its own branch, so the worst a bad command can do is ruin a scratch branch. Capabilities are dropped and the container user isn't root, so `sudo` inside gets you nothing.
+**Your repository is never on the line.** The real `.git` stays on the host. The agent only ever sees a throwaway worktree on its own branch, so the worst a bad command can do is ruin a scratch branch. Inside, your session is root of its own user namespace, mapped to your own unprivileged user on the host and holding no capabilities, so being root in there buys nothing on the machine.
 
 <br>
 
@@ -83,7 +83,7 @@ Inside, you run agents however you already do: `claude`, `aider`, `gemini`, what
 
 Linux only; the isolation is built directly on Linux kernel features, and running on a VPS over SSH is a first-class case rather than an afterthought. macOS is out of scope.
 
-You need unprivileged user namespaces enabled, [`pasta`](https://passt.top/) on your `PATH`, and optionally git (without it you lose per-branch worktrees but keep full container isolation). You also bring a base root filesystem with your agents baked in; hort runs it, it doesn't build it for you.
+You need unprivileged user namespaces enabled, and [`pasta`](https://passt.top/) and `git` on your `PATH`. The project itself doesn't have to be a git repository: if the directory you run hort from, or one above it, holds a `.hort.json` or a `.devcontainer/devcontainer.json`, the folder holding it gets a box too, mounted directly, so you keep full container isolation but lose per-branch worktrees. You also bring a base root filesystem with your agents baked in; hort runs it, it doesn't build it for you. [`example.Dockerfile`](./example.Dockerfile) shows how to make one. Inside the box your session is root of its own user namespace, so an agent that refuses to run as root needs its sandbox setting in that filesystem (for Claude Code, `IS_SANDBOX=1`).
 
 <br>
 
