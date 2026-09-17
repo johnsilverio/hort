@@ -45,6 +45,10 @@ pub enum HortError {
     BranchCheckedOut { branch: String },
     /// `up`: `--branch` named a branch that does not exist.
     BranchDoesNotExist { branch: String, name: String },
+    /// `up`: a half-built sandbox is being completed, and `--branch` named a free
+    /// branch other than the one the sandbox's worktree holds. Completing it
+    /// would leave the sandbox on a branch the user did not ask for.
+    SandboxHoldsAnotherBranch { name: String, held: String, requested: String },
     /// `up`: another invocation for this name is already in progress.
     UpInProgress { name: String },
     /// `up`: a branch flag was given in a project that is not a git repository.
@@ -198,6 +202,10 @@ impl fmt::Display for HortError {
                 f,
                 "branch '{branch}' does not exist; create it first or omit --branch to create a new branch named '{name}'"
             ),
+            HortError::SandboxHoldsAnotherBranch { name, held, requested } => write!(
+                f,
+                "sandbox '{name}' holds branch '{held}', not '{requested}' — run 'hort down {name}' first, then 'hort up {name} --branch {requested}'"
+            ),
             HortError::UpInProgress { name } => {
                 write!(f, "another 'hort up {name}' is already in progress")
             }
@@ -347,6 +355,20 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "branch 'feature-x' does not exist; create it first or omit --branch to create a new branch named 'demo'"
+        );
+    }
+
+    #[test]
+    fn sandbox_holds_another_branch_error_names_the_way_out() {
+        let error = HortError::SandboxHoldsAnotherBranch {
+            name: "demo".to_string(),
+            held: "feature".to_string(),
+            requested: "other".to_string(),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "sandbox 'demo' holds branch 'feature', not 'other' — run 'hort down demo' first, then 'hort up demo --branch other'"
         );
     }
 

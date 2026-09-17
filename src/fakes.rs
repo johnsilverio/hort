@@ -675,7 +675,8 @@ impl EnvironmentProbe for FakeCapabilities {
 
 /// Tracks the worktrees it created so `list` reflects `create`/`remove` without
 /// touching git, records the branch of each `create`, and answers the read-side
-/// observations (git or not, which branches exist, which are checked out) from
+/// observations (git or not, which branches exist, which worktree holds which
+/// branch) from
 /// scripted state. `new` is a fresh git repository with no branches or
 /// worktrees; the builder methods layer scripted state on top.
 pub struct FakeWorktreeProvider {
@@ -831,6 +832,14 @@ impl WorktreeProvider for FakeWorktreeProvider {
             .filter(|(held, _)| held == branch)
             .map(|(_, path)| path.clone())
             .collect())
+    }
+
+    fn branch_held_at(&self, path: &Path) -> Result<Option<BranchName>, HortError> {
+        Ok(self
+            .checked_out_branches
+            .iter()
+            .find(|(_, holder)| holder == path)
+            .map(|(branch, _)| branch.clone()))
     }
 
     fn is_dirty(&self, name: &SandboxName) -> Result<bool, HortError> {

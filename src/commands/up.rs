@@ -292,6 +292,21 @@ impl UpCommand<'_> {
             });
         }
 
+        // A resume reuses the worktree as it stands, so a branch flag naming
+        // another branch would finish the sandbox on one nobody asked for. Which
+        // branch it holds is asked of git, because a checkout made on the host
+        // inside the worktree moves it without the record.
+        if let Some(requested) = &branch
+            && let Some(held) = self.worktrees.branch_held_at(&worktree_path)?
+            && held != *requested
+        {
+            return Err(HortError::SandboxHoldsAnotherBranch {
+                name: name.as_str().to_string(),
+                held: held.as_str().to_string(),
+                requested: requested.as_str().to_string(),
+            });
+        }
+
         if let Some(target) = &branch_to_checkout
             && !worktree_listed
         {
@@ -2873,6 +2888,121 @@ mod tests {
         // the worktree holding this one is somebody else's, and resuming would
         // put the box on a branch nothing checked out for it.
         assert_eq!(result, Err(HortError::BranchCheckedOut { branch: "main".to_string() }));
+    }
+
+    #[test]
+    fn up_refuses_to_resume_a_half_built_sandbox_on_a_free_branch_its_worktree_does_not_hold() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        store.put(&record_built_on("demo", "feature")).unwrap();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new()
+            .with_existing_branch("feature")
+            .with_existing_branch("other")
+            .with_listed_worktree(&SandboxName::new("demo").unwrap())
+            .with_branch_checked_out_in("feature", &SandboxName::new("demo").unwrap());
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        let result =
+            command.run(SandboxName::new("demo").unwrap(), Some(BranchName::new("other").unwrap()));
+
+        // A resume reuses the worktree as it stands, so completing it would
+        // leave the sandbox on a branch the user did not ask for while the
+        // command they typed reads as if it had been honoured.
+        assert_eq!(
+            result,
+            Err(HortError::SandboxHoldsAnotherBranch {
+                name: "demo".to_string(),
+                held: "feature".to_string(),
+                requested: "other".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn up_refuses_another_branch_before_stopping_what_an_orphaned_sandbox_left() {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        store.put(&record_built_on("demo", "feature").with_token(canned_token())).unwrap();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new()
+            .with_existing_branch("feature")
+            .with_existing_branch("other")
+            .with_listed_worktree(&SandboxName::new("demo").unwrap())
+            .with_branch_checked_out_in("feature", &SandboxName::new("demo").unwrap());
+        let runtime = FakeRuntime::new(canned_token()).with_trace(trace.clone());
+        let network = FakeNetwork::new().with_trace(trace.clone());
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new().with_trace(trace.clone());
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        let _ =
+            command.run(SandboxName::new("demo").unwrap(), Some(BranchName::new("other").unwrap()));
+
+        // Resuming an orphan first stops whatever its dead anchor left running.
+        // A refusal is a precondition, so it comes before that: refusing after
+        // the collection would take down what is left of the box for nothing.
+        assert_eq!(*trace.borrow(), Vec::<String>::new());
+        assert!(network.provisioned().is_empty());
+    }
+
+    #[test]
+    fn up_names_the_branch_the_host_checked_out_in_the_sandbox_worktree_when_it_refuses_another() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        store.put(&record_built_on("demo", "feature").with_token(canned_token())).unwrap();
+        let probe = ScriptedLivenessProbe::new(true);
+        let registry = FakeRegistry::new(vec![]);
+        // The record still names the branch the sandbox was built with, and the
+        // one it asks for is that branch, now free because the host checked
+        // another one out inside the worktree.
+        let worktrees = FakeWorktreeProvider::new()
+            .with_existing_branch("feature")
+            .with_existing_branch("other2")
+            .with_listed_worktree(&SandboxName::new("demo").unwrap())
+            .with_branch_checked_out_in("other2", &SandboxName::new("demo").unwrap());
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::nothing_standing();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        let result = command
+            .run(SandboxName::new("demo").unwrap(), Some(BranchName::new("feature").unwrap()));
+
+        assert_eq!(
+            result,
+            Err(HortError::SandboxHoldsAnotherBranch {
+                name: "demo".to_string(),
+                held: "other2".to_string(),
+                requested: "feature".to_string(),
+            })
+        );
     }
 
     #[test]

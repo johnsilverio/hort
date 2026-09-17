@@ -156,6 +156,10 @@ pub trait WorktreeProvider {
     /// else's is the caller's question, because only the caller knows which
     /// worktree it is standing on.
     fn checked_out_at(&self, branch: &BranchName) -> Result<Vec<PathBuf>, HortError>;
+    /// The branch the worktree at `path` has checked out, the inverse of
+    /// `checked_out_at`. `None` when git lists no worktree at that path, or the
+    /// one it lists there holds no branch.
+    fn branch_held_at(&self, path: &Path) -> Result<Option<BranchName>, HortError>;
     /// Whether this sandbox's worktree has uncommitted changes; untracked files
     /// count. The first behavioral consumer is `prune`.
     fn is_dirty(&self, name: &SandboxName) -> Result<bool, HortError>;

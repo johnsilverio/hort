@@ -120,6 +120,16 @@ impl WorktreeProvider for GitWorktreeProvider {
             .collect())
     }
 
+    fn branch_held_at(&self, path: &Path) -> Result<Option<BranchName>, HortError> {
+        let porcelain = run(&self.repo_dir, "worktree list", &["worktree", "list", "--porcelain"])?;
+        parse_worktree_records(&porcelain)
+            .iter()
+            .find(|record| record.path == path)
+            .and_then(WorktreeRecord::held_branch)
+            .map(BranchName::new)
+            .transpose()
+    }
+
     fn is_dirty(&self, name: &SandboxName) -> Result<bool, HortError> {
         let porcelain = run(&self.worktree_path(name), "status", &["status", "--porcelain"])?;
         Ok(!porcelain.trim().is_empty())
@@ -175,6 +185,12 @@ impl WorktreeRecord<'_> {
     fn holds(&self, branch: &BranchName) -> bool {
         let checked_out = format!("branch refs/heads/{}", branch.as_str());
         self.attributes.iter().any(|line| *line == checked_out)
+    }
+
+    /// The short name of the branch this worktree has checked out, absent for a
+    /// detached HEAD, which git reports with a `detached` line instead.
+    fn held_branch(&self) -> Option<&str> {
+        self.attributes.iter().find_map(|line| line.strip_prefix("branch refs/heads/"))
     }
 }
 
@@ -600,6 +616,37 @@ mod tests {
         let holders = provider.checked_out_at(&BranchName::new("feature").unwrap()).unwrap();
 
         assert_eq!(holders, Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn git_worktree_reports_the_branch_a_sandbox_worktree_holds() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        git(&repo, &["branch", "feature-x"]);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("work").unwrap();
+        provider.create(&name, &BranchName::new("feature-x").unwrap()).unwrap();
+
+        let held = provider.branch_held_at(&canonical_worktree(&state_root, &name)).unwrap();
+
+        // The main checkout is listed first and holds another branch, so an
+        // answer that is not read off this worktree's own record names `main`.
+        assert_eq!(held, Some(BranchName::new("feature-x").unwrap()));
+    }
+
+    #[test]
+    fn git_worktree_reports_no_branch_at_a_path_no_worktree_is_at() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+
+        let held = provider
+            .branch_held_at(&canonical_worktree(&state_root, &SandboxName::new("work").unwrap()))
+            .unwrap();
+
+        assert_eq!(held, None);
     }
 
     #[test]
