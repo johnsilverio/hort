@@ -111,7 +111,7 @@ Use a **fine-grained** token, scoped to the one repository you are working on wi
 
 Under an egress allowlist the sandbox reaches nothing by default, so add `github.com` and `api.github.com` to the allowlist for `gh` to work. Under open egress they are reachable already.
 
-Git itself does not work inside the sandbox today, so `gh` covers what needs only the API: opening a pull request for a branch that is already on the remote, reading issues, `gh api`. Committing and pushing from inside is the planned [clone mode](roadmap.md#clone-mode-opt-in); until it lands, you commit and push from the host.
+In the default worktree mode git does not work inside the sandbox, so `gh` covers only what is API work: opening a pull request for a branch that is already on the remote, reading issues, `gh api`. To let the agent commit and push from inside, build the sandbox in [clone mode](git-modes.md); the same token then serves both.
 
 ## Dependency caches
 

@@ -14,7 +14,7 @@ What the sandbox can see and write:
 
 | Surface | Inside | Writable | Survives `hort down` |
 | :--- | :--- | :--- | :--- |
-| The worktree | `/workdir` | yes | the directory is deleted; committed work survives on the branch |
+| The worktree, or the clone | `/workdir` | yes | the directory is deleted; in worktree mode committed work survives on the branch, and in clone mode only what left the sandbox, by a push or a fetch from the host |
 | Declared caches | `/workdir/<name>` or their `target` | yes | yes, on the host under hort's state, shared by the project's sandboxes |
 | Everything else in `/` | the rootfs plus a per-sandbox layer | yes | no, the layer is discarded |
 | `HOME` (`/home/hort`) and `/tmp` | in memory | yes | no |
@@ -25,9 +25,20 @@ The whole root is writable, so tools that write to `/usr` or `/etc` work. The gu
 
 ### Your repository
 
-The real `.git` directory stays on the host and is not mounted. The agent sees a worktree whose `.git` is a pointer file naming a host path that does not exist inside. That pointer is mounted **read-only**: the agent cannot rewrite or replace it, and the mount point itself cannot be removed or renamed from inside. It can delete every other file in `/workdir`; your history, your other branches and your main checkout are untouched. **The most a rogue command can destroy is the uncommitted content of one worktree.** That is also why git does not work inside the sandbox.
+**In worktree mode, the default.** The real `.git` directory stays on the host and is not mounted. The agent sees a worktree whose `.git` is a pointer file naming a host path that does not exist inside. That pointer is mounted **read-only**: the agent cannot rewrite or replace it, and the mount point itself cannot be removed or renamed from inside. It can delete every other file in `/workdir`; your history, your other branches and your main checkout are untouched. **The most a rogue command can destroy is the uncommitted content of one worktree.** That is also why git does not work inside a sandbox in this mode.
 
-You commit the work from the host, in that same worktree, while the sandbox is up. The read-only pointer is what makes that safe: a `git` you run there reads the genuine pointer, not one the agent rewrote to name a repository it planted with its own hooks or filters. Such a planted pointer would run the agent's configuration as you, on the host, outside every layer hort has, the moment you ran an ordinary git command in the worktree. Committing advances the sandbox's own branch in your repository; the commits are yours, made on the host. (An opt-in clone mode, [planned and not available yet](roadmap.md#clone-mode-opt-in), would let an agent commit in its own clone and push only with a narrowly scoped token you choose.)
+You commit the work from the host, in that same worktree, while the sandbox is up. The read-only pointer is what makes that safe: a `git` you run there reads the genuine pointer, not one the agent rewrote to name a repository it planted with its own hooks or filters. Such a planted pointer would run the agent's configuration as you, on the host, outside every layer hort has, the moment you ran an ordinary git command in the worktree. Committing advances the sandbox's own branch in your repository; the commits are yours, made on the host.
+
+#### In clone mode
+
+[Clone mode](git-modes.md) lets the agent run git itself, and the guarantee about your repository is unchanged: it is never written from inside. `/workdir` is a clone with its own writable `.git`, and your repository reaches it in two ways only, both of them one-way:
+
+- its **object store is mounted read-only**, so the clone reads all of your history and can rewrite none of it (a write there is refused by the kernel with `Read-only file system`);
+- the remote pointing back at your repository, `hort-base`, is **fetch only**, because a plain shared clone would otherwise be able to push new branches straight into it.
+
+After an agent commits inside such a sandbox, your repository's `.git` is byte for byte what it was. The one thing hort writes there is a ref, `refs/hort/<name>/base`, which pins the commit the clone started from so your own `git gc` cannot prune objects the clone borrows.
+
+What clone mode does change is where a credential lives. If you want the agent to push, you forward a token into a box you are not watching, so the token is what bounds the damage: scope it to one repository, give it only the permissions the job needs, and protect the branches on the remote.
 
 ### Your machine
 

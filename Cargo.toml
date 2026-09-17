@@ -6,7 +6,7 @@ edition = "2024"
 # floors hort's own code needs (`File::try_lock` and `io::pipe`, both stabilized by 1.89).
 # Bumping the youki crates may raise it.
 rust-version = "1.89"
-description = "Terminal-operated, agent-agnostic manager of ephemeral sandboxes (a git worktree + an embedded-libcontainer OCI container) for running CLI LLM agents in unrestricted mode without exposing the host"
+description = "Terminal-operated, agent-agnostic manager of ephemeral sandboxes (a git worktree or clone + an embedded-libcontainer OCI container) for running CLI LLM agents in unrestricted mode without exposing the host"
 license = "AGPL-3.0-only"
 repository = "https://github.com/johnsilverio/hort"
 readme = "README.md"

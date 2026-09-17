@@ -11,6 +11,7 @@
 # Using hort
 
 - [Concepts](concepts.md)
+- [Git inside the sandbox](git-modes.md)
 - [Running agents in parallel](parallel-agents.md)
 - [Networking and egress](networking.md)
 - [Configuration recipes and tips](recipes.md)

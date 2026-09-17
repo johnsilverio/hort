@@ -83,7 +83,7 @@ The columns are name, state, sessions (processes running in the box besides its 
 
 ## 7. Review and commit from the host
 
-Git does not work inside the sandbox (see [why](concepts.md#git-is-a-host-activity)). You review and commit on the host, against the worktree, while the sandbox is still running. The worktree lives at `~/.local/state/hort/sandboxes/<name>/worktree-<name>`; inside the box, `$HORT_WORKTREE` prints that host path too.
+Git does not work inside a sandbox built the default way (see [why](concepts.md#git-is-a-host-activity), and [clone mode](git-modes.md) for the sandbox that does have it). You review and commit on the host, against the worktree, while the sandbox is still running. The worktree lives at `~/.local/state/hort/sandboxes/<name>/worktree-<name>`; inside the box, `$HORT_WORKTREE` prints that host path too.
 
 ```bash
 cd ~/.local/state/hort/sandboxes/fix-login/worktree-fix-login

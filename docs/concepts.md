@@ -6,8 +6,8 @@ hort has few moving parts. Knowing exactly what each one is makes everything els
 
 A **sandbox** is a pair that lives and dies together:
 
-- a **git worktree on your host**, on its own branch, and
-- a **container** that mounts that worktree at `/workdir`.
+- a **git worktree on your host**, on its own branch (or, in [clone mode](git-modes.md), a clone of your repository), and
+- a **container** that mounts it at `/workdir`.
 
 It has a name you choose (`hort up <name>`), which is how every other command refers to it. It is born when `hort up` builds it and it dies **only** when you run `hort down` (or `hort prune` collects it). No timer ever stops it, however long it sits idle.
 
@@ -45,11 +45,11 @@ Committing in the worktree advances that branch in your real repository, which i
 
 ### Git is a host activity
 
-The worktree's `.git` is a small file pointing at your repository's real `.git` directory by its host path, and that path does not exist inside the sandbox. So **today no git command works inside a sandbox**: not `status`, not `diff`, not `commit`, even if git is installed in the rootfs. This is deliberate. Making git work inside would mean mounting your repository's `.git` into the box writable, and then an unrestricted agent could rewrite history or delete branches in your real repository, instead of being limited to one disposable worktree.
+The worktree's `.git` is a small file pointing at your repository's real `.git` directory by its host path, and that path does not exist inside the sandbox. So in this mode **no git command works inside a sandbox**: not `status`, not `diff`, not `commit`, even if git is installed in the rootfs. This is deliberate. Making git work inside by mounting your repository's `.git` into the box writable would let an unrestricted agent rewrite history or delete branches in your real repository, instead of being limited to one disposable worktree.
 
 So the division of labour is: **the agent writes files, you commit them from the host.** Review with `git diff` in the worktree directory, commit there, while the sandbox is still running. `$HORT_WORKTREE`, set in every session, holds the host path of that directory.
 
-**Planned, not available yet: an opt-in clone mode.** In it, a sandbox would get its own clone of the repository, so an agent could commit, branch and open a pull request with its own tools, while your host repository is never written from inside. Pushing to a remote such as GitHub would use a narrowly scoped token you choose to pass in, so what the agent can do there is bounded by that token and by the remote's branch protection. On large repositories a clone costs noticeably more disk space and time than a worktree, which is why it will be opt-in. None of this exists in hort today, and there is nothing to configure for it yet. See the [Roadmap](roadmap.md#clone-mode-opt-in).
+**When you need git inside, there is a second mode.** `hort up <name> --git clone` gives the sandbox its own clone of the repository instead of a worktree, so an agent can commit, branch and open a pull request with its own tools. Your repository is still never written from inside: the clone borrows its history read-only and can only push to a remote you gave it credentials for. Worktrees stay the default. See [Git inside the sandbox](git-modes.md).
 
 ### What `down` keeps
 
@@ -59,7 +59,7 @@ So the division of labour is: **the agent writes files, you commit them from the
 - your repository and every other branch,
 - the project's [dependency caches](configuration.md#cache).
 
-Anything not committed when you run `down` is gone. Commit first.
+Anything not committed when you run `down` is gone. Commit first. In [clone mode](git-modes.md) that means anything the agent did not push: the clone goes with the sandbox, and `down` leaves only the pinned ref `refs/hort/<name>/base` behind in your repository.
 
 Because the branch stays, `hort up <name>` later finds it already there. On a terminal, hort offers to build the sandbox on that branch; without a terminal it refuses and prints the command that does it (`hort up <name> --branch <name>`). Delete a branch you no longer need with `git branch -d <name>` on the host (a flag to do it from `down` is [planned](roadmap.md#deleting-the-sandboxs-branch-on-down-and-prune)).
 
@@ -102,7 +102,7 @@ Idle time only informs you, and [`hort prune --idle`](commands/prune.md) if you 
 | `~/.config/hort/config.json` | Global configuration. |
 | `<project>/.hort.json` | Project configuration (or `.devcontainer/devcontainer.json`). |
 | `~/.local/state/hort/sandboxes/<name>/metadata.json` | hort's record of the sandbox. |
-| `~/.local/state/hort/sandboxes/<name>/worktree-<name>/` | The worktree (git mode). |
+| `~/.local/state/hort/sandboxes/<name>/worktree-<name>/` | The worktree, or the clone in [clone mode](git-modes.md). |
 | `~/.local/state/hort/sandboxes/<name>/overlay/` | The sandbox's disposable writable layer over the rootfs. |
 | `~/.local/state/hort/sandboxes/<name>/notify/` | The notification channel, when configured. |
 | `~/.local/state/hort/cache/<encoded project path>/` | The project's dependency caches, shared by all its sandboxes. |

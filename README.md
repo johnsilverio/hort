@@ -14,7 +14,7 @@
 </p>
 
 > [!NOTE]
-> hort works end to end today: `up`, `attach`, `ls`, `down`, `prune`, `config` and `doctor` all run. It is pre-1.0, so expect rough edges and changes, and it is installed from source.
+> hort works end to end today: `up`, `attach`, `run`, `ls`, `down`, `prune`, `config` and `doctor` all run. It is pre-1.0, so expect rough edges and changes, and it is installed from source.
 >
 > **Documentation:** <https://johnsilverio.github.io/hort/> (the same pages are in [`docs/`](./docs/README.md)).
 
@@ -52,7 +52,7 @@ That single change is what makes the rest possible:
 
 **It's quick to start and simple to install.** hort is one binary, written in Rust, that you drop into `~/.local/bin`. There's no daemon to reach and no image to pull, because you bring a prepared root filesystem, so a box comes up fast.
 
-**Your repository is never on the line.** The real `.git` stays on the host. The agent only ever sees a throwaway worktree on its own branch, so the worst a bad command can do is ruin a scratch branch. Inside, your session is root of its own user namespace, mapped to your own unprivileged user on the host and holding no capabilities, so being root in there buys nothing on the machine.
+**Your repository is never on the line.** The real `.git` stays on the host. The agent only ever sees a throwaway worktree on its own branch, so the worst a bad command can do is ruin a scratch branch. If you turn on clone mode so the agent can use git itself, it gets a clone that borrows your history read-only and cannot push back into your repository. Inside, your session is root of its own user namespace, mapped to your own unprivileged user on the host and holding no capabilities, so being root in there buys nothing on the machine.
 
 <br>
 
@@ -73,11 +73,14 @@ So the rule is simple: run hort on code you trust, with development credentials 
 ```bash
 hort up api-feature      # branch + worktree, start the box, drop you in
 hort attach api-feature  # open another session from any terminal
+hort run api-feature -- cargo test   # one command inside, exit code and all
 hort ls                  # see what's running
 hort down api-feature    # tear it down (asks first if sessions are open)
 ```
 
-Inside, you run agents however you already do: `claude`, `aider`, `gemini`, whatever you reach for. hort doesn't wrap them or replace them. It just makes the ground under them safe to stand on. The agent writes files; you review and commit them from the host, where your real repository lives. (Git does not work inside a box today. An opt-in mode giving a box its own clone, so an agent can commit and open pull requests itself, is [planned but not available yet](./docs/roadmap.md#clone-mode-opt-in).)
+Inside, you run agents however you already do: `claude`, `aider`, `gemini`, whatever you reach for. hort doesn't wrap them or replace them. It just makes the ground under them safe to stand on.
+
+By default the agent writes files and you review and commit them from the host, where your real repository lives; git deliberately doesn't work inside the box. When you'd rather the agent finish the job itself, `hort up <name> --git clone` gives the box its own clone, so it can commit, push and open a pull request with a token you scope. Either way your repository is never written from inside it. See [Git inside the sandbox](./docs/git-modes.md).
 
 <br>
 
@@ -87,7 +90,7 @@ Read it at **<https://johnsilverio.github.io/hort/>**, or browse [`docs/`](./doc
 
 - [Installation](./docs/installation.md) and [Preparing a rootfs](./docs/rootfs.md)
 - [Quickstart](./docs/quickstart.md): from nothing to an agent in a sandbox, review, commit, tear down
-- [Concepts](./docs/concepts.md), [Running agents in parallel](./docs/parallel-agents.md), [Networking and egress](./docs/networking.md)
+- [Concepts](./docs/concepts.md), [Git inside the sandbox](./docs/git-modes.md), [Running agents in parallel](./docs/parallel-agents.md), [Networking and egress](./docs/networking.md)
 - Reference: [commands](./docs/commands/index.md), [configuration](./docs/configuration.md), [security model](./docs/security.md), [troubleshooting](./docs/troubleshooting.md)
 - [Working inside a hort sandbox](./docs/agents.md): a page to hand to your agent
 - [Roadmap](./docs/roadmap.md): planned work, not available yet

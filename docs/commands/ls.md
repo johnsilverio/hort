@@ -32,9 +32,11 @@ The columns, separated by two spaces:
 | 4 | age | Time since `hort up` built it. |
 | 5 | idle | `active` while anything runs inside; otherwise time since the latest of creation, last attach and last announced completion. |
 | 6 | branch | The sandbox's branch, or `-` without git. |
-| 7 | dirty | `dirty` if the worktree has uncommitted changes, `clean` if not. |
+| 7 | dirty | `dirty` if the worktree has uncommitted changes, `clean` if not. Always `-` for a [clone-mode](../git-modes.md) sandbox, whose `/workdir` is a clone rather than a worktree of your repository. |
 
-A `-` means hort could not tell: there is no record to read (a `lost-record` row), the project has no git (branch and dirty), the worktree is gone, or hort could not read the sandbox's process list (sessions, and idle with it). hort shows `-` rather than guessing.
+A `-` means hort could not tell: there is no record to read (a `lost-record` row), the project has no git (branch and dirty), the sandbox is in clone mode (dirty), the worktree is gone, or hort could not read the sandbox's process list (sessions, and idle with it). hort shows `-` rather than guessing.
+
+The listing does not say which git mode a sandbox was built in; showing it is [planned](../roadmap.md#cleaning-up-after-clone-mode).
 
 A `lost-record` row is followed by an indented line with the command that collects it.
 

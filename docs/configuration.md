@@ -36,7 +36,7 @@ The project layer wins over the global one:
 
 | Key | Rule |
 | :--- | :--- |
-| `rootfs`, `shell` | The project value replaces the global one. |
+| `rootfs`, `shell`, `git` | The project value replaces the global one. |
 | `egress` | The project value replaces the global one **entirely**. Allowlists are never combined, so a global `true` can never loosen a project allowlist. |
 | `mounts.readOnly`, `cache.dirs` | Both lists are combined, duplicates removed. |
 | `agents` | Both lists are combined. Entries with the same `command` are merged: their `auth.readOnly` and `auth.env` lists are combined, and the project's `notify` wins. |
@@ -97,6 +97,10 @@ A project file:
   // A ceiling per sandbox.
   "resources": { "memory": "4g", "cpus": 2 },
 
+  // Give each sandbox its own clone, so an agent can commit and open a pull
+  // request from inside. The default, "worktree", keeps git a host activity.
+  "git": "clone",
+
   // The login shell of every session; must exist in the rootfs.
   "shell": "/bin/bash",
 }
@@ -119,6 +123,27 @@ The shell each session runs, as a login shell (`-l`) in `/workdir`. It is a path
 ```text
 shell '/bin/bash' not found in rootfs '/home/you/.local/share/hort/devbox' — set "shell" to one the rootfs provides, or omit it
 ```
+
+### `git`
+
+**string.** Default: `"worktree"`. Merge: replaces.
+
+How a sandbox of this project gets git into `/workdir`.
+
+| Value | Meaning |
+| :--- | :--- |
+| `"worktree"` | `/workdir` is a git worktree of your repository. git does not work inside the sandbox; you commit from the host. |
+| `"clone"` | `/workdir` is a clone of your repository, with a writable `.git` of its own, so an agent can commit, branch and open a pull request from inside. |
+
+**Before you turn `"clone"` on for a project, two things are worth knowing.** Any credential you pass into the sandbox so the agent can push lives *inside* the box, with the agent, so scope it to one repository and protect the branches on the remote ([security](security.md#in-clone-mode)). And the clone borrows your history rather than copying it, so it costs about as much disk as a worktree: measured on a repository with 2.3 GB of history, the sandbox's own `.git` was about 6 MB and the new disk was the checkout alone. See [git inside the sandbox](git-modes.md) for the whole picture, including what `hort down` does not clean up yet.
+
+`hort up --git <mode>` overrides this for one build. In a project that is not a git repository the key has nothing to act on, so a configured `"clone"` warns and the sandbox is built with the project folder mounted:
+
+```text
+warning: the configured 'clone' git mode needs a git repository and this project is not one, so the sandbox mounts the project folder itself
+```
+
+Clone mode puts a token inside the box if you want the agent to push, so read [Git inside the sandbox](git-modes.md) before turning it on for a project.
 
 ### `mounts`
 

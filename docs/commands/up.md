@@ -10,6 +10,7 @@ Arguments:
 
 Options:
       --branch <BRANCH>  Check out this existing branch instead of creating one named after the sandbox
+      --git <GIT>        How the sandbox gets git into `/workdir`, overriding what the configuration declares: `worktree` or `clone`
   -d, --detach           Return to the prompt with the sandbox running instead of opening a session in it
   -h, --help             Print help
 ```
@@ -21,6 +22,7 @@ cd ~/src/webapp
 hort up fix-login                      # new branch fix-login from HEAD, then a shell inside
 hort up fix-login -d                   # same, but return to your prompt
 hort up review --branch feature/search # build on an existing branch
+hort up ship-it --git clone            # give the box its own clone, so git works inside
 ```
 
 ## What it does
@@ -31,7 +33,7 @@ hort up review --branch feature/search # build on an existing branch
 4. **Checks the rest of the configuration** that can be wrong: resource sizes, databases sharing a port, and caches aimed inside read-only mounts.
 5. **Takes a per-name lock**, so two `hort up` of the same name cannot race.
 6. **Decides what to build.** A sandbox of that name that is already fully running is refused. One that is half-built (an orphan, or a live box whose networking is gone) is completed instead of refused.
-7. **Prepares the worktree**: in a git repository, a new branch `<name>` from `HEAD` (or the `--branch` you named) checked out at `~/.local/state/hort/sandboxes/<name>/worktree-<name>`. Without git, the project folder itself.
+7. **Prepares `/workdir`**: in a git repository, a new branch `<name>` from `HEAD` (or the `--branch` you named) checked out at `~/.local/state/hort/sandboxes/<name>/worktree-<name>`, as a worktree or, in [clone mode](../git-modes.md), as a clone of the repository. Without git, the project folder itself.
 8. **Records the sandbox on disk**, before anything starts, so an interruption from here on leaves something `hort ls` can see.
 9. **Starts the container** with its anchor process, then **its networking** (pasta; the egress proxy for an allowlist; database forwarders).
 10. **Starts the notification watcher**, if an agent declares `notify.stopHook`. If that fails, it warns and carries on.
@@ -82,6 +84,7 @@ If a sandbox of that name is `orphaned` (its container died, for example after a
 | `cache '<name>' targets '<target>', which does not exist inside the read-only mount '<source>' — point the cache elsewhere, or create it on the host first` | A `cache.dirs` target falls inside a read-only mount whose host directory lacks that path. Create it on the host, or move the cache. |
 | `two databases are declared on port <port> (<host> and <other>), and a sandbox can reach only one of them — remove one from "network" in your configuration or give it another port` | Every declared database is `127.0.0.1:<port>` inside, so two on one port cannot both be reached. Remove one or change a port. |
 | `--branch requires a git repository, but this project is not one` | `--branch` makes no sense for a project folder without git. |
+| `--git clone requires a git repository, but this project is not one` | There is nothing to clone in a project folder without git. The same mode set in a configuration file only warns and builds the sandbox without git. See [Git inside the sandbox](../git-modes.md#turning-it-on). |
 | `another 'hort up <name>' is already in progress` | Another `hort up` of this name holds the lock. Wait for it. The lock is released automatically if that process dies. |
 
 ### Refusals about the name and the branch
@@ -93,12 +96,13 @@ If a sandbox of that name is `orphaned` (its container died, for example after a
 | `branch '<branch>' is already checked out in another worktree` | git allows a branch in one worktree at a time. Switch that other checkout to a different branch, or pick another branch or name. |
 | `branch '<branch>' does not exist; create it first or omit --branch to create a new branch named '<name>'` | `--branch` names a branch that does not exist. |
 | `sandbox '<name>' holds branch '<held>', not '<requested>' — run 'hort down <name>' first, then 'hort up <name> --branch <requested>'` | You are resuming a half-built sandbox, whose worktree is on another branch than the `--branch` you gave. Commit what you need from its worktree first. |
+| `sandbox '<name>' was built in <built> git mode, not <requested> — run 'hort down <name>' first, or repeat it with 'hort up <name> --git <built>'` | You are resuming a half-built sandbox that was built in the other [git mode](../git-modes.md). Finish it in the mode it has, or tear it down and build again. |
 
 ### Failures while building
 
 | Message | What to do |
 | :--- | :--- |
-| `git command failed: worktree add: <git's message>` | Most often the repository has no commit yet (`HEAD` is empty). Make a first commit. |
+| `git command failed: <step>: <git's message>` | A git step of the build failed, and git's message says why; the step is named. For `worktree add` the usual cause is a repository with no commit yet (`HEAD` is empty), so make a first commit. |
 | `container runtime failed: ...` | See [Troubleshooting](../troubleshooting.md#container-runtime-failed-). |
 | `sandbox networking failed: ...` | See [Troubleshooting](../troubleshooting.md#sandbox-networking-failed-). |
 
@@ -108,6 +112,7 @@ If a sandbox of that name is `orphaned` (its container died, for example after a
 | :--- | :--- |
 | `warning: cgroup controller '<controller>' is not delegated to this user, so the <controller> ceiling is not enforced; add '<controller>' to Delegate= in a systemd drop-in for user@.service` | Part of `resources` is not applied. |
 | `warning: this kernel cannot restrict which ports a process connects to, so the egress allowlist of this sandbox runs without its kernel layer (Linux 6.7 or newer enforces it)` | The allowlist holds, minus its Landlock layer. |
+| `warning: the configured 'clone' git mode needs a git repository and this project is not one, so the sandbox mounts the project folder itself` | Your configuration asks for [clone mode](../git-modes.md) and this project is not a repository, so the sandbox is built the way a project without git always is. |
 | `warning: read-only mount '<path>' is not on this host, so the sandbox starts without it` | A `mounts.readOnly` or `auth.readOnly` path does not exist. |
 | `warning: notify-send is not on PATH, so no completion of this sandbox will be raised on the desktop (install libnotify to get it)` | Notifications are configured but cannot be shown. |
 | `warning: this build raises a completion on the desktop and nowhere else, so nothing will be raised on the '<sink>' this configuration asks for` | `notifications.sink` names something other than `desktop`. |

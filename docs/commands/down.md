@@ -26,7 +26,7 @@ Always in this order, because deleting a directory that a running process still 
 
 1. Stops the notification watcher and the host-side network helpers (pasta, the egress proxy, database forwarders).
 2. Removes the container, which ends every session and the anchor and releases the worktree mount.
-3. In a git project, **removes the worktree directory, including uncommitted changes**, and its registration in your repository.
+3. In a git project, **removes the worktree directory, including uncommitted changes**, and its registration in your repository. In [clone mode](../git-modes.md) that directory is the sandbox's clone, so every commit made inside it that was not pushed or fetched out goes with it.
 4. Removes hort's record of the sandbox.
 
 It **keeps** the branch and its commits (deleting it from `down` is [planned](../roadmap.md#deleting-the-sandboxs-branch-on-down-and-prune)), your repository, and the project's dependency caches. In a project without git it never touches your folder: only the container and the record go.
@@ -63,3 +63,5 @@ refusing to down without confirmation: stdin is not a TTY (pass --force to proce
 | `refusing to down without confirmation: stdin is not a TTY (pass --force to proceed)` | Sessions are open and there is nobody to ask. Add `-f` if you mean it. |
 | `container runtime failed: ...` / `sandbox networking failed: ...` | A step failed. hort stops at the failing step, so later steps (worktree, record) have not run; run `hort down <name>` again, and see [Troubleshooting](../troubleshooting.md). |
 | `git command failed: ...` | Removing the worktree failed; git's message says why. |
+
+In [clone mode](../git-modes.md), `down` leaves the pinned ref `refs/hort/<name>/base` in your repository. Remove it with `git update-ref -d refs/hort/<name>/base`; having `down` do it is [planned](../roadmap.md#cleaning-up-after-clone-mode).

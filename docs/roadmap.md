@@ -2,11 +2,12 @@
 
 This page lists work that has been decided but is **not available yet**. It describes what you will be able to do, not when: there are no dates and no promised order, and any of it may change. Everything else in this book describes hort as it works today.
 
-## Clone mode, opt-in
+## Cleaning up after clone mode
 
-Today git does not work inside a sandbox, and you commit from the host ([why](concepts.md#git-is-a-host-activity)). A planned opt-in mode gives a sandbox its own clone of the repository, so an agent can commit, create branches and open a pull request with its own tools. Your host repository is never written from inside. Pushing to a remote such as GitHub uses a narrowly scoped token you choose to pass in, so what the agent can do there is bounded by that token and by the remote's branch protection.
+[Clone mode](git-modes.md) works today. Two pieces of it are still missing:
 
-The mechanism has been measured. The clone shares your repository's existing history read-only rather than copying it, so on typical repositories it costs about the same disk as a worktree today, and only a fully independent copy is heavier. This mode will still be opt-in, and worktrees stay the default.
+- `hort down` leaves the pinned ref `refs/hort/<name>/base` in your repository; today you remove it with `git update-ref -d refs/hort/<name>/base`. Planned: `down` removes it, and warns when the sandbox holds commits you never pushed.
+- `hort ls` does not show which git mode a sandbox was built in, and its dirty column reads `-` for a clone. Planned: the mode is visible in the listing.
 
 ## Deleting the sandbox's branch on `down` and `prune`
 

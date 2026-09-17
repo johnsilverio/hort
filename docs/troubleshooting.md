@@ -99,7 +99,29 @@ Claude Code sees uid 0. In a hort sandbox that is the root of an unprivileged us
 
 ### git says the directory is not a repository
 
-Expected: today git does not work inside a sandbox, by design, because the worktree's `.git` points at your host repository, which the box does not have. Run git on the host, in the worktree (`~/.local/state/hort/sandboxes/<name>/worktree-<name>`, also printed by `echo $HORT_WORKTREE` inside). An opt-in clone mode that would let an agent commit inside is [planned but not available yet](roadmap.md#clone-mode-opt-in). See [Git is a host activity](concepts.md#git-is-a-host-activity).
+Expected in the default worktree mode, by design, because the worktree's `.git` points at your host repository, which the box does not have. Run git on the host, in the worktree (`~/.local/state/hort/sandboxes/<name>/worktree-<name>`, also printed by `echo $HORT_WORKTREE` inside). See [Git is a host activity](concepts.md#git-is-a-host-activity).
+
+If you want git to work inside instead, build the sandbox with `hort up <name> --git clone`, which gives it a clone of its own: see [Git inside the sandbox](git-modes.md).
+
+### git on the host says `unable to normalize alternate object path`
+
+```text
+error: unable to normalize alternate object path: /run/hort/objects
+fatal: bad object HEAD
+```
+
+You ran git **on the host** inside a [clone-mode](git-modes.md) sandbox's directory. The clone borrows your history at an address that exists inside the sandbox and not on your machine, so git run from outside cannot resolve it. Nothing is damaged. Ask the sandbox instead:
+
+```bash
+hort run <name> -- git -C /workdir status
+```
+
+Fetching from that directory fails for the same reason (`remote: aborting due to possible repository corruption on the remote side`). To pull the agent's commits out without pushing them, have the sandbox write a bundle, which is made where the history resolves and lands on your host:
+
+```bash
+hort run <name> -- git -C /workdir bundle create /workdir/work.bundle <branch>
+git fetch ~/.local/state/hort/sandboxes/<name>/worktree-<name>/work.bundle '<branch>:refs/hort/incoming'
+```
 
 ### `error: Unable to open universal variable file '/home/hort/.config/fish/fish_variables': EROFS: Read-only file system`
 

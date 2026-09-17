@@ -8,7 +8,7 @@ You are running inside a **hort sandbox**: an isolated Linux container around a 
 
 ## Where you are
 
-- Your working directory is **`/workdir`**. It is a git worktree of the user's repository, on a branch created for this task. Everything you should change is in there.
+- Your working directory is **`/workdir`**. It is the user's repository, on a branch created for this task, either as a worktree or as a clone (see [Git](#git) below for how to tell and what changes). Everything you should change is in there.
 - `HORT_SANDBOX` holds the sandbox name, which is also the branch name and the hostname.
 - `HORT_WORKTREE` holds the **host** path of `/workdir`. It does not exist inside the sandbox; it is useful only when telling the user where to look.
 - Your home is `/home/hort`. It lives in memory.
@@ -23,12 +23,24 @@ You are running inside a **hort sandbox**: an isolated Linux container around a 
 
 ## Git
 
-- **git does not work in this sandbox.** The worktree's `.git` file points to the user's repository on the host, which does not exist here, so `git status`, `git diff`, `git commit` and every other git command fail. This is intentional: it keeps the real repository's history and branches out of your reach.
+**First, find out which mode you are in.** Run `git -C /workdir status`. It either works or it does not, and that decides everything below. Do not assume; check.
+
+### If git does not work (the default mode)
+
+- The worktree's `.git` file points to the user's repository on the host, which does not exist here, so `git status`, `git diff`, `git commit` and every other git command fail. This is intentional: it keeps the real repository's history and branches out of your reach.
 - **Do not commit, and do not try to repair git** (do not run `git init`, do not delete or rewrite `/workdir/.git`, do not clone the repository again). Destroying `.git` in `/workdir` only breaks the user's review of your work.
 - Write your changes as files. The user reviews them with `git diff` on the host and commits them there.
 - When you finish, summarize what you changed and which files, since you cannot show a diff yourself.
-- **The GitHub CLI (`gh`) may still work for API operations** if the user forwarded a token: you can open a pull request, read issues or call `gh api` against a branch that already exists on the remote. You cannot commit or push from here, because that needs git, which does not work in this sandbox. If `gh` reports it is not authenticated, tell the user; do not run `gh auth login`.
-- A mode in which a sandbox has its own clone, so an agent can commit and open pull requests itself, is planned but **not available yet** (see the [Roadmap](roadmap.md#clone-mode-opt-in)). Do not assume it exists.
+- **The GitHub CLI (`gh`) may still work for API operations** if the user forwarded a token: you can open a pull request, read issues or call `gh api` against a branch that already exists on the remote. You cannot commit or push from here, because that needs git. If `gh` reports it is not authenticated, tell the user; do not run `gh auth login`.
+
+### If git works (clone mode)
+
+- `/workdir` is a **clone of the user's repository**, made for this sandbox, already on a branch named after it. Commit there as you normally would.
+- `origin` is the user's own remote, and that is where your work goes. Push your branch and open a pull request with it.
+- `hort-base` points back at the user's repository on this machine. It is **fetch only** and a push through it fails by design. Do not try to work around that.
+- `/run/hort/objects` holds the history your clone borrows, mounted read-only. Never try to write there, and do not run `git gc`, `git repack` or anything else meant to rewrite the object store you did not create.
+- If a push fails because you have no credentials, say so and stop. Do not run `gh auth login`, do not invent a remote, and never write a token into the repository.
+- Rewriting history you did not create (a force push, a rebase of the base branch) reaches the user's remote. Do not do it unless the task explicitly asks for it.
 
 ## Network
 
@@ -56,5 +68,5 @@ Databases the project declares are reachable at **`127.0.0.1:<port>`**, for exam
 
 - "Read-only file system" on a file under `/home/hort`: it is the user's mounted configuration; leave it alone.
 - "Network unreachable", DNS failures, or HTTP 403 from the proxy under an allowlist: report the host you needed.
-- git errors: expected; see above.
+- git errors in the default mode: expected; see above. In clone mode git works, so an error there is real and worth reporting.
 - A tool the task needs is not installed and cannot be installed: say so; the user adds it to the sandbox image.
