@@ -25,9 +25,9 @@ The whole root is writable, so tools that write to `/usr` or `/etc` work. The gu
 
 ### Your repository
 
-The real `.git` directory stays on the host and is not mounted. The agent sees a worktree whose `.git` is a pointer to a path that does not exist inside. It can delete every file in `/workdir`; your history, your other branches and your main checkout are untouched. **The most a rogue command can destroy is the uncommitted content of one worktree.** That is also why git does not work inside the sandbox.
+The real `.git` directory stays on the host and is not mounted. The agent sees a worktree whose `.git` is a pointer file naming a host path that does not exist inside. That pointer is mounted **read-only**: the agent cannot rewrite or replace it, and the mount point itself cannot be removed or renamed from inside. It can delete every other file in `/workdir`; your history, your other branches and your main checkout are untouched. **The most a rogue command can destroy is the uncommitted content of one worktree.** That is also why git does not work inside the sandbox.
 
-Committing does advance the sandbox's own branch in your repository, but commits are made by you, on the host. (An opt-in clone mode, [planned and not available yet](roadmap.md#clone-mode-opt-in), would let an agent commit in its own clone and push only with a narrowly scoped token you choose.)
+You commit the work from the host, in that same worktree, while the sandbox is up. The read-only pointer is what makes that safe: a `git` you run there reads the genuine pointer, not one the agent rewrote to name a repository it planted with its own hooks or filters. Such a planted pointer would run the agent's configuration as you, on the host, outside every layer hort has, the moment you ran an ordinary git command in the worktree. Committing advances the sandbox's own branch in your repository; the commits are yours, made on the host. (An opt-in clone mode, [planned and not available yet](roadmap.md#clone-mode-opt-in), would let an agent commit in its own clone and push only with a narrowly scoped token you choose.)
 
 ### Your machine
 

@@ -2189,14 +2189,15 @@ fn temp_git_repo_under_the_host_home() -> (TempDir, PathBuf) {
     (dir, path)
 }
 
-/// Take every entry of the worktree with it, then list what is left of it.
+/// Take every ordinary entry of the worktree with it, then list what is left.
 ///
-/// A shell glob is deliberately not what does the taking: it leaves out a name
-/// that starts with a dot, and the worktree's `.git` is exactly such a name, so
-/// `rm -rf /workdir/*` spares the one entry carrying the address of the real
-/// repository. The trailing `find` prints its own starting point and one line
-/// per entry under it, so a worktree with nothing left in it prints exactly
-/// `/workdir`.
+/// The `find -exec rm -rf` reaches even a name that starts with a dot, so it
+/// aims at the worktree's `.git` too. That file is now a read-only bind
+/// mountpoint, and without CAP_SYS_ADMIN the box cannot unlink a mountpoint, so
+/// the `rm` is refused with `Resource busy` and the pointer to the real
+/// repository survives while everything else under the worktree is gone. The
+/// trailing `find` prints its own starting point and one line per surviving
+/// entry, so a wiped worktree prints exactly `/workdir` and `/workdir/.git`.
 const DESTROY_THE_WORKTREE: &str = "find /workdir -mindepth 1 -exec rm -rf {} +\nfind /workdir\n";
 
 #[test]
@@ -2217,8 +2218,10 @@ fn cli_the_host_repository_keeps_its_history_after_the_worktree_is_destroyed() {
         .write_stdin(DESTROY_THE_WORKTREE)
         .assert()
         .success()
-        .stdout(predicate::str::contains("/workdir"))
-        .stdout(predicate::str::contains("/workdir/").not());
+        .stdout(predicate::str::contains("/workdir/.git"))
+        .stdout(predicate::function(|out: &str| {
+            out.lines().filter(|line| line.starts_with("/workdir/")).eq(["/workdir/.git"])
+        }));
 
     assert_eq!(git_output(&repo_path, &["log", "--format=%s", "main"]), "initial\n");
 }
@@ -2248,8 +2251,10 @@ fn cli_a_branch_the_sandbox_never_touched_survives_the_destruction() {
         .write_stdin(DESTROY_THE_WORKTREE)
         .assert()
         .success()
-        .stdout(predicate::str::contains("/workdir"))
-        .stdout(predicate::str::contains("/workdir/").not());
+        .stdout(predicate::str::contains("/workdir/.git"))
+        .stdout(predicate::function(|out: &str| {
+            out.lines().filter(|line| line.starts_with("/workdir/")).eq(["/workdir/.git"])
+        }));
 
     assert_eq!(
         git_output(&repo_path, &["show", "keeper:keeper.txt"]),
@@ -2967,6 +2972,52 @@ fn cli_a_write_to_the_worktree_is_on_the_host_afterwards() {
     assert_eq!(
         fs::read_to_string(worktree.join("kept-by-the-worktree")).ok().as_deref(),
         Some("this-write-is-kept\n")
+    );
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_a_session_cannot_rewrite_the_worktree_git_pointer() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+    let worktree = sandbox.state_dir().join(format!("worktree-{}", sandbox.name().as_str()));
+
+    // The worktree's `.git` is a pointer file naming the host repository, and a
+    // box that rewrites it makes a later host `git` in this worktree read
+    // configuration the box controls, which runs as the user outside every
+    // layer hort has. The session overwrites the pointer with a marker of its
+    // own; the sibling write is the control, because a pointer that stays put
+    // only proves the guarantee if an ordinary write to `/workdir` still lands.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", sandbox.name().as_str()])
+        .write_stdin(
+            "echo planted-by-the-agent > /workdir/.git\necho this-write-is-kept > /workdir/kept-by-the-worktree\n",
+        )
+        .assert()
+        .success();
+
+    // Read from the host with the box still standing, which is exactly where and
+    // when a person commits: the genuine pointer starts `gitdir:`, so its
+    // survival is the read-only bind refusing the rewrite.
+    let pointer = fs::read_to_string(worktree.join(".git")).unwrap();
+    assert!(
+        pointer.starts_with("gitdir:"),
+        "the box rewrote the worktree's .git pointer, so a host git here would run planted config: {pointer:?}"
+    );
+    // Without the control write landing, a still-genuine pointer would prove
+    // nothing: it could be a box that refused every write rather than one that
+    // refused only the read-only `.git`.
+    assert_eq!(
+        fs::read_to_string(worktree.join("kept-by-the-worktree")).ok().as_deref(),
+        Some("this-write-is-kept\n"),
+        "the sibling write never landed, so a genuine pointer discriminates nothing"
     );
 }
 

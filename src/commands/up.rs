@@ -28,7 +28,7 @@ use crate::domain::egress::{
 use crate::domain::error::HortError;
 use crate::domain::model::{BranchName, LivenessToken, SandboxName, SandboxRecord, Warning};
 use crate::domain::mounts::{
-    cache_landing_error, cache_landings, cache_mount_plan, declared_read_only_sources,
+    WORKDIR, cache_landing_error, cache_landings, cache_mount_plan, declared_read_only_sources,
     read_only_mount_plan,
 };
 use crate::domain::network::declared_databases;
@@ -43,8 +43,8 @@ use crate::domain::resources::resource_limits;
 use crate::domain::teardown::{TeardownStep, rollback_plan};
 use crate::ports::{
     CacheProvider, Clock, ContainerRegistry, ContainerRuntime, DbForward, EnvironmentProbe,
-    LivenessProbe, MetadataStore, NetworkProvider, NetworkSpec, NotifyProvider, NotifySpec,
-    OciSpec, Proposer, SandboxLock, WorktreeProvider,
+    LivenessProbe, MetadataStore, MountAccess, NetworkProvider, NetworkSpec, NotifyProvider,
+    NotifySpec, OciSpec, Proposer, SandboxLock, SandboxMount, WorktreeProvider,
 };
 
 /// Coordinates building (or resuming) the sandbox named `<name>` over the ports
@@ -353,6 +353,21 @@ impl UpCommand<'_> {
         self.cache.ensure(&caches.iter().map(|cache| cache.source.clone()).collect::<Vec<_>>())?;
         mounts.extend(caches);
 
+        // The worktree's `.git` is a pointer file the box can reach on the
+        // writable `/workdir`. A box that rewrites it makes a later host `git`
+        // in this worktree read configuration the box chose, running as the user
+        // outside every layer hort has. Binding it read-only denies the rewrite:
+        // with no capability to remount, the box can neither replace the pointer
+        // nor unlink the mountpoint. Only in git mode, where `.git` is a pointer;
+        // no-git mounts the project folder itself and its `.git` is the user's own.
+        if git {
+            mounts.push(SandboxMount {
+                source: worktree_path.join(".git"),
+                target: Path::new(WORKDIR).join(".git"),
+                access: MountAccess::ReadOnly,
+            });
+        }
+
         // Carried in only when some agent announces its completions: the bind is
         // writable, and one nothing ever writes to is a writable path handed to
         // an unrestricted agent for nothing. Its address is the provider's
@@ -569,6 +584,17 @@ mod tests {
 
     fn canned_token() -> LivenessToken {
         LivenessToken { pid: AnchorPid(1234), mnt_ns: MountNsInode(5678) }
+    }
+
+    // The read-only bind of the worktree's `.git` pointer that a git-mode build
+    // always carries, so a host git reads the genuine pointer and not one the box
+    // rewrote. Ambient to every git-mode spec below, not the subject of any.
+    fn git_pointer_mount(name: &str) -> SandboxMount {
+        SandboxMount {
+            source: PathBuf::from(format!("/state/sandboxes/{name}/worktree-{name}/.git")),
+            target: PathBuf::from("/workdir/.git"),
+            access: MountAccess::ReadOnly,
+        }
     }
 
     fn ready_host() -> Capabilities {
@@ -1439,11 +1465,14 @@ mod tests {
         // it happens.
         assert_eq!(
             runtime.started_mounts(),
-            vec![SandboxMount {
-                source: PathBuf::from("/home/tester/.config/fish"),
-                target: PathBuf::from("/home/hort/.config/fish"),
-                access: MountAccess::ReadOnly,
-            }]
+            vec![
+                SandboxMount {
+                    source: PathBuf::from("/home/tester/.config/fish"),
+                    target: PathBuf::from("/home/hort/.config/fish"),
+                    access: MountAccess::ReadOnly,
+                },
+                git_pointer_mount("demo"),
+            ]
         );
     }
 
@@ -1476,11 +1505,14 @@ mod tests {
         // it can only be in the spec at all if it was asked for first.
         assert_eq!(
             runtime.started_mounts(),
-            vec![SandboxMount {
-                source: FakeNotifyProvider::channel_of(&SandboxName::new("demo").unwrap()),
-                target: PathBuf::from("/run/hort/notify"),
-                access: MountAccess::ReadWrite,
-            }]
+            vec![
+                git_pointer_mount("demo"),
+                SandboxMount {
+                    source: FakeNotifyProvider::channel_of(&SandboxName::new("demo").unwrap()),
+                    target: PathBuf::from("/run/hort/notify"),
+                    access: MountAccess::ReadWrite,
+                },
+            ]
         );
     }
 
@@ -1508,8 +1540,9 @@ mod tests {
         // Nothing inside the box ever writes to a channel no agent announces
         // into, and the mount is writable: a sandbox that gets one anyway hands
         // an agent running without restrictions a writable path to the host for
-        // nothing in return.
-        assert!(runtime.started_mounts().is_empty());
+        // nothing in return. Only the always-present read-only `.git` pointer is
+        // carried, so the absence of anything beside it is the guarantee.
+        assert_eq!(runtime.started_mounts(), vec![git_pointer_mount("demo")]);
     }
 
     #[test]
@@ -1876,8 +1909,8 @@ mod tests {
         // thinking twice, and a cache keyed by sandbox would make the second box
         // of a project pay that price over again. The address is the witness,
         // because keying it by anything else is invisible until someone waits.
-        assert_eq!(first, vec![shared.clone()]);
-        assert_eq!(runtime.started_mounts(), vec![shared]);
+        assert_eq!(first, vec![shared.clone(), git_pointer_mount("first")]);
+        assert_eq!(runtime.started_mounts(), vec![shared, git_pointer_mount("second")]);
     }
 
     #[test]
@@ -1967,6 +2000,7 @@ mod tests {
                     target: PathBuf::from("/home/hort/.config/fish"),
                     access: MountAccess::ReadWrite,
                 },
+                git_pointer_mount("demo"),
             ]
         );
     }
