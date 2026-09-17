@@ -89,6 +89,41 @@ impl AttachCommand<'_> {
         name: SandboxName,
         terminal: bool,
     ) -> Result<(Session, Vec<Warning>), HortError> {
+        self.open(name, self.login_shell(), terminal)
+    }
+
+    /// Open a session in the sandbox named `name` that runs `command` with no
+    /// terminal, returning it so the caller can wait for it, along with whatever
+    /// the session had to go without.
+    ///
+    /// It is `run` with the caller's command in place of a login shell and no
+    /// pty: a command that ends rather than a shell a person types into, so
+    /// there is no terminal to lend it and it asks the sandbox for none.
+    /// Everything else is the same session, which is why both hand off to the
+    /// one assembly below.
+    pub fn run_command(
+        &self,
+        name: SandboxName,
+        command: Vec<String>,
+    ) -> Result<(Session, Vec<Warning>), HortError> {
+        self.open(name, command, false)
+    }
+
+    /// Open a session that execs `command` in the live sandbox named `name`,
+    /// giving it a pty of the sandbox's own when `terminal`.
+    ///
+    /// The shared body of `attach` and `run`. A name nothing knows, a name whose
+    /// anchor is gone, and a running sandbox whose container state is gone are
+    /// three different answers and all stop here, before any session opens. What
+    /// differs between the two callers is only what the session runs and whether
+    /// it holds a terminal; both stamp the attach time, because either is
+    /// activity that has to keep a box off `prune --idle`.
+    fn open(
+        &self,
+        name: SandboxName,
+        command: Vec<String>,
+        terminal: bool,
+    ) -> Result<(Session, Vec<Warning>), HortError> {
         if let Some(error) = attach_precondition_error(&self.env.detect()) {
             return Err(error);
         }
@@ -114,7 +149,7 @@ impl AttachCommand<'_> {
 
         let session = self.runtime.join_session(&SessionSpec {
             name,
-            command: self.login_shell(),
+            command,
             cwd: PathBuf::from(WORKDIR),
             env,
             terminal,
@@ -1373,5 +1408,202 @@ mod tests {
         // pid back: a caller with no pid to wait for returns to the host prompt
         // while the shell it just opened is still running.
         assert_eq!(session.pid, FakeRuntime::SESSION_PID);
+    }
+
+    #[test]
+    fn run_execs_the_given_command_in_the_session() {
+        let store = InMemoryMetadataStore::new();
+        store.put(&live_record()).unwrap();
+        let probe = ScriptedLivenessProbe::new(true);
+        let runtime = FakeRuntime::new(canned_token());
+        let clock = ScriptedClock::new(humantime::parse_rfc3339("2026-06-11T13:00:00Z").unwrap());
+        let env = FakeCapabilities::new(ready_host());
+        let proxy = FakeProxyEndpoint::without_proxy();
+        let config = config_with_shell(None);
+        let command = attach_command(
+            &store,
+            &probe,
+            &runtime,
+            &clock,
+            &env,
+            &proxy,
+            &config,
+            None,
+            Vec::new(),
+        );
+
+        command
+            .run_command(
+                SandboxName::new("demo").unwrap(),
+                vec!["ruff".to_string(), "check".to_string()],
+            )
+            .unwrap();
+
+        // The whole of what run adds over attach: the session execs the command
+        // the caller handed it rather than a login shell. attach's own tests pin
+        // the shell chain; a run that opened a shell would be an attach with a
+        // longer name.
+        assert_eq!(runtime.session_command(), vec!["ruff".to_string(), "check".to_string()]);
+    }
+
+    #[test]
+    fn run_asks_for_no_terminal() {
+        let store = InMemoryMetadataStore::new();
+        store.put(&live_record()).unwrap();
+        let probe = ScriptedLivenessProbe::new(true);
+        let runtime = FakeRuntime::new(canned_token());
+        let clock = ScriptedClock::new(humantime::parse_rfc3339("2026-06-11T13:00:00Z").unwrap());
+        let env = FakeCapabilities::new(ready_host());
+        let proxy = FakeProxyEndpoint::without_proxy();
+        let config = config_with_shell(None);
+        let command = attach_command(
+            &store,
+            &probe,
+            &runtime,
+            &clock,
+            &env,
+            &proxy,
+            &config,
+            None,
+            Vec::new(),
+        );
+
+        command.run_command(SandboxName::new("demo").unwrap(), vec!["true".to_string()]).unwrap();
+
+        // run is a command that ends, not a shell a person types into, so there
+        // is no terminal to lend it and it asks the sandbox for none. A session
+        // that asked for a pty nobody relays would block the box on a master no
+        // one reads.
+        assert!(!runtime.session_terminal());
+    }
+
+    #[test]
+    fn run_records_the_time_as_an_attach() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&live_record()).unwrap();
+        let probe = ScriptedLivenessProbe::new(true);
+        let runtime = FakeRuntime::new(canned_token());
+        let clock = ScriptedClock::new(humantime::parse_rfc3339("2026-06-11T13:00:00Z").unwrap());
+        let env = FakeCapabilities::new(ready_host());
+        let proxy = FakeProxyEndpoint::without_proxy();
+        let config = config_with_shell(None);
+        let command = attach_command(
+            &store,
+            &probe,
+            &runtime,
+            &clock,
+            &env,
+            &proxy,
+            &config,
+            None,
+            Vec::new(),
+        );
+
+        command.run_command(name.clone(), vec!["true".to_string()]).unwrap();
+
+        // Running a command in a box is activity, so it stamps the same marker an
+        // attach does: a box an orchestrator is driving command by command must
+        // not read as idle to `prune --idle` between two of them.
+        let persisted = store.get(&name).unwrap().unwrap();
+        assert_eq!(persisted.last_attach_at(), "2026-06-11T13:00:00Z");
+    }
+
+    #[test]
+    fn run_errors_absent_for_an_unknown_name() {
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(true);
+        let runtime = FakeRuntime::new(canned_token());
+        let clock = ScriptedClock::new(humantime::parse_rfc3339("2026-06-11T13:00:00Z").unwrap());
+        let env = FakeCapabilities::new(ready_host());
+        let proxy = FakeProxyEndpoint::without_proxy();
+        let config = config_with_shell(None);
+        let command = attach_command(
+            &store,
+            &probe,
+            &runtime,
+            &clock,
+            &env,
+            &proxy,
+            &config,
+            None,
+            Vec::new(),
+        );
+
+        let result =
+            command.run_command(SandboxName::new("demo").unwrap(), vec!["true".to_string()]);
+
+        // run reaches a live box the same way attach does, so a name nothing
+        // knows stops in the same place with the same answer.
+        assert_eq!(
+            result.unwrap_err(),
+            HortError::UnknownSandboxOnAttach { name: "demo".to_string() }
+        );
+        assert!(runtime.joins().is_empty());
+    }
+
+    #[test]
+    fn run_errors_not_running_for_an_orphaned_record() {
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo")).unwrap();
+        let probe = ScriptedLivenessProbe::new(false);
+        let runtime = FakeRuntime::new(canned_token());
+        let clock = ScriptedClock::new(humantime::parse_rfc3339("2026-06-11T13:00:00Z").unwrap());
+        let env = FakeCapabilities::new(ready_host());
+        let proxy = FakeProxyEndpoint::without_proxy();
+        let config = config_with_shell(None);
+        let command = attach_command(
+            &store,
+            &probe,
+            &runtime,
+            &clock,
+            &env,
+            &proxy,
+            &config,
+            None,
+            Vec::new(),
+        );
+
+        let result =
+            command.run_command(SandboxName::new("demo").unwrap(), vec!["true".to_string()]);
+
+        // There is no session to join in a box whose anchor is gone, so a record
+        // without a live anchor refuses before the command is ever run, the same
+        // arm attach refuses on.
+        assert_eq!(result.unwrap_err(), HortError::SandboxNotRunning { name: "demo".to_string() });
+        assert!(runtime.joins().is_empty());
+    }
+
+    #[test]
+    fn run_refuses_a_live_sandbox_whose_container_state_is_gone() {
+        let store = InMemoryMetadataStore::new();
+        store.put(&live_record_on_branch("feature")).unwrap();
+        let probe = ScriptedLivenessProbe::new(true);
+        let runtime = FakeRuntime::new(canned_token()).without_container_state();
+        let clock = ScriptedClock::new(humantime::parse_rfc3339("2026-06-11T13:00:00Z").unwrap());
+        let env = FakeCapabilities::new(ready_host());
+        let proxy = FakeProxyEndpoint::without_proxy();
+        let config = config_with_shell(None);
+        let command = attach_command(
+            &store,
+            &probe,
+            &runtime,
+            &clock,
+            &env,
+            &proxy,
+            &config,
+            None,
+            Vec::new(),
+        );
+
+        let result =
+            command.run_command(SandboxName::new("demo").unwrap(), vec!["true".to_string()]);
+
+        // A session joins through container state a removal under the runtime
+        // root can take while the anchor still stands, so run stops on the same
+        // condition attach does rather than fail inside the runtime. attach's own
+        // tests pin the message; run only has to route through it.
+        assert!(matches!(result.unwrap_err(), HortError::ContainerStateGone { .. }));
+        assert!(runtime.joins().is_empty());
     }
 }

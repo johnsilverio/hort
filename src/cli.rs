@@ -1,14 +1,14 @@
 //! CLI surface: the clap v4 derive definitions for the subcommands hort exposes,
 //! their dispatch, and the pure `ls`, `prune`, `doctor` and warning renderers.
 //!
-//! Only subcommands that work end to end ship here, and with `doctor` that is now
-//! the whole surface: `up`, `attach`, `ls`, `down`, `prune`, `config` and
-//! `doctor`. A command the binary names is one the binary can run.
+//! Only subcommands that work end to end ship here: `up`, `attach`, `run`, `ls`,
+//! `down`, `prune`, `config` and `doctor`. A command the binary names is one the
+//! binary can run.
 //!
-//! A run that opened a session leaves with the status that session exited with,
-//! which is what lets a script tell what ran inside a sandbox from what hort
-//! itself did. That collides with hort's own exit codes, the same trade `ssh`
-//! makes.
+//! A command that opened a session (`up` without `-d`, `attach`, `run`) leaves
+//! with the status that session exited with, which is what lets a script tell
+//! what ran inside a sandbox from what hort itself did. That collides with hort's
+//! own exit codes, the same trade `ssh` makes.
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -46,7 +46,7 @@ use crate::domain::onboarding::onboarding_is_due;
 use crate::domain::preconditions::hard_preconditions_are_met;
 use crate::domain::prune::SkipReason;
 use crate::domain::reconcile::SandboxState;
-use crate::ports::SessionTerminal;
+use crate::ports::{Session, SessionTerminal};
 
 /// The parsed command line: one subcommand and its flags.
 #[derive(Parser)]
@@ -76,6 +76,14 @@ pub enum CliCommand {
     Attach {
         /// The sandbox to join.
         name: String,
+    },
+    /// Run one command in a running sandbox with no terminal.
+    Run {
+        /// The sandbox to run the command in.
+        name: String,
+        /// The command and its arguments, taken verbatim after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
     },
     /// List every sandbox with its reconciled state.
     Ls,
@@ -319,6 +327,12 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<u8, HortError> {
             eprint!("{}", render_warnings(&config_warnings, &[]));
             open_session(deps, name, &config)
         }
+        CliCommand::Run { name, command } => {
+            let name = SandboxName::new(&name)?;
+            let (config, config_warnings) = resolve_configuration(deps)?;
+            eprint!("{}", render_warnings(&config_warnings, &[]));
+            run_in_session(deps, name, command, &config)
+        }
         CliCommand::Ls => {
             let command = LsCommand::new(
                 &deps.store,
@@ -444,7 +458,30 @@ fn open_session(
     name: SandboxName,
     config: &ResolvedConfig,
 ) -> Result<u8, HortError> {
-    let command = AttachCommand::new(
+    let opened = session_command(deps, config).run(name, std::io::stdin().is_terminal())?;
+    relay_session(deps, opened)
+}
+
+/// Run `command` in `name` with no terminal and report what it exited with, so a
+/// script or an orchestrator can tell what ran inside the box from what hort
+/// itself did. It is `open_session` with the caller's command instead of a login
+/// shell and no pty to allocate.
+fn run_in_session(
+    deps: &RealDeps,
+    name: SandboxName,
+    command: Vec<String>,
+    config: &ResolvedConfig,
+) -> Result<u8, HortError> {
+    let opened = session_command(deps, config).run_command(name, command)?;
+    relay_session(deps, opened)
+}
+
+/// The session command wired to the real adapters, shared by the two paths that
+/// open one. It grows a member whenever a session learns to carry one more thing,
+/// so building it in one place is what keeps `attach` and `run` from drifting
+/// apart on the next such addition.
+fn session_command<'a>(deps: &'a RealDeps, config: &'a ResolvedConfig) -> AttachCommand<'a> {
+    AttachCommand::new(
         &deps.store,
         &deps.probe,
         &deps.runtime,
@@ -454,8 +491,13 @@ fn open_session(
         config,
         std::env::var("SHELL").ok(),
         std::env::vars().collect(),
-    );
-    let (session, warnings) = command.run(name, std::io::stdin().is_terminal())?;
+    )
+}
+
+/// Print whatever the session had to go without, then hold its terminal until it
+/// ends and hand back the code the caller leaves with.
+fn relay_session(deps: &RealDeps, opened: (Session, Vec<Warning>)) -> Result<u8, HortError> {
+    let (session, warnings) = opened;
     eprint!("{}", render_warnings(&[], &warnings));
     Ok(session_exit_code(deps.terminal.relay(session)?))
 }

@@ -20,6 +20,7 @@
 - [Commands](commands/index.md)
   - [hort up](commands/up.md)
   - [hort attach](commands/attach.md)
+  - [hort run](commands/run.md)
   - [hort ls](commands/ls.md)
   - [hort down](commands/down.md)
   - [hort prune](commands/prune.md)

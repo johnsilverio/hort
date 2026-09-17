@@ -4284,3 +4284,132 @@ fn cli_a_raw_connection_still_fails_after_the_agent_tried_to_open_a_route() {
         .assert()
         .success();
 }
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_run_executes_the_command_inside_the_sandbox() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", sandbox.name().as_str()])
+        .assert()
+        .success();
+
+    // run is the sibling of attach: it joins the live box and execs the command
+    // the caller named instead of a login shell, and the command's own stdout
+    // comes back on hort's. An orchestrator on the host drives a box this way.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["run", sandbox.name().as_str(), "--", "echo", "ran-inside-the-sandbox"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ran-inside-the-sandbox"));
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_run_propagates_a_nonzero_exit_code() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", sandbox.name().as_str()])
+        .assert()
+        .success();
+
+    // hort leaves with the command's own status, which is the whole point of run
+    // for a script: a command that failed inside the box has to be tellable from
+    // hort failing to open the box, and a build that returned zero regardless
+    // would read every failure as a success.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["run", sandbox.name().as_str(), "--", "sh", "-c", "exit 7"])
+        .assert()
+        .code(7);
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_run_reports_a_signalled_command_as_128_plus_the_signal() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", sandbox.name().as_str()])
+        .assert()
+        .success();
+
+    // The exit byte of a signalled command's wait status is zero, so without the
+    // shell's 128+signal rule a command the kernel killed reads to a script as
+    // one that finished its work. SIGKILL is uncatchable, so 137 is the same
+    // number on every run rather than something the command could trap away.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["run", sandbox.name().as_str(), "--", "sh", "-c", "kill -KILL $$"])
+        .assert()
+        .code(137);
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}

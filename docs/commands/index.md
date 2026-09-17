@@ -4,6 +4,7 @@
 | :--- | :--- | :--- |
 | [`hort up <name>`](up.md) | Build a sandbox (or finish a half-built one) and open a session in it. | yes |
 | [`hort attach <name>`](attach.md) | Open another session in a running sandbox. | records the attach time |
+| [`hort run <name> -- <cmd>`](run.md) | Run one command in a running sandbox with no terminal, exiting with its status. | records the attach time |
 | [`hort ls`](ls.md) | List every sandbox with its state, sessions, age, idle time, branch and dirty state. | no |
 | [`hort down <name>`](down.md) | Tear a sandbox down: processes, container, worktree, record. | yes |
 | [`hort prune`](prune.md) | Remove debris and, if asked, idle sandboxes, after confirming. | yes |
@@ -16,7 +17,7 @@
 
 - `0`: the command succeeded.
 - `1`: hort refused or failed; the reason is printed on stderr as one line.
-- For `hort up` without `-d` and for `hort attach`, once the session has opened: **the exit status of the session**, or `128 + signal` if it was killed by a signal. A shell you leave with `exit 3` makes hort exit with 3.
+- For `hort up` without `-d`, `hort attach` and `hort run`, once the session has opened: **the exit status of the session**, or `128 + signal` if it was killed by a signal. A shell you leave with `exit 3` makes hort exit with 3.
 - `hort doctor`: `1` when a hard requirement of the host is missing, even though the report is printed.
 
 ## Output
