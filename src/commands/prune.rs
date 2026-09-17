@@ -1041,6 +1041,93 @@ mod tests {
     }
 
     #[test]
+    fn prune_treats_an_unreadable_creation_time_of_a_live_sandbox_as_unknown_idle() {
+        let name = SandboxName::new("demo").unwrap();
+        let record = SandboxRecord::new(
+            name.clone(),
+            Some(BranchName::new("demo").unwrap()),
+            PathBuf::from("/state/sandboxes/demo/worktree-demo"),
+            PathBuf::from("/state/sandboxes/demo/overlay"),
+            "not a timestamp".to_string(),
+            "2026-06-11T12:00:00Z".to_string(),
+            None,
+            PathBuf::from("/home/tester/projects/demo"),
+        )
+        .with_token(canned_token());
+        let store = InMemoryMetadataStore::new();
+        store.put(&record).unwrap();
+        let registry = FakeRegistry::new(vec![(name.clone(), canned_token())]);
+        let worktrees = FakeWorktreeProvider::new().with_listed_worktree(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let now = humantime::parse_rfc3339("2026-06-11T13:00:00Z").unwrap();
+        let clock = ScriptedClock::new(now);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches, &notify,
+        );
+
+        let report = command.run(Some(Duration::from_secs(1800)), false, true).unwrap();
+
+        // Idle counts from the latest of the two times, so the one that still
+        // reads, an hour ago, is only a lower bound: the creation time hort cannot
+        // read might be a minute old. Guessing either way is wrong, one hands the
+        // box to the threshold and the other withholds it without saying why.
+        assert!(report.removed.is_empty());
+        assert_eq!(
+            report.skipped,
+            vec![PruneSkip { name: "demo".to_string(), reason: SkipReason::UnknownIdle }]
+        );
+    }
+
+    #[test]
+    fn prune_treats_an_unreadable_last_attach_time_of_a_live_sandbox_as_unknown_idle() {
+        let name = SandboxName::new("demo").unwrap();
+        let record = SandboxRecord::new(
+            name.clone(),
+            Some(BranchName::new("demo").unwrap()),
+            PathBuf::from("/state/sandboxes/demo/worktree-demo"),
+            PathBuf::from("/state/sandboxes/demo/overlay"),
+            "2026-06-11T12:00:00Z".to_string(),
+            "not a timestamp".to_string(),
+            None,
+            PathBuf::from("/home/tester/projects/demo"),
+        )
+        .with_token(canned_token());
+        let store = InMemoryMetadataStore::new();
+        store.put(&record).unwrap();
+        let registry = FakeRegistry::new(vec![(name.clone(), canned_token())]);
+        let worktrees = FakeWorktreeProvider::new().with_listed_worktree(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let now = humantime::parse_rfc3339("2026-06-11T13:00:00Z").unwrap();
+        let clock = ScriptedClock::new(now);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches, &notify,
+        );
+
+        let report = command.run(Some(Duration::from_secs(1800)), false, true).unwrap();
+
+        // The creation time says an hour, but a box somebody attached to a
+        // minute ago is created long before it is last touched, so an attach
+        // time hort cannot read leaves the idle unknown rather than an hour.
+        assert!(report.removed.is_empty());
+        assert_eq!(
+            report.skipped,
+            vec![PruneSkip { name: "demo".to_string(), reason: SkipReason::UnknownIdle }]
+        );
+    }
+
+    #[test]
     fn prune_spares_a_sandbox_whose_agent_just_finished() {
         let finished = SandboxName::new("finished").unwrap();
         let stale = SandboxName::new("stale").unwrap();
