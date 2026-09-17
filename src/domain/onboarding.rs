@@ -90,6 +90,7 @@ pub fn generate_config(
         entries: vec![
             rootfs_entry(answers.rootfs.as_deref()),
             mounts_entry(&answers.dotfiles),
+            git_entry(),
             egress_entry(),
             agents_entry(&answers.agents),
             notifications_entry(answers.notifications, caps.notify_send.is_some()),
@@ -142,6 +143,28 @@ fn mounts_entry(dotfiles: &[String]) -> Entry {
     Entry::Active {
         note: vec!["Host paths every sandbox mounts read-only, dotfiles and the like.".to_string()],
         body: object("mounts", array("readOnly", quoted_items(dotfiles))),
+    }
+}
+
+/// How a sandbox gets git into `/workdir`, which stays commented because the
+/// default is a worktree and clone mode is opt-in: an active entry would put
+/// every project of this host into it.
+///
+/// The note carries the two things a reader has to weigh before turning it on,
+/// because this file is where they turn it on and the one that says so in the
+/// moment beats the one that says so in the documentation.
+fn git_entry() -> Entry {
+    Entry::Commented {
+        note: vec![
+            "Uncomment to give each sandbox a clone of its own, so an agent can commit".to_string(),
+            "and open a pull request from inside. The default, worktree, keeps git a".to_string(),
+            "host activity. A token you pass in so the agent can push lives inside the".to_string(),
+            "box with it: scope it to one repository and protect the remote's branches."
+                .to_string(),
+            "The clone borrows your history instead of copying it and costs about as".to_string(),
+            "much disk as a worktree: 2.3 GB of history gave a .git of about 6 MB.".to_string(),
+        ],
+        body: vec![r#""git": "clone","#.to_string()],
     }
 }
 
@@ -534,6 +557,26 @@ mod tests {
         assert!(
             rendered.contains(&format!("// {taught}")),
             "and it is what the file says, closing brace and all: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_generated_config_warns_about_clone_mode_where_it_offers_it() {
+        let (document, _warnings) =
+            generate_config(&host_with_everything(), &answers_with_a_rootfs());
+        let rendered = document.render();
+
+        assert!(
+            rendered.contains(r#"// "git": "clone","#),
+            "the mode that gives a sandbox a git of its own is offered commented, so the default stays worktree: {rendered}"
+        );
+        assert!(
+            rendered.contains("token") && rendered.contains("protect the remote's branches"),
+            "and the note says a pushing credential lives inside the box, and what to do about that: {rendered}"
+        );
+        assert!(
+            rendered.contains("borrows your history") && rendered.contains("6 MB"),
+            "and that the history is borrowed rather than copied, with the measured disk cost: {rendered}"
         );
     }
 

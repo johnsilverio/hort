@@ -57,6 +57,14 @@ A commented JSONC file. Everything your host cannot do, or that you did not ask 
     "readOnly": [],
   },
 
+  // Uncomment to give each sandbox a clone of its own, so an agent can commit
+  // and open a pull request from inside. The default, worktree, keeps git a
+  // host activity. A token you pass in so the agent can push lives inside the
+  // box with it: scope it to one repository and protect the remote's branches.
+  // The clone borrows your history instead of copying it and costs about as
+  // much disk as a worktree: 2.3 GB of history gave a .git of about 6 MB.
+  // "git": "clone",
+
   // Outbound is open and unfiltered until this is uncommented. With a list, a
   // sandbox reaches only these hosts, and only through tools that read
   // HTTP_PROXY. A bare name matches exactly, and "*." covers subdomains
