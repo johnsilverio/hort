@@ -120,11 +120,16 @@ impl HostHelper {
         outcome
     }
 
-    /// Whether the one this sandbox recorded is still running, asked the way
-    /// `stop` asks before it signals: the file names a process, and that process
-    /// still says it is this helper. A sandbox that never had one has none.
+    /// Whether the one this sandbox recorded is still running: the file names a
+    /// process, that process still says it is this helper, and it has not
+    /// exited. A sandbox that never had one has none.
+    ///
+    /// This asks one thing more than `stop` does before it signals. A helper
+    /// that died and was never reaped keeps its name in the process table, so
+    /// it is still the process that was recorded, which is what lets `stop`
+    /// take it out of the table, and it is no longer carrying anything.
     pub fn running(&self, sandbox_dir: &Path) -> bool {
-        self.recorded(sandbox_dir).is_some_and(|pid| self.names(pid))
+        self.recorded(sandbox_dir).is_some_and(|pid| self.names(pid) && has_not_exited(pid))
     }
 
     fn pid_file_in(&self, sandbox_dir: &Path) -> PathBuf {
@@ -372,6 +377,18 @@ pub(crate) fn a_declared_port() -> u16 {
     panic!("no port between {FIRST} and {LAST} is free to declare");
 }
 
+/// Whether the kernel still reports `pid` as a process that has not exited.
+/// Asked of the state the kernel states rather than inferred from an empty
+/// command line, which is only what exiting happens to leave behind. A process
+/// the table no longer holds has exited too.
+fn has_not_exited(pid: libc::pid_t) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|status| {
+        status.lines().find_map(|line| line.strip_prefix("State:")).is_some_and(|state| {
+            !matches!(state.trim_start().chars().next(), Some('Z' | 'X') | None)
+        })
+    })
+}
+
 /// Take the exit status of a helper this process is the one that started, so the
 /// stopped process leaves the table instead of staying in it as a corpse that
 /// still answers to its name. Usually there is nothing to take: a sandbox is
@@ -441,10 +458,65 @@ mod tests {
         assert_eq!(session, pid, "the test process's own session is {}", session_of(0));
     }
 
+    #[test]
+    fn a_helper_that_died_and_was_never_reaped_is_not_running() {
+        let sandbox = tempfile::tempdir().unwrap();
+        A_HELPER.start(sandbox.path(), &[], || sleep(LINGERS)).unwrap();
+        let pid = A_HELPER.recorded(sandbox.path()).expect("the pid start recorded");
+        kill_without_reaping(pid);
+
+        let running = A_HELPER.running(sandbox.path());
+
+        A_HELPER.stop(sandbox.path()).unwrap();
+        // The hort that started a helper outlives it for as long as a session it
+        // opened is in use, and waits only on that session, so a helper that dies
+        // meanwhile stays in the table under its own name until hort leaves. Read
+        // as running, it makes a sandbox with nothing carrying its traffic look
+        // healthy, and a second build of it is refused as a duplicate.
+        assert!(!running);
+    }
+
+    #[test]
+    fn stopping_a_helper_that_died_and_was_never_reaped_reaps_it() {
+        let sandbox = tempfile::tempdir().unwrap();
+        A_HELPER.start(sandbox.path(), &[], || sleep(LINGERS)).unwrap();
+        let pid = A_HELPER.recorded(sandbox.path()).expect("the pid start recorded");
+        kill_without_reaping(pid);
+
+        A_HELPER.stop(sandbox.path()).unwrap();
+
+        // A dead helper no longer counts as running, but it is still the process
+        // that was recorded, and the stop is the only thing in a long-lived hort
+        // that will ever take it out of the table.
+        assert!(left_nothing_to_reap(pid));
+    }
+
     /// The session a process belongs to, asked of the kernel. A session is
     /// named by the pid of its leader, so a process whose session carries its
     /// own pid is one that leads it.
     fn session_of(pid: libc::pid_t) -> libc::pid_t {
         unsafe { libc::getsid(pid) }
+    }
+
+    /// Kill a helper this process started and return once the kernel reports it
+    /// dead, leaving it unreaped. The wait asks not to consume what it reports,
+    /// so what is left is a process that has exited and is still in the table
+    /// waiting for its parent, and never one that is already gone.
+    fn kill_without_reaping(pid: libc::pid_t) {
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0, "signalling {pid}");
+        let mut exited: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let waited = unsafe {
+            libc::waitid(libc::P_PID, pid as libc::id_t, &mut exited, libc::WEXITED | libc::WNOWAIT)
+        };
+        assert_eq!(waited, 0, "waiting on {pid}: {}", io::Error::last_os_error());
+    }
+
+    /// Whether the kernel holds nothing more of `pid` for this process to
+    /// collect: it is no longer a child here, dead or alive.
+    fn left_nothing_to_reap(pid: libc::pid_t) -> bool {
+        let mut exited: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let options = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+        let waited = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut exited, options) };
+        waited == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
     }
 }
