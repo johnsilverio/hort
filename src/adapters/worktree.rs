@@ -6,9 +6,23 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use crate::domain::config::GitMode;
 use crate::domain::error::HortError;
 use crate::domain::model::{BranchName, SandboxName};
+use crate::domain::mounts::GIT_OBJECTS;
 use crate::ports::{Worktree, WorktreeProvider};
+
+/// The name a clone knows the host repository by. It exists so a box can bring
+/// host work in, never to send work out: the remote a `git clone --shared`
+/// leaves behind accepts a push straight into the host repository, which is the
+/// write the sandbox model forbids.
+const HOST_REMOTE: &str = "hort-base";
+
+/// The push address of `HOST_REMOTE`, which names no repository anywhere. That
+/// is what closes the write channel: measured on git 2.55, an empty push
+/// address is ignored and the push goes through, while this one git refuses by
+/// itself, naming the reason in the message the agent reads.
+const HOST_REMOTE_PUSH_URL: &str = "hort-base-is-fetch-only";
 
 /// A `WorktreeProvider` backed by the system `git`, rooted at the project
 /// repository and the hort state directory the worktrees live under.
@@ -61,11 +75,10 @@ impl GitWorktreeProvider {
             })
             .ok_or_else(missing)
     }
-}
 
-impl WorktreeProvider for GitWorktreeProvider {
-    fn create(&self, name: &SandboxName, branch: &BranchName) -> Result<Worktree, HortError> {
-        let path = self.worktree_path(name);
+    /// Add a worktree of the project repository at `path`, checked out on
+    /// `branch`.
+    fn add_worktree(&self, path: &Path, branch: &BranchName) -> Result<(), HortError> {
         // Clear any stale registration left by a worktree directory that vanished
         // outside hort, so the add does not refuse the path or the branch the dead
         // entry still holds. This is also the resume path for a half-built sandbox.
@@ -85,6 +98,102 @@ impl WorktreeProvider for GitWorktreeProvider {
                 "worktree add",
                 &["worktree", "add", "-b", branch.as_str(), path_arg.as_ref(), "HEAD"],
             )?;
+        }
+        Ok(())
+    }
+
+    /// Give the sandbox a repository of its own at `path`, checked out on
+    /// `branch`. One act rather than several, because each step past the clone
+    /// itself is what keeps the clone usable: without the pin the host's own gc
+    /// can prune an object the clone borrows, without the rewired remotes the
+    /// box can write the host repository, and without the recorded object path
+    /// the clone finds no objects inside the box.
+    fn clone_repository(
+        &self,
+        name: &SandboxName,
+        path: &Path,
+        branch: &BranchName,
+    ) -> Result<(), HortError> {
+        let source_arg = self.repo_dir.to_string_lossy();
+        let path_arg = path.to_string_lossy();
+        run(
+            &self.repo_dir,
+            "clone",
+            &["clone", "--shared", source_arg.as_ref(), path_arg.as_ref()],
+        )?;
+        if self.branch_exists(branch)? {
+            run(path, "checkout", &["checkout", branch.as_str()])?;
+        } else {
+            run(path, "checkout", &["checkout", "-b", branch.as_str()])?;
+        }
+        self.wire_remotes(path)?;
+        self.pin_clone_base(name, path)?;
+        record_box_object_store(path)
+    }
+
+    /// Point the clone's remotes where a push is safe. `origin` becomes the host
+    /// repository's own remote, so an agent pushes its branch where the project
+    /// lives and opens a pull request with nothing to configure; a project with
+    /// no remote of its own leaves the clone without one, because hort invents a
+    /// remote no more than it invents an allowlist. The host repository stays
+    /// reachable for fetching, under a name whose push address resolves nowhere.
+    fn wire_remotes(&self, clone: &Path) -> Result<(), HortError> {
+        match self.host_remote_url()? {
+            Some(url) => {
+                run(clone, "remote set-url", &["remote", "set-url", "origin", &url])?;
+            }
+            None => {
+                run(clone, "remote remove", &["remote", "remove", "origin"])?;
+            }
+        }
+        let source_arg = self.repo_dir.to_string_lossy();
+        run(clone, "remote add", &["remote", "add", HOST_REMOTE, source_arg.as_ref()])?;
+        run(
+            clone,
+            "remote set-url",
+            &["remote", "set-url", "--push", HOST_REMOTE, HOST_REMOTE_PUSH_URL],
+        )?;
+        Ok(())
+    }
+
+    /// Where the project repository itself pushes, and nothing when it pushes
+    /// nowhere. Absence is an answer here and not a failure, so a repository
+    /// with no remote is read rather than refused.
+    fn host_remote_url(&self) -> Result<Option<String>, HortError> {
+        let output = capture(&self.repo_dir, "remote get-url", &["remote", "get-url", "origin"])?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_string()))
+    }
+
+    /// Hold the commit the clone stands on in the host repository, so the host's
+    /// own gc cannot prune an object the clone borrows instead of owning. A
+    /// repository with no commit stands on nothing and has no object a gc could
+    /// prune, so it is left unpinned rather than refused, the way the worktree
+    /// route accepts one too.
+    fn pin_clone_base(&self, name: &SandboxName, clone: &Path) -> Result<(), HortError> {
+        let base = capture(clone, "rev-parse", &["rev-parse", "HEAD"])?;
+        if !base.status.success() {
+            return Ok(());
+        }
+        let commit = String::from_utf8_lossy(&base.stdout).trim().to_string();
+        let pin = format!("refs/hort/{}/base", name.as_str());
+        run(&self.repo_dir, "update-ref", &["update-ref", &pin, &commit]).map(|_| ())
+    }
+}
+
+impl WorktreeProvider for GitWorktreeProvider {
+    fn create(
+        &self,
+        name: &SandboxName,
+        branch: &BranchName,
+        mode: GitMode,
+    ) -> Result<Worktree, HortError> {
+        let path = self.worktree_path(name);
+        match mode {
+            GitMode::Worktree => self.add_worktree(&path, branch)?,
+            GitMode::Clone => self.clone_repository(name, &path, branch)?,
         }
         Ok(Worktree { path })
     }
@@ -126,6 +235,21 @@ impl WorktreeProvider for GitWorktreeProvider {
 
     fn exists(&self, path: &Path) -> bool {
         path.is_dir()
+    }
+
+    fn git_mode_at(&self, path: &Path) -> Option<GitMode> {
+        // The shape of `.git` is the whole answer, and no git command is needed
+        // for it: a clone carries its repository in a directory of its own,
+        // while a worktree carries a file pointing at the administrative
+        // directory the project repository keeps for it.
+        let git = path.join(".git");
+        if git.is_dir() {
+            Some(GitMode::Clone)
+        } else if git.is_file() {
+            Some(GitMode::Worktree)
+        } else {
+            None
+        }
     }
 
     fn is_git_repo(&self) -> Result<bool, HortError> {
@@ -209,6 +333,16 @@ fn run(dir: &Path, op: &str, args: &[&str]) -> Result<String, HortError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Record inside the clone where the objects it borrows will be, which is a
+/// path of the box and not of the host: git resolves that path on whichever
+/// machine it runs on, and this clone is read inside the box. Written last,
+/// because from here on the host itself can no longer read the clone's objects.
+fn record_box_object_store(clone: &Path) -> Result<(), HortError> {
+    let alternates = clone.join(".git").join("objects").join("info").join("alternates");
+    std::fs::write(&alternates, format!("{GIT_OBJECTS}\n"))
+        .map_err(|err| HortError::GitCommandFailed { detail: format!("clone alternates: {err}") })
+}
+
 /// One worktree as `git worktree list --porcelain` reports it: the host path on
 /// the `worktree <path>` line that opens the record, and the attribute lines
 /// that follow it up to the next record.
@@ -262,6 +396,8 @@ mod tests {
     use std::process::Command;
 
     use tempfile::TempDir;
+
+    use crate::domain::mounts::GIT_OBJECTS;
 
     /// A scratch directory whose path is canonicalized, so the worktree paths the
     /// provider derives and the paths git reports back compare equal regardless of
@@ -325,6 +461,21 @@ mod tests {
         rev_parse(worktree, "HEAD")
     }
 
+    /// Run a real git command against a clone, lending it the host object store
+    /// through the environment, and return the raw outcome. A clone records the
+    /// object path the box will have and the host does not, so a test that
+    /// drives git against one has to supply the borrow the box gets by mount:
+    /// without it every object read fails and a push is refused for a reason
+    /// that has nothing to do with the remote under test.
+    fn git_borrowing_objects(dir: &Path, objects: &Path, args: &[&str]) -> Output {
+        Command::new("git")
+            .current_dir(dir)
+            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", objects)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
     fn rev_parse(dir: &Path, rev: &str) -> String {
         git(dir, &["rev-parse", rev]).trim().to_string()
     }
@@ -347,7 +498,7 @@ mod tests {
         let name = SandboxName::new("demo").unwrap();
         let branch = BranchName::new("demo").unwrap();
 
-        let worktree = provider.create(&name, &branch).unwrap();
+        let worktree = provider.create(&name, &branch, GitMode::Worktree).unwrap();
 
         assert_eq!(worktree.path, canonical_worktree(&state_root, &name));
         assert_eq!(rev_parse(&repo, "refs/heads/demo"), head);
@@ -364,7 +515,7 @@ mod tests {
         let name = SandboxName::new("work").unwrap();
         let branch = BranchName::new("feature-x").unwrap();
 
-        let worktree = provider.create(&name, &branch).unwrap();
+        let worktree = provider.create(&name, &branch, GitMode::Worktree).unwrap();
 
         assert_eq!(worktree.path, canonical_worktree(&state_root, &name));
         assert_eq!(current_branch(&worktree.path), "feature-x");
@@ -378,10 +529,10 @@ mod tests {
         let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
         let name = SandboxName::new("demo").unwrap();
         let branch = BranchName::new("demo").unwrap();
-        let first = provider.create(&name, &branch).unwrap();
+        let first = provider.create(&name, &branch, GitMode::Worktree).unwrap();
         fs::remove_dir_all(&first.path).unwrap();
 
-        let again = provider.create(&name, &branch).unwrap();
+        let again = provider.create(&name, &branch, GitMode::Worktree).unwrap();
 
         assert_eq!(again.path, canonical_worktree(&state_root, &name));
         assert!(again.path.exists());
@@ -397,7 +548,7 @@ mod tests {
         let name = SandboxName::new("demo").unwrap();
         let branch = BranchName::new("demo").unwrap();
 
-        let result = provider.create(&name, &branch);
+        let result = provider.create(&name, &branch, GitMode::Worktree);
 
         assert!(matches!(result, Err(HortError::GitCommandFailed { .. })));
     }
@@ -409,7 +560,7 @@ mod tests {
         init_repo_with_commit(&repo);
         let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
         let name = SandboxName::new("demo").unwrap();
-        provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+        provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
 
         let listed = provider.list().unwrap();
 
@@ -424,7 +575,8 @@ mod tests {
         init_repo_with_commit(&repo);
         let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
         let name = SandboxName::new("demo").unwrap();
-        let worktree = provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+        let worktree =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
         fs::remove_dir_all(&worktree.path).unwrap();
 
         let listed = provider.list().unwrap();
@@ -456,7 +608,8 @@ mod tests {
         init_repo_with_commit(&repo);
         let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
         let name = SandboxName::new("demo").unwrap();
-        let worktree = provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+        let worktree =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
         fs::remove_dir_all(&worktree.path).unwrap();
 
         assert!(!provider.exists(&worktree.path));
@@ -469,7 +622,8 @@ mod tests {
         init_repo_with_commit(&repo);
         let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
         let name = SandboxName::new("demo").unwrap();
-        let worktree = provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+        let worktree =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
 
         provider.remove(&name).unwrap();
 
@@ -496,7 +650,8 @@ mod tests {
         init_repo_with_commit(&repo);
         let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
         let name = SandboxName::new("demo").unwrap();
-        let worktree = provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+        let worktree =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
         fs::remove_dir_all(&worktree.path).unwrap();
 
         provider.remove(&name).unwrap();
@@ -512,7 +667,8 @@ mod tests {
         init_repo_with_commit(&repo);
         let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
         let name = SandboxName::new("demo").unwrap();
-        let worktree = provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+        let worktree =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
         fs::remove_file(worktree.path.join(".git")).unwrap();
 
         // An agent that deletes the pointer file of its own worktree, which a
@@ -529,7 +685,8 @@ mod tests {
         init_repo_with_commit(&repo);
         let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
         let name = SandboxName::new("demo").unwrap();
-        let worktree = provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+        let worktree =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
         fs::remove_file(worktree.path.join(".git")).unwrap();
 
         provider.remove(&name).unwrap();
@@ -545,7 +702,8 @@ mod tests {
         init_repo_with_commit(&repo);
         let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
         let name = SandboxName::new("demo").unwrap();
-        let worktree = provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+        let worktree =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
         let tip = commit_in_worktree(&worktree.path, "work.txt", "work\n");
         fs::remove_file(worktree.path.join(".git")).unwrap();
 
@@ -564,7 +722,8 @@ mod tests {
         init_repo_with_commit(&repo);
         let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
         let name = SandboxName::new("demo").unwrap();
-        let worktree = provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+        let worktree =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
         let tip = commit_in_worktree(&worktree.path, "work.txt", "work\n");
 
         provider.remove(&name).unwrap();
@@ -620,7 +779,7 @@ mod tests {
         git(&repo, &["branch", "feature-x"]);
         let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
         let name = SandboxName::new("work").unwrap();
-        provider.create(&name, &BranchName::new("feature-x").unwrap()).unwrap();
+        provider.create(&name, &BranchName::new("feature-x").unwrap(), GitMode::Worktree).unwrap();
 
         let holders = provider.checked_out_at(&BranchName::new("feature-x").unwrap()).unwrap();
 
@@ -636,7 +795,11 @@ mod tests {
         init_repo_with_commit(&repo);
         let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
         provider
-            .create(&SandboxName::new("work").unwrap(), &BranchName::new("feature-x").unwrap())
+            .create(
+                &SandboxName::new("work").unwrap(),
+                &BranchName::new("feature-x").unwrap(),
+                GitMode::Worktree,
+            )
             .unwrap();
 
         let holders = provider.checked_out_at(&BranchName::new("main").unwrap()).unwrap();
@@ -655,7 +818,11 @@ mod tests {
         // A branch whose name the held one starts with, so that answering by
         // the start of a name reads a free branch as taken.
         provider
-            .create(&SandboxName::new("work").unwrap(), &BranchName::new("feature-x").unwrap())
+            .create(
+                &SandboxName::new("work").unwrap(),
+                &BranchName::new("feature-x").unwrap(),
+                GitMode::Worktree,
+            )
             .unwrap();
 
         let holders = provider.checked_out_at(&BranchName::new("feature").unwrap()).unwrap();
@@ -671,7 +838,7 @@ mod tests {
         git(&repo, &["branch", "feature-x"]);
         let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
         let name = SandboxName::new("work").unwrap();
-        provider.create(&name, &BranchName::new("feature-x").unwrap()).unwrap();
+        provider.create(&name, &BranchName::new("feature-x").unwrap(), GitMode::Worktree).unwrap();
 
         let held = provider.branch_held_at(&canonical_worktree(&state_root, &name)).unwrap();
 
@@ -701,7 +868,7 @@ mod tests {
         init_repo_with_commit(&repo);
         let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
         let name = SandboxName::new("demo").unwrap();
-        provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+        provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
 
         assert!(!provider.is_dirty(&name).unwrap());
     }
@@ -713,7 +880,8 @@ mod tests {
         init_repo_with_commit(&repo);
         let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
         let name = SandboxName::new("demo").unwrap();
-        let worktree = provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+        let worktree =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
         fs::write(worktree.path.join("README.md"), "changed\n").unwrap();
 
         assert!(provider.is_dirty(&name).unwrap());
@@ -726,7 +894,8 @@ mod tests {
         init_repo_with_commit(&repo);
         let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
         let name = SandboxName::new("demo").unwrap();
-        let worktree = provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+        let worktree =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
         fs::write(worktree.path.join("untracked.txt"), "x\n").unwrap();
 
         assert!(provider.is_dirty(&name).unwrap());
@@ -739,7 +908,7 @@ mod tests {
         init_repo_with_commit(&repo);
         let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
         let name = SandboxName::new("demo").unwrap();
-        provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+        provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
         fs::remove_dir_all(&repo).unwrap();
 
         let result = provider.is_dirty(&name);
@@ -757,7 +926,8 @@ mod tests {
         init_repo_with_commit(&repo);
         let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
         let name = SandboxName::new("demo").unwrap();
-        let worktree = provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+        let worktree =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
 
         // A tenant with write access to /workdir rewrites the worktree's `.git`
         // pointer to name a repository it planted inside the worktree, whose
@@ -797,7 +967,8 @@ mod tests {
         init_repo_with_commit(&repo);
         let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
         let name = SandboxName::new("demo").unwrap();
-        let worktree = provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+        let worktree =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
 
         // The worktree is clean, but its `.git` pointer is rewritten to a fresh
         // empty repository outside it, under which the tracked README reads as
@@ -824,12 +995,193 @@ mod tests {
         init_repo_with_commit(&repo);
         let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
         let name = SandboxName::new("demo").unwrap();
-        let worktree = provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+        let worktree =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
         fs::remove_dir_all(&worktree.path).unwrap();
 
         provider.prune_stale().unwrap();
 
         let porcelain = git(&repo, &["worktree", "list", "--porcelain"]);
         assert!(!porcelain.contains("worktree-demo"));
+    }
+
+    #[test]
+    fn clone_mode_create_gives_the_sandbox_its_own_git_directory() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let branch = BranchName::new("demo").unwrap();
+
+        let workdir = provider.create(&name, &branch, GitMode::Clone).unwrap();
+
+        assert_eq!(workdir.path, canonical_worktree(&state_root, &name));
+        assert!(workdir.path.join(".git").is_dir());
+    }
+
+    #[test]
+    fn clone_mode_create_checks_out_a_new_branch_named_after_the_sandbox() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let branch = BranchName::new("demo").unwrap();
+
+        let workdir = provider.create(&name, &branch, GitMode::Clone).unwrap();
+
+        assert_eq!(current_branch(&workdir.path), "demo");
+    }
+
+    #[test]
+    fn clone_mode_create_checks_out_an_existing_branch() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        git(&repo, &["branch", "feature-x"]);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("work").unwrap();
+        let branch = BranchName::new("feature-x").unwrap();
+
+        let workdir = provider.create(&name, &branch, GitMode::Clone).unwrap();
+
+        assert_eq!(current_branch(&workdir.path), "feature-x");
+    }
+
+    #[test]
+    fn clone_mode_create_pins_the_clone_base_commit_in_the_host_repository() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let base = rev_parse(&repo, "HEAD");
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let branch = BranchName::new("demo").unwrap();
+
+        provider.create(&name, &branch, GitMode::Clone).unwrap();
+
+        assert_eq!(rev_parse(&repo, "refs/hort/demo/base"), base);
+    }
+
+    #[test]
+    fn clone_mode_create_points_the_clone_at_the_object_store_the_box_will_have() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let branch = BranchName::new("demo").unwrap();
+
+        let workdir = provider.create(&name, &branch, GitMode::Clone).unwrap();
+
+        let alternates =
+            fs::read_to_string(workdir.path.join(".git/objects/info/alternates")).unwrap();
+        assert_eq!(alternates.trim(), GIT_OBJECTS);
+    }
+
+    #[test]
+    fn clone_mode_create_gives_the_clone_the_host_repositorys_own_origin() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        git(&repo, &["remote", "add", "origin", "https://github.com/example/thing.git"]);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let branch = BranchName::new("demo").unwrap();
+
+        let workdir = provider.create(&name, &branch, GitMode::Clone).unwrap();
+
+        assert_eq!(
+            git(&workdir.path, &["remote", "get-url", "origin"]).trim(),
+            "https://github.com/example/thing.git"
+        );
+    }
+
+    #[test]
+    fn clone_mode_create_leaves_no_origin_when_the_host_repository_has_none() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let branch = BranchName::new("demo").unwrap();
+
+        let workdir = provider.create(&name, &branch, GitMode::Clone).unwrap();
+
+        let remotes = git(&workdir.path, &["remote"]);
+        assert!(!remotes.lines().any(|remote| remote.trim() == "origin"), "remotes: {remotes}");
+    }
+
+    #[test]
+    fn clone_mode_create_names_the_host_repository_as_the_hort_base_remote() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let branch = BranchName::new("demo").unwrap();
+
+        let workdir = provider.create(&name, &branch, GitMode::Clone).unwrap();
+
+        assert_eq!(
+            Path::new(git(&workdir.path, &["remote", "get-url", "hort-base"]).trim()),
+            repo.as_path()
+        );
+    }
+
+    #[test]
+    fn a_push_to_the_hort_base_remote_does_not_write_the_host_repository() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let branch = BranchName::new("demo").unwrap();
+        let workdir = provider.create(&name, &branch, GitMode::Clone).unwrap();
+
+        git_borrowing_objects(
+            &workdir.path,
+            &repo.join(".git").join("objects"),
+            &["push", "hort-base", "demo"],
+        );
+
+        assert_eq!(git(&repo, &["branch", "--list", "demo"]).trim(), "");
+    }
+
+    #[test]
+    fn git_mode_at_reports_clone_for_a_workdir_holding_a_clone() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let workdir = state_root.join("workdir");
+        git(&repo, &["clone", "--shared", repo.to_str().unwrap(), workdir.to_str().unwrap()]);
+        let provider = GitWorktreeProvider::new(repo, state_root);
+
+        assert_eq!(provider.git_mode_at(&workdir), Some(GitMode::Clone));
+    }
+
+    #[test]
+    fn git_mode_at_reports_worktree_for_a_workdir_holding_a_worktree() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let workdir = state_root.join("workdir");
+        git(&repo, &["worktree", "add", "-b", "demo", workdir.to_str().unwrap(), "HEAD"]);
+        let provider = GitWorktreeProvider::new(repo, state_root);
+
+        assert_eq!(provider.git_mode_at(&workdir), Some(GitMode::Worktree));
+    }
+
+    #[test]
+    fn git_mode_at_reports_nothing_for_a_directory_holding_no_git() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let workdir = state_root.join("workdir");
+        fs::create_dir_all(&workdir).unwrap();
+        let provider = GitWorktreeProvider::new(repo, state_root);
+
+        assert_eq!(provider.git_mode_at(&workdir), None);
     }
 }

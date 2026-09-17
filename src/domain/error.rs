@@ -58,6 +58,10 @@ pub enum HortError {
     /// git repository. The same mode carried by a configuration layer only warns,
     /// because that layer covers every directory on the machine.
     CloneRequiresGit,
+    /// `up`: the sandbox already has a `/workdir` on disk, built in the other git
+    /// mode from the one this run asks for. Finishing it in the asked-for mode
+    /// would mean replacing work that is already there.
+    GitModeMismatch { name: String, built: String, requested: String },
     /// `up`: the directory is neither a git repository nor marked as a project,
     /// so nothing there authorizes hort to hand it to a sandbox.
     NotAProject { path: String },
@@ -224,6 +228,10 @@ impl fmt::Display for HortError {
             HortError::CloneRequiresGit => {
                 write!(f, "--git clone requires a git repository, but this project is not one")
             }
+            HortError::GitModeMismatch { name, built, requested } => write!(
+                f,
+                "sandbox '{name}' was built in {built} git mode, not {requested} — run 'hort down {name}' first, or repeat it with 'hort up {name} --git {built}'"
+            ),
             HortError::NotAProject { path } => write!(
                 f,
                 "'{path}' is not a project — run hort from a git repository, or add a .hort.json there to sandbox the directory itself"
@@ -412,6 +420,20 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "--git clone requires a git repository, but this project is not one"
+        );
+    }
+
+    #[test]
+    fn git_mode_mismatch_error_renders_canonical_string() {
+        let error = HortError::GitModeMismatch {
+            name: "demo".to_string(),
+            built: "clone".to_string(),
+            requested: "worktree".to_string(),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "sandbox 'demo' was built in clone git mode, not worktree — run 'hort down demo' first, or repeat it with 'hort up demo --git clone'"
         );
     }
 

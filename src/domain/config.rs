@@ -48,6 +48,17 @@ pub enum GitMode {
     Clone,
 }
 
+impl GitMode {
+    /// How the mode is spelled where a person reads or types it, which is the
+    /// configuration file, the `--git` flag and any message naming a mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GitMode::Worktree => "worktree",
+            GitMode::Clone => "clone",
+        }
+    }
+}
+
 /// Host paths mounted into the sandbox.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]

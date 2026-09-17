@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::SystemTime;
 
+use crate::domain::config::GitMode;
 use crate::domain::egress::{EgressPolicy, HostPattern};
 use crate::domain::error::HortError;
 use crate::domain::model::{
@@ -690,6 +691,8 @@ pub struct FakeWorktreeProvider {
     paths: RefCell<Vec<PathBuf>>,
     present: RefCell<Vec<PathBuf>>,
     creates: RefCell<Vec<BranchName>>,
+    create_modes: RefCell<Vec<GitMode>>,
+    workdir_modes: RefCell<Vec<(PathBuf, GitMode)>>,
     is_git_repo: bool,
     existing_branches: Vec<BranchName>,
     checked_out_branches: Vec<(BranchName, PathBuf)>,
@@ -705,6 +708,8 @@ impl FakeWorktreeProvider {
             paths: RefCell::new(Vec::new()),
             present: RefCell::new(Vec::new()),
             creates: RefCell::new(Vec::new()),
+            create_modes: RefCell::new(Vec::new()),
+            workdir_modes: RefCell::new(Vec::new()),
             is_git_repo: true,
             existing_branches: Vec::new(),
             checked_out_branches: Vec::new(),
@@ -756,6 +761,16 @@ impl FakeWorktreeProvider {
     pub fn with_listed_worktree(self, name: &SandboxName) -> Self {
         self.paths.borrow_mut().push(fake_worktree_path(name));
         self.present.borrow_mut().push(fake_worktree_path(name));
+        self.workdir_modes.borrow_mut().push((fake_worktree_path(name), GitMode::Worktree));
+        self
+    }
+
+    /// Seed the `/workdir` of `name` as a clone left by a prior crashed build.
+    /// It is on disk and absent from the worktree listing, because a clone is a
+    /// repository of its own and the project repository never registers it.
+    pub fn with_clone_workdir(self, name: &SandboxName) -> Self {
+        self.present.borrow_mut().push(fake_worktree_path(name));
+        self.workdir_modes.borrow_mut().push((fake_worktree_path(name), GitMode::Clone));
         self
     }
 
@@ -764,6 +779,7 @@ impl FakeWorktreeProvider {
     /// like from here.
     pub fn with_present_worktree(self, name: &SandboxName) -> Self {
         self.present.borrow_mut().push(fake_worktree_path(name));
+        self.workdir_modes.borrow_mut().push((fake_worktree_path(name), GitMode::Worktree));
         self
     }
 
@@ -785,6 +801,11 @@ impl FakeWorktreeProvider {
         self.creates.borrow().clone()
     }
 
+    /// The git mode of every `create` call, in order.
+    pub fn create_modes(&self) -> Vec<GitMode> {
+        self.create_modes.borrow().clone()
+    }
+
     /// How many times `prune_stale` was called.
     pub fn prune_stale_calls(&self) -> usize {
         *self.prune_stale_calls.borrow()
@@ -798,12 +819,31 @@ impl Default for FakeWorktreeProvider {
 }
 
 impl WorktreeProvider for FakeWorktreeProvider {
-    fn create(&self, name: &SandboxName, branch: &BranchName) -> Result<Worktree, HortError> {
+    fn create(
+        &self,
+        name: &SandboxName,
+        branch: &BranchName,
+        mode: GitMode,
+    ) -> Result<Worktree, HortError> {
         let path = fake_worktree_path(name);
         self.creates.borrow_mut().push(branch.clone());
-        self.paths.borrow_mut().push(path.clone());
+        self.create_modes.borrow_mut().push(mode);
+        // Only a worktree joins the project repository's listing; a clone is a
+        // repository of its own, which the project repository never registers.
+        if mode == GitMode::Worktree {
+            self.paths.borrow_mut().push(path.clone());
+        }
         self.present.borrow_mut().push(path.clone());
+        self.workdir_modes.borrow_mut().push((path.clone(), mode));
         Ok(Worktree { path })
+    }
+
+    fn git_mode_at(&self, path: &Path) -> Option<GitMode> {
+        self.workdir_modes
+            .borrow()
+            .iter()
+            .find(|(workdir, _)| workdir == path)
+            .map(|(_, mode)| *mode)
     }
 
     fn remove(&self, name: &SandboxName) -> Result<(), HortError> {

@@ -18,6 +18,15 @@ pub const SANDBOX_HOME: &str = "/home/hort";
 /// bare name is a name inside of.
 pub const WORKDIR: &str = "/workdir";
 
+/// Where the box finds the object store its clone borrows from. A clone records
+/// the path it borrows objects at inside itself, and git resolves that path on
+/// whichever machine it runs on, so the recorded path has to be the one the box
+/// sees rather than the one the host has: a clone made for a box is read inside
+/// the box. Fixed for the same reason the home is, since whatever writes the
+/// path into a clone and whatever carries the host objects in have to arrive at
+/// the same place.
+pub const GIT_OBJECTS: &str = "/run/hort/objects";
+
 /// What the host says about one declared mount source. It carries its own path,
 /// so a source that was declared but never inspected cannot be represented.
 pub struct MountSourceFacts {

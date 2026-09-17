@@ -317,9 +317,9 @@ impl UpCommand<'_> {
 
         // Asked after the branch selection, so a directory with no git that was
         // given both flags always hears the same one of the two refusals. What
-        // the mode resolves to is how `/workdir` gets git, which this build does
-        // not yet vary; what it settles here is the refusal and the warning.
-        let (_mode, mode_warning) = resolve_git_mode(git, self.config.git, is_git_repo)?;
+        // it settles is how `/workdir` gets git, plus the refusal and the
+        // warning a mode this project cannot hold raises.
+        let (mode, mode_warning) = resolve_git_mode(git, self.config.git, is_git_repo)?;
         warnings.extend(mode_warning);
 
         // Past the selection a branch flag means git mode, because without git the
@@ -349,10 +349,34 @@ impl UpCommand<'_> {
             });
         }
 
-        if let Some(target) = &branch_to_checkout
-            && !worktree_listed
+        // A `/workdir` already on disk was built one way, and finishing it the
+        // other way would mean replacing the work already in it. The disk is
+        // asked and not the record, because the directory is written before the
+        // record and a build interrupted between the two leaves one without the
+        // other.
+        let built_mode = is_git_repo.then(|| self.worktrees.git_mode_at(&worktree_path)).flatten();
+        if let Some(built) = built_mode
+            && built != mode
         {
-            self.worktrees.create(&name, target)?;
+            return Err(HortError::GitModeMismatch {
+                name: name.as_str().to_string(),
+                built: built.as_str().to_string(),
+                requested: mode.as_str().to_string(),
+            });
+        }
+
+        // What answers whether `/workdir` is already there differs by mode: git's
+        // own registration for a worktree, and the disk for a clone, which is a
+        // repository of its own the project repository never registers and
+        // `git worktree list` therefore never reports.
+        let provisioned = match mode {
+            GitMode::Worktree => worktree_listed,
+            GitMode::Clone => built_mode.is_some(),
+        };
+        if let Some(target) = &branch_to_checkout
+            && !provisioned
+        {
+            self.worktrees.create(&name, target, mode)?;
         }
 
         // Another mount source hort owns rather than finds, made here for the
@@ -2666,6 +2690,93 @@ mod tests {
         // Both flags are meaningless without a repository and both say so, so
         // what matters is that the person gets the same answer every time.
         assert_eq!(result, Err(HortError::BranchRequiresGit));
+    }
+
+    #[test]
+    fn up_in_clone_mode_provisions_a_clone_instead_of_a_worktree() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        command
+            .run(SandboxName::new("demo").unwrap(), None, Some(GitMode::Clone), false)
+            .expect("a clone mode build in a git project must go through");
+
+        assert_eq!(worktrees.create_modes(), vec![GitMode::Clone]);
+    }
+
+    #[test]
+    fn up_resumes_a_clone_workdir_without_cloning_it_again() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo")).unwrap();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees =
+            FakeWorktreeProvider::new().with_clone_workdir(&SandboxName::new("demo").unwrap());
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        command
+            .run(SandboxName::new("demo").unwrap(), None, Some(GitMode::Clone), false)
+            .expect("a half-built clone sandbox must finish");
+
+        assert!(worktrees.creates().is_empty());
+    }
+
+    #[test]
+    fn up_refuses_a_workdir_built_in_the_other_git_mode() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo")).unwrap();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees =
+            FakeWorktreeProvider::new().with_clone_workdir(&SandboxName::new("demo").unwrap());
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
+
+        assert_eq!(
+            result,
+            Err(HortError::GitModeMismatch {
+                name: "demo".to_string(),
+                built: "clone".to_string(),
+                requested: "worktree".to_string(),
+            })
+        );
     }
 
     #[test]

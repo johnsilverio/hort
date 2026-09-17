@@ -9,6 +9,7 @@ use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::domain::config::GitMode;
 use crate::domain::egress::EgressPolicy;
 use crate::domain::error::HortError;
 use crate::domain::model::{BranchName, Capabilities, LivenessToken, SandboxName, SandboxRecord};
@@ -130,8 +131,21 @@ pub struct CorruptEntry {
 /// supplies the observations `up` needs to decide what to do about a branch
 /// before it touches git.
 pub trait WorktreeProvider {
-    /// Create a worktree for `name` checked out on `branch`.
-    fn create(&self, name: &SandboxName, branch: &BranchName) -> Result<Worktree, HortError>;
+    /// Give the sandbox `name` its `/workdir` on `branch`, the way `mode` asks
+    /// for: a worktree of the project repository, or a clone of it that carries
+    /// its own writable git.
+    fn create(
+        &self,
+        name: &SandboxName,
+        branch: &BranchName,
+        mode: GitMode,
+    ) -> Result<Worktree, HortError>;
+    /// Which git mode the `/workdir` already on disk at `path` was built in, and
+    /// nothing when there is no git there at all. Asked of the disk rather than
+    /// of the record, because the record is written after the directory and a
+    /// build interrupted between the two leaves one without the other. An
+    /// unanswerable read is absence, like `exists`.
+    fn git_mode_at(&self, path: &Path) -> Option<GitMode>;
     /// Remove this sandbox's worktree.
     fn remove(&self, name: &SandboxName) -> Result<(), HortError>;
     /// Every worktree currently registered.
