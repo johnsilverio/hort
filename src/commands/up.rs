@@ -21,7 +21,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::domain::cache::project_cache_key;
-use crate::domain::config::ResolvedConfig;
+use crate::domain::config::{GitMode, ResolvedConfig};
 use crate::domain::egress::{
     EgressPolicy, egress_degradation_warning, resolver_drop_in, sandbox_resolver,
 };
@@ -36,7 +36,7 @@ use crate::domain::notify::{
     channel_is_declared, channel_mount, channel_sink, notify_degradation_warning,
     render_notification, stop_hook_drop_ins,
 };
-use crate::domain::policy::{BranchIntent, up_error};
+use crate::domain::policy::{BranchIntent, resolve_git_mode, up_error};
 use crate::domain::preconditions::up_precondition_error;
 use crate::domain::reconcile::SandboxState;
 use crate::domain::resources::resource_limits;
@@ -130,6 +130,7 @@ impl UpCommand<'_> {
         &self,
         name: SandboxName,
         branch: Option<BranchName>,
+        git: Option<GitMode>,
         stdin_is_tty: bool,
     ) -> Result<Vec<Warning>, HortError> {
         // Asked before anything about the host, because it asks a different
@@ -233,17 +234,17 @@ impl UpCommand<'_> {
         // creation: listing worktrees is already a git command, and outside a
         // repository it is the first one to fail. Without git the project folder
         // itself is what the sandbox mounts and there is no branch at all.
-        let git = self.worktrees.is_git_repo()?;
-        let worktree_path = if git {
+        let is_git_repo = self.worktrees.is_git_repo()?;
+        let worktree_path = if is_git_repo {
             sandbox_dir.join(format!("worktree-{}", name.as_str()))
         } else {
             project_dir.clone()
         };
-        let worktree_listed =
-            git && self.worktrees.list()?.iter().any(|worktree| worktree.path == worktree_path);
+        let worktree_listed = is_git_repo
+            && self.worktrees.list()?.iter().any(|worktree| worktree.path == worktree_path);
         let own = stored.is_some() || worktree_listed;
 
-        let (intent, branch_to_checkout) = match (git, &branch) {
+        let (intent, branch_to_checkout) = match (is_git_repo, &branch) {
             (false, _) => (BranchIntent::NoGit { branch_flag: branch.is_some() }, None),
             (true, None) => {
                 let own_branch = BranchName::new(name.as_str())?;
@@ -314,6 +315,13 @@ impl UpCommand<'_> {
             return Err(error);
         }
 
+        // Asked after the branch selection, so a directory with no git that was
+        // given both flags always hears the same one of the two refusals. What
+        // the mode resolves to is how `/workdir` gets git, which this build does
+        // not yet vary; what it settles here is the refusal and the warning.
+        let (_mode, mode_warning) = resolve_git_mode(git, self.config.git, is_git_repo)?;
+        warnings.extend(mode_warning);
+
         // Past the selection a branch flag means git mode, because without git the
         // flag was already refused: adding a git test here would be dead, and
         // dropping the selection above would put a git read in the no-git arm.
@@ -360,7 +368,7 @@ impl UpCommand<'_> {
         // with no capability to remount, the box can neither replace the pointer
         // nor unlink the mountpoint. Only in git mode, where `.git` is a pointer;
         // no-git mounts the project folder itself and its `.git` is the user's own.
-        if git {
+        if is_git_repo {
             mounts.push(SandboxMount {
                 source: worktree_path.join(".git"),
                 target: Path::new(WORKDIR).join(".git"),
@@ -621,6 +629,7 @@ mod tests {
             cache: Cache::default(),
             shell: None,
             resources: None,
+            git: None,
         }
     }
 
@@ -694,7 +703,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         assert!(result.is_ok());
         assert_eq!(worktrees.creates(), vec![BranchName::new("demo").unwrap()]);
@@ -719,7 +728,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         assert!(result.is_err());
         let persisted = store.get(&SandboxName::new("demo").unwrap()).unwrap();
@@ -745,7 +754,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         assert!(runtime.started_env().contains(&("HORT_SANDBOX".to_string(), "demo".to_string())));
         assert!(runtime.started_env().contains(&(
@@ -773,7 +782,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         assert!(result.is_ok());
         let persisted = store.get(&SandboxName::new("demo").unwrap()).unwrap();
@@ -802,7 +811,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         assert!(result.is_ok());
         assert!(worktrees.creates().is_empty());
@@ -831,7 +840,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         assert!(result.is_ok());
         assert!(worktrees.creates().is_empty());
@@ -862,7 +871,7 @@ mod tests {
             )
         };
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         // A script has nobody to answer, and a question it cannot see would be
         // taken as a yes here: the refusal is the one answer that names the
@@ -893,7 +902,7 @@ mod tests {
             )
         };
 
-        let _ = command.run(SandboxName::new("demo").unwrap(), None, true);
+        let _ = command.run(SandboxName::new("demo").unwrap(), None, None, true);
 
         assert_eq!(
             proposer.proposals(),
@@ -927,7 +936,7 @@ mod tests {
             )
         };
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, true);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, true);
 
         // The worktree is cut on the branch that already exists, the one named
         // after the sandbox. Whether git checks it out or makes one from HEAD is
@@ -959,7 +968,7 @@ mod tests {
             )
         };
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, true);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, true);
 
         // A no is not a quiet success: the person still has no sandbox, and the
         // refusal is what tells them how to get one later.
@@ -989,7 +998,7 @@ mod tests {
             )
         };
 
-        let _ = command.run(SandboxName::new("demo").unwrap(), None, true);
+        let _ = command.run(SandboxName::new("demo").unwrap(), None, None, true);
 
         assert!(worktrees.creates().is_empty());
         assert_eq!(store.get(&SandboxName::new("demo").unwrap()).unwrap(), None);
@@ -1022,7 +1031,7 @@ mod tests {
             )
         };
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, true);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, true);
 
         // Git cannot hold one branch in two worktrees without being forced to,
         // so there is no build to offer. The offer turned down would answer that
@@ -1055,7 +1064,7 @@ mod tests {
             )
         };
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, true);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, true);
 
         // The kernel runs a box under this name, so building one is not the step
         // past this refusal, and a question turned down would hide which one it is.
@@ -1082,7 +1091,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         assert_eq!(result, Err(HortError::UpInProgress { name: "demo".to_string() }));
         assert_eq!(store.get(&SandboxName::new("demo").unwrap()).unwrap(), None);
@@ -1108,7 +1117,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         assert!(result.is_ok());
         assert_eq!(lock.releases(), vec![SandboxName::new("demo").unwrap()]);
@@ -1134,7 +1143,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         assert_eq!(result, Err(HortError::DuplicateName { name: "demo".to_string() }));
     }
@@ -1158,7 +1167,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         assert_eq!(result, Err(HortError::DuplicateName { name: "demo".to_string() }));
     }
@@ -1185,6 +1194,7 @@ mod tests {
         let result = command.run(
             SandboxName::new("demo").unwrap(),
             Some(BranchName::new("feature-x").unwrap()),
+            None,
             false,
         );
 
@@ -1216,6 +1226,7 @@ mod tests {
         let result = command.run(
             SandboxName::new("demo").unwrap(),
             Some(BranchName::new("feature-x").unwrap()),
+            None,
             false,
         );
 
@@ -1244,6 +1255,7 @@ mod tests {
         let result = command.run(
             SandboxName::new("demo").unwrap(),
             Some(BranchName::new("feature-x").unwrap()),
+            None,
             false,
         );
 
@@ -1275,7 +1287,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         assert!(result.is_ok());
         assert_eq!(network.provisioned(), vec![SandboxName::new("demo").unwrap()]);
@@ -1300,7 +1312,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         assert_eq!(result, Err(HortError::UserNamespacesDisabled));
     }
@@ -1327,7 +1339,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         assert_eq!(result, Err(HortError::IpMissing));
     }
@@ -1351,7 +1363,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         assert_eq!(result, Err(HortError::RootfsMissing { path: "/base/rootfs".to_string() }));
     }
@@ -1376,7 +1388,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         assert_eq!(
             env.inspections(),
@@ -1403,7 +1415,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         assert_eq!(runtime.started_rootfs(), PathBuf::from("/base/rootfs"));
     }
@@ -1430,7 +1442,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         assert_eq!(runtime.started_memory_bytes(), Some(4_294_967_296));
         assert_eq!(runtime.started_cpus(), Some(2.0));
@@ -1458,7 +1470,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // A plan nobody hands to the runtime builds the same empty box as no
         // plan at all, and every test of the planning itself stays green while
@@ -1495,7 +1507,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // The source is the path the provider answered with, never one this
         // command worked out for itself: the layout of the channel belongs to
@@ -1535,7 +1547,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // Nothing inside the box ever writes to a channel no agent announces
         // into, and the mount is writable: a sandbox that gets one anyway hands
@@ -1564,7 +1576,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // Which file to drop is decided in the pure layer and the writing is the
         // runtime's, so this handover is the whole of the wiring between them: a
@@ -1601,7 +1613,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // The record is what a later run reads to decide whether this sandbox has
         // a channel at all, so a box with one and nothing written down is a box
@@ -1630,7 +1642,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // The absence is the answer a reader acts on: told a sink, it goes
         // looking for a channel that was never mounted and reports whatever the
@@ -1658,7 +1670,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // The same directory on both sides of the boundary, and that is the whole
         // mechanism: the hook writes into a path inside a box that cannot reach
@@ -1696,7 +1708,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // Rendered here and once, because the sink is handed a finished message
         // and the process that would otherwise fill it in is the one nothing on
@@ -1728,7 +1740,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // The watcher runs the program the precondition found, not whatever a
         // search path answers with hours later, in a process that was forked and
@@ -1756,7 +1768,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // Nothing ever appends to a channel no agent announces into, so a watcher
         // here is a process per sandbox waiting forever on an event that cannot
@@ -1783,7 +1795,7 @@ mod tests {
             &notify, &config,
         );
 
-        let warnings = command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        let warnings = command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // The user configured a completion signal and this host cannot raise one.
         // Said nowhere, it becomes an agent that finished hours ago and a person
@@ -1810,7 +1822,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // A watcher whose sink cannot run is a process that wakes on every
         // completion to fail, and the warning above already said what will not
@@ -1837,7 +1849,7 @@ mod tests {
             &notify, &config,
         );
 
-        let warnings = command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        let warnings = command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // A box whose channel is mounted and whose watcher never started looks
         // exactly like one that works until the first completion is missed, so
@@ -1864,7 +1876,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         // This is the one step of a build that degrades. The costs are not
         // symmetric: tearing the box down loses work nobody else has a copy of,
@@ -1900,9 +1912,9 @@ mod tests {
             access: MountAccess::ReadWrite,
         };
 
-        command.run(SandboxName::new("first").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("first").unwrap(), None, None, false).unwrap();
         let first = runtime.started_mounts();
-        command.run(SandboxName::new("second").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("second").unwrap(), None, None, false).unwrap();
 
         // The cache belongs to the project, not to the box: what took four
         // minutes to populate is the reason to throw a sandbox away without
@@ -1935,7 +1947,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         // A bind whose source is not on the host takes the whole container down,
         // and this source is one hort chose the address of and nobody else ever
@@ -1978,7 +1990,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // The mount list is applied in order, so of two mounts whose
         // destinations overlap the box only ever sees the later one. Carried the
@@ -2036,7 +2048,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         // Two declarations that cannot both hold. Let through, they kill the
         // build with a message about the rootfs, which is the one part of the
@@ -2083,7 +2095,7 @@ mod tests {
             &notify, &config,
         );
 
-        let _ = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let _ = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         // A refusal over what the configuration says has to happen before hort
         // takes anything, and the worktree is the sharpest thing it takes: git
@@ -2122,7 +2134,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         // A dotfile directory the user stopped keeping is dropped with a warning
         // and the box boots without it, so nothing read-only covers that target
@@ -2154,7 +2166,7 @@ mod tests {
             &notify, &config,
         );
 
-        let warnings = command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        let warnings = command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // The build survives the missing path either way, so a warning that
         // stops at the planner leaves the user in a box quietly missing what
@@ -2189,7 +2201,7 @@ mod tests {
             &notify, &config,
         );
 
-        let warnings = command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        let warnings = command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         assert!(warnings.iter().any(|warning| warning.to_string().contains("memory")));
     }
@@ -2216,7 +2228,7 @@ mod tests {
             &notify, &config,
         );
 
-        let warnings = command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        let warnings = command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // The kernel drops what it cannot enforce and reports success, so a
         // sandbox built here runs one layer thinner than the one that was asked
@@ -2247,7 +2259,7 @@ mod tests {
             &notify, &config,
         );
 
-        let warnings = command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        let warnings = command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // An advisory raised whatever the host reports is one the user learns to
         // scroll past, and the next one that matters scrolls past with it. This
@@ -2277,7 +2289,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         let policy = network.provisioned_egress().expect("up provisions the sandbox network");
         assert!(policy.matches("api.anthropic.com"));
@@ -2310,7 +2322,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         assert_eq!(network.provisioned_forwards(), vec![("127.0.0.1".to_string(), 5432)]);
     }
@@ -2339,7 +2351,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // Which address an open sandbox is given is hort's to choose, so this
         // reads it back rather than naming one. What it holds is the part that
@@ -2382,7 +2394,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // An allowlisted sandbox is meant to have no name resolution of its own:
         // the proxy is handed the hostname and resolves it, and a way out of the
@@ -2416,7 +2428,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // The other face of the same refusal, apart from it because the two can
         // drift apart: one wiring hands the address to the host and the other
@@ -2455,7 +2467,7 @@ mod tests {
             )
         };
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         assert_eq!(runtime.started_workdir(), project);
     }
@@ -2484,7 +2496,7 @@ mod tests {
             )
         };
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // A null branch is what every later reader keys on, teardown included, so
         // a sandbox that loses it is one whose teardown starts deleting the
@@ -2517,7 +2529,7 @@ mod tests {
             )
         };
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         assert!(worktrees.creates().is_empty());
     }
@@ -2545,7 +2557,7 @@ mod tests {
             )
         };
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         // What authorizes hort to hand a host folder to a sandbox running an
         // agent with no permission limits is the user having left a marker file
@@ -2583,10 +2595,108 @@ mod tests {
         let result = command.run(
             SandboxName::new("demo").unwrap(),
             Some(BranchName::new("feature-x").unwrap()),
+            None,
             false,
         );
 
         assert_eq!(result, Err(HortError::BranchRequiresGit));
+    }
+
+    #[test]
+    fn up_refuses_the_clone_flag_without_git() {
+        let project = PathBuf::from("/home/tester/project");
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new().no_git();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = UpCommand {
+            project_dir: Some(project.clone()),
+            current_dir: project,
+            ..up_command(
+                &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
+                &cache, &notify, &config,
+            )
+        };
+
+        let result =
+            command.run(SandboxName::new("demo").unwrap(), None, Some(GitMode::Clone), false);
+
+        assert_eq!(result, Err(HortError::CloneRequiresGit));
+    }
+
+    #[test]
+    fn up_refuses_the_branch_flag_before_the_clone_flag_without_git() {
+        let project = PathBuf::from("/home/tester/project");
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new().no_git();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = UpCommand {
+            project_dir: Some(project.clone()),
+            current_dir: project,
+            ..up_command(
+                &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
+                &cache, &notify, &config,
+            )
+        };
+
+        let result = command.run(
+            SandboxName::new("demo").unwrap(),
+            Some(BranchName::new("feature-x").unwrap()),
+            Some(GitMode::Clone),
+            false,
+        );
+
+        // Both flags are meaningless without a repository and both say so, so
+        // what matters is that the person gets the same answer every time.
+        assert_eq!(result, Err(HortError::BranchRequiresGit));
+    }
+
+    #[test]
+    fn up_warns_for_a_configured_clone_mode_without_git() {
+        let project = PathBuf::from("/home/tester/project");
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new().no_git();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = ResolvedConfig { git: Some(GitMode::Clone), ..healthy_config() };
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = UpCommand {
+            project_dir: Some(project.clone()),
+            current_dir: project,
+            ..up_command(
+                &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env,
+                &cache, &notify, &config,
+            )
+        };
+
+        let warnings = command
+            .run(SandboxName::new("demo").unwrap(), None, None, false)
+            .expect("a configured clone mode must not refuse a project without git");
+
+        assert!(warnings.iter().any(|warning| warning.to_string().contains("clone")));
     }
 
     #[test]
@@ -2615,6 +2725,7 @@ mod tests {
         let result = command.run(
             SandboxName::new("demo").unwrap(),
             Some(BranchName::new("feature-x").unwrap()),
+            None,
             false,
         );
 
@@ -2648,7 +2759,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         assert!(result.is_err());
         assert!(runtime.started_env().is_empty());
@@ -2673,7 +2784,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // With git the worktree is one hort made under its own state root, so
         // the record is the only place the project the sandbox came from is
@@ -2706,7 +2817,7 @@ mod tests {
             )
         };
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // Here the project folder is also the worktree, so writing it twice
         // looks redundant. It is not: a reader that had to know which mode a
@@ -2737,7 +2848,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         // A build that fails with the anchor already up leaves a box that looks
         // healthy and reaches nothing, which is worse than an orphan: the first
@@ -2770,7 +2881,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         // The undo is the teardown order truncated, so every step it carries needs
         // an answer here as much as in `down`: this is the third place they are
@@ -2799,7 +2910,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         // The undo stops processes and stops there. This directory is the one
         // thing in the sandbox that can hold work nobody else has a copy of, and
@@ -2827,7 +2938,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         // The record is what the next run reads to finish or clean this sandbox,
         // so removing it would leave the worktree tracked by nothing, which is
@@ -2861,7 +2972,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         // What comes back names the cause. The scripted provisioning failure and
         // the scripted helper stop fail with different variants on purpose, so a
@@ -2889,7 +3000,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         // A helper that will not die is the one arrangement where giving up
         // early leaves exactly the box this undo exists to kill: alive, and
@@ -2918,7 +3029,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         // Provisioning is not the only thing that can fail with the anchor
         // already up, and the box left behind is the same one either way: alive,
@@ -2949,7 +3060,7 @@ mod tests {
             &notify, &config,
         );
 
-        command.run(SandboxName::new("demo").unwrap(), None, false).unwrap();
+        command.run(SandboxName::new("demo").unwrap(), None, None, false).unwrap();
 
         // The undo has to be reachable only from the failing path. An
         // implementation that tears down on the way out of every build would
@@ -2987,7 +3098,7 @@ mod tests {
         );
 
         command
-            .run(SandboxName::new("demo").unwrap(), None, false)
+            .run(SandboxName::new("demo").unwrap(), None, None, false)
             .expect("a live sandbox whose network is down is half-built, and up finishes it");
 
         // The anchor is what makes the box live, and it is standing. A second
@@ -3021,7 +3132,7 @@ mod tests {
         );
 
         command
-            .run(SandboxName::new("demo").unwrap(), None, false)
+            .run(SandboxName::new("demo").unwrap(), None, None, false)
             .expect("a live sandbox whose network is down is half-built, and up finishes it");
 
         // The namespace pasta attaches to is the anchor's, and the anchor here
@@ -3072,6 +3183,7 @@ mod tests {
         let result = command.run(
             SandboxName::new("demo").unwrap(),
             Some(BranchName::new("feature").unwrap()),
+            None,
             false,
         );
 
@@ -3109,6 +3221,7 @@ mod tests {
         let result = command.run(
             SandboxName::new("demo").unwrap(),
             Some(BranchName::new("feature").unwrap()),
+            None,
             false,
         );
 
@@ -3146,6 +3259,7 @@ mod tests {
         let result = command.run(
             SandboxName::new("demo").unwrap(),
             Some(BranchName::new("other").unwrap()),
+            None,
             false,
         );
 
@@ -3180,6 +3294,7 @@ mod tests {
         let result = command.run(
             SandboxName::new("demo").unwrap(),
             Some(BranchName::new("main").unwrap()),
+            None,
             false,
         );
 
@@ -3216,6 +3331,7 @@ mod tests {
         let result = command.run(
             SandboxName::new("demo").unwrap(),
             Some(BranchName::new("other").unwrap()),
+            None,
             false,
         );
 
@@ -3260,6 +3376,7 @@ mod tests {
         let _ = command.run(
             SandboxName::new("demo").unwrap(),
             Some(BranchName::new("other").unwrap()),
+            None,
             false,
         );
 
@@ -3300,6 +3417,7 @@ mod tests {
         let result = command.run(
             SandboxName::new("demo").unwrap(),
             Some(BranchName::new("feature").unwrap()),
+            None,
             false,
         );
 
@@ -3335,7 +3453,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         // An anchor killed outright leaves the runtime holding its container
         // under this name, and a runtime refuses to build a name it holds. A
@@ -3372,7 +3490,7 @@ mod tests {
             &notify, &config,
         );
 
-        let _ = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let _ = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         // A killed anchor takes nothing on the host with it: its pasta is still
         // attached, so the helpers go before the container the same way they do
@@ -3429,7 +3547,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         // No build can keep that promise, so a refusal that waits for the
         // network costs a container started and then undone for a
@@ -3457,7 +3575,7 @@ mod tests {
             &notify, &config,
         );
 
-        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let result = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         // What the configuration gets wrong is wrong whoever holds the build,
         // and it is said before hort takes anything: the lock is the first thing
@@ -3491,7 +3609,7 @@ mod tests {
             &notify, &config,
         );
 
-        let _ = command.run(SandboxName::new("demo").unwrap(), None, false);
+        let _ = command.run(SandboxName::new("demo").unwrap(), None, None, false);
 
         // The box was built before its configuration turned illegal, and people
         // may be working inside it. Taken for half-built, it would have its

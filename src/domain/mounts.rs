@@ -222,6 +222,7 @@ mod tests {
             cache: Cache::default(),
             shell: None,
             resources: None,
+            git: None,
         }
     }
 

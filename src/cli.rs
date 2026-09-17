@@ -38,7 +38,7 @@ use crate::commands::down::DownCommand;
 use crate::commands::ls::{LsCommand, LsEntry};
 use crate::commands::prune::{PruneCommand, PruneReport};
 use crate::commands::up::UpCommand;
-use crate::domain::config::ResolvedConfig;
+use crate::domain::config::{GitMode, ResolvedConfig};
 use crate::domain::error::HortError;
 use crate::domain::idle::IdleState;
 use crate::domain::model::{BranchName, Capabilities, SandboxName, Warning};
@@ -67,6 +67,10 @@ pub enum CliCommand {
         /// the sandbox.
         #[arg(long)]
         branch: Option<String>,
+        /// How the sandbox gets git into `/workdir`, overriding what the
+        /// configuration declares: `worktree` or `clone`.
+        #[arg(long, value_parser = parse_git_mode)]
+        git: Option<GitMode>,
         /// Return to the prompt with the sandbox running instead of opening a
         /// session in it.
         #[arg(short, long)]
@@ -112,6 +116,16 @@ pub enum CliCommand {
     },
     /// Report what this host can do, changing nothing.
     Doctor,
+}
+
+/// Read the value of `--git` as a git mode. Spelled here rather than derived on
+/// the enum so the domain gains no dependency on the argument parser.
+fn parse_git_mode(value: &str) -> Result<GitMode, String> {
+    match value {
+        "worktree" => Ok(GitMode::Worktree),
+        "clone" => Ok(GitMode::Clone),
+        other => Err(format!("'{other}' is not a git mode (expected 'worktree' or 'clone')")),
+    }
 }
 
 /// The real adapters the commands run against, assembled once at startup.
@@ -285,7 +299,7 @@ fn real_path(path: &Path) -> std::io::Result<PathBuf> {
 /// once.
 pub fn run(cli: Cli, deps: &RealDeps) -> Result<u8, HortError> {
     match cli.command {
-        CliCommand::Up { name, branch, detach } => {
+        CliCommand::Up { name, branch, git, detach } => {
             let name = SandboxName::new(&name)?;
             let branch = branch.as_deref().map(BranchName::new).transpose()?;
             // Read here rather than at assembly: configuration is what a sandbox
@@ -311,7 +325,8 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<u8, HortError> {
                 deps.host_home.clone(),
                 &config,
             );
-            let warnings = command.run(name.clone(), branch, std::io::stdin().is_terminal())?;
+            let warnings =
+                command.run(name.clone(), branch, git, std::io::stdin().is_terminal())?;
             eprint!("{}", render_warnings(&config_warnings, &warnings));
             if detach {
                 return Ok(HORT_SUCCEEDED);

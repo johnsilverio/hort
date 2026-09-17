@@ -1109,6 +1109,28 @@ fn cli_up_refuses_a_directory_that_is_not_a_project() {
 }
 
 #[test]
+fn cli_up_accepts_a_git_mode_flag() {
+    let xdg = TempDir::new().unwrap();
+    let xdg_root = xdg.path().canonicalize().unwrap();
+    let (_config, config_home) = temp_config_home("{}");
+    let plain = TempDir::new().unwrap();
+    let plain_path = plain.path().canonicalize().unwrap();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", &xdg_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .current_dir(&plain_path)
+        .args(["up", "demo", "--git", "clone"])
+        .assert()
+        // A flag `up` does not carry is refused by the parser with exit 2, so a
+        // run that reaches hort's own refusal of this directory is the proof the
+        // flag is part of the command line. Where the value then goes is not
+        // visible from outside without a prepared rootfs.
+        .code(1);
+}
+
+#[test]
 fn cli_ls_lists_sandboxes_despite_a_malformed_project_config() {
     let xdg = TempDir::new().unwrap();
     let xdg_root = xdg.path().canonicalize().unwrap();

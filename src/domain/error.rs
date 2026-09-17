@@ -54,6 +54,10 @@ pub enum HortError {
     UpInProgress { name: String },
     /// `up`: a branch flag was given in a project that is not a git repository.
     BranchRequiresGit,
+    /// `up`: the clone git mode was asked for by flag in a project that is not a
+    /// git repository. The same mode carried by a configuration layer only warns,
+    /// because that layer covers every directory on the machine.
+    CloneRequiresGit,
     /// `up`: the directory is neither a git repository nor marked as a project,
     /// so nothing there authorizes hort to hand it to a sandbox.
     NotAProject { path: String },
@@ -216,6 +220,9 @@ impl fmt::Display for HortError {
             }
             HortError::BranchRequiresGit => {
                 write!(f, "--branch requires a git repository, but this project is not one")
+            }
+            HortError::CloneRequiresGit => {
+                write!(f, "--git clone requires a git repository, but this project is not one")
             }
             HortError::NotAProject { path } => write!(
                 f,
@@ -395,6 +402,16 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "--branch requires a git repository, but this project is not one"
+        );
+    }
+
+    #[test]
+    fn clone_requires_git_error_renders_canonical_string() {
+        let error = HortError::CloneRequiresGit;
+
+        assert_eq!(
+            error.to_string(),
+            "--git clone requires a git repository, but this project is not one"
         );
     }
 

@@ -361,6 +361,7 @@ mod tests {
             cache: Cache::default(),
             shell: shell.map(str::to_owned),
             resources: None,
+            git: None,
         }
     }
 

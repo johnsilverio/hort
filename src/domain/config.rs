@@ -34,6 +34,18 @@ pub struct Config {
     pub shell: Option<String>,
     #[serde(default)]
     pub resources: Option<Resources>,
+    #[serde(default)]
+    pub git: Option<GitMode>,
+}
+
+/// How the sandbox gets git into `/workdir`: a worktree of the host repository,
+/// which is the default and leaves git a host activity, or a clone of it, which
+/// gives the sandbox a writable `.git` of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GitMode {
+    Worktree,
+    Clone,
 }
 
 /// Host paths mounted into the sandbox.
@@ -175,14 +187,15 @@ pub struct ResolvedConfig {
     pub cache: Cache,
     pub shell: Option<String>,
     pub resources: Option<Resources>,
+    pub git: Option<GitMode>,
 }
 
 /// Merge the global and local configuration layers into the final
 /// [`ResolvedConfig`], with the local layer winning.
 ///
-/// Scalars (`rootfs`, `shell`) and `egress` take the local value where it is set,
-/// else the global; `egress` is replaced wholesale, so an allowlist is never
-/// unioned across layers. The additive arrays union and dedupe: `mounts.readOnly`
+/// Scalars (`rootfs`, `shell`, `git`) and `egress` take the local value where it
+/// is set, else the global; `egress` is replaced wholesale, so an allowlist is
+/// never unioned across layers. The additive arrays union and dedupe: `mounts.readOnly`
 /// and `cache.dirs` by value, `network` by `host:port`, and `agents` by
 /// `command` — a colliding agent deep-merges, its `auth` lists unioning and
 /// `notify` taken local-first. The `notifications` and `resources` objects
@@ -198,6 +211,7 @@ pub fn merge(global: Config, local: Config) -> ResolvedConfig {
         cache: Cache { dirs: union_dedupe(global.cache.dirs, local.cache.dirs) },
         shell: local.shell.or(global.shell),
         resources: merge_resources(global.resources, local.resources),
+        git: local.git.or(global.git),
     }
 }
 
@@ -409,6 +423,23 @@ mod tests {
         let merged = merge(global, local);
 
         assert_eq!(merged.rootfs.as_deref(), Some("~/local-rootfs"));
+    }
+
+    #[test]
+    fn clone_git_mode_parses_from_the_git_key() {
+        let config = parse(r#"{ "git": "clone" }"#).expect("a declared git mode must parse");
+
+        assert_eq!(config.git, Some(GitMode::Clone));
+    }
+
+    #[test]
+    fn local_git_mode_replaces_global() {
+        let global = parse(r#"{ "git": "clone" }"#).unwrap();
+        let local = parse(r#"{ "git": "worktree" }"#).unwrap();
+
+        let merged = merge(global, local);
+
+        assert_eq!(merged.git, Some(GitMode::Worktree));
     }
 
     #[test]
