@@ -32,6 +32,35 @@ impl GitWorktreeProvider {
             .join(name.as_str())
             .join(format!("worktree-{}", name.as_str()))
     }
+
+    /// The administrative directory git keeps on the host for the linked
+    /// worktree at `worktree`. Discovered by matching git's own `gitdir` records
+    /// under `<repo>/.git/worktrees/`, never by reading the worktree's `.git`
+    /// pointer: that file lives on the writable `/workdir` a tenant controls, so
+    /// inspecting the worktree through it would run whatever git command the
+    /// tenant configured there. Absence of a match is reported as a git failure,
+    /// so a worktree hort cannot vouch for degrades to an error rather than a
+    /// false verdict.
+    fn worktree_admin_dir(&self, worktree: &Path) -> Result<PathBuf, HortError> {
+        let missing = || HortError::GitCommandFailed {
+            detail: format!("worktree admin dir: none registered for {}", worktree.display()),
+        };
+        let dot_git = std::fs::canonicalize(worktree.join(".git")).map_err(|_| missing())?;
+        let registry = self.repo_dir.join(".git").join("worktrees");
+        let entries = std::fs::read_dir(&registry).map_err(|err| HortError::GitCommandFailed {
+            detail: format!("worktree admin dir: {err}"),
+        })?;
+        entries
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|admin| {
+                std::fs::read_to_string(admin.join("gitdir"))
+                    .ok()
+                    .and_then(|recorded| std::fs::canonicalize(recorded.trim()).ok())
+                    .is_some_and(|resolved| resolved == dot_git)
+            })
+            .ok_or_else(missing)
+    }
 }
 
 impl WorktreeProvider for GitWorktreeProvider {
@@ -131,7 +160,22 @@ impl WorktreeProvider for GitWorktreeProvider {
     }
 
     fn is_dirty(&self, name: &SandboxName) -> Result<bool, HortError> {
-        let porcelain = run(&self.worktree_path(name), "status", &["status", "--porcelain"])?;
+        let worktree = self.worktree_path(name);
+        let admin = self.worktree_admin_dir(&worktree)?;
+        let admin_arg = admin.to_string_lossy();
+        let worktree_arg = worktree.to_string_lossy();
+        let porcelain = run(
+            &self.repo_dir,
+            "status",
+            &[
+                "--git-dir",
+                admin_arg.as_ref(),
+                "--work-tree",
+                worktree_arg.as_ref(),
+                "status",
+                "--porcelain",
+            ],
+        )?;
         Ok(!porcelain.trim().is_empty())
     }
 
@@ -213,6 +257,7 @@ mod tests {
     use super::*;
 
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::process::Command;
 
@@ -703,6 +748,73 @@ mod tests {
         // it holds, committed work included. Answering "clean" here would let
         // the guard that protects uncommitted work delete the last copy.
         assert!(matches!(result, Err(HortError::GitCommandFailed { .. })));
+    }
+
+    #[test]
+    fn git_worktree_is_dirty_does_not_run_a_command_the_worktree_pointer_names() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let worktree = provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+
+        // A tenant with write access to /workdir rewrites the worktree's `.git`
+        // pointer to name a repository it planted inside the worktree, whose
+        // config runs a command of its own on any status read. The marker file
+        // is that command's only effect, so its presence is the code having run.
+        let marker = state_root.join("agent-code-ran");
+        let planted = worktree.path.join(".planted-git");
+        git(&worktree.path, &["--git-dir", planted.to_str().unwrap(), "init", "--bare"]);
+        let hook = planted.join("run-on-status.sh");
+        fs::write(&hook, format!("#!/bin/sh\ntouch {}\nprintf '%s\\0' 1\n", marker.display()))
+            .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        let planted_arg = planted.to_str().unwrap();
+        git(
+            &worktree.path,
+            &["--git-dir", planted_arg, "config", "core.fsmonitor", hook.to_str().unwrap()],
+        );
+        git(&worktree.path, &["--git-dir", planted_arg, "config", "core.bare", "false"]);
+        git(
+            &worktree.path,
+            &["--git-dir", planted_arg, "config", "core.worktree", worktree.path.to_str().unwrap()],
+        );
+        fs::write(worktree.path.join(".git"), format!("gitdir: {}\n", planted.display())).unwrap();
+
+        let _ = provider.is_dirty(&name);
+
+        // Inspecting the worktree must read git configuration from the trusted
+        // host-side administrative directory, never from the pointer the box
+        // controls, so the planted command never runs.
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn git_worktree_is_dirty_reads_its_verdict_from_the_admin_dir_not_the_rewritten_pointer() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let worktree = provider.create(&name, &BranchName::new("demo").unwrap()).unwrap();
+
+        // The worktree is clean, but its `.git` pointer is rewritten to a fresh
+        // empty repository outside it, under which the tracked README reads as
+        // untracked and the worktree would look dirty. The pointer is the box's
+        // to control, so the verdict has to be read from the trusted host-side
+        // administrative directory, where the worktree is clean.
+        let decoy = state_root.join("decoy-git");
+        let decoy_arg = decoy.to_str().unwrap();
+        git(&worktree.path, &["--git-dir", decoy_arg, "init", "--bare"]);
+        git(&worktree.path, &["--git-dir", decoy_arg, "config", "core.bare", "false"]);
+        git(
+            &worktree.path,
+            &["--git-dir", decoy_arg, "config", "core.worktree", worktree.path.to_str().unwrap()],
+        );
+        fs::write(worktree.path.join(".git"), format!("gitdir: {}\n", decoy.display())).unwrap();
+
+        assert!(!provider.is_dirty(&name).unwrap());
     }
 
     #[test]
