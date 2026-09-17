@@ -10,11 +10,13 @@
   <img src="https://img.shields.io/badge/license-AGPL_v3-00add8" alt="AGPL v3">
   <img src="https://img.shields.io/badge/language-Rust-dea584?logo=rust&logoColor=white" alt="Rust">
   <img src="https://img.shields.io/badge/platform-Linux_·_VPS-555" alt="Platform">
-  <img src="https://img.shields.io/badge/status-early_development-orange" alt="Status">
+  <img src="https://img.shields.io/badge/status-alpha-orange" alt="Status">
 </p>
 
-> [!WARNING]
-> hort is in early development. The design is settled; the code is being written. What follows is the tool we're building toward, not a finished product.
+> [!NOTE]
+> hort works end to end today: `up`, `attach`, `ls`, `down`, `prune`, `config` and `doctor` all run. It is pre-1.0, so expect rough edges and changes, and it is installed from source.
+>
+> **Documentation:** <https://johnsilverio.github.io/hort/> (the same pages are in [`docs/`](./docs/README.md)).
 
 <br>
 
@@ -48,7 +50,7 @@ That single change is what makes the rest possible:
 
 **It's light.** There's no background daemon the way Docker has one. The read-only base image is shared by every box, so running ten of them at once doesn't copy it ten times. Each box is held open by a single idle process and nothing more, so the overhead hort itself adds is small.
 
-**It's quick to start and trivial to install.** hort is one static binary, written in Rust, that you drop into `~/.local/bin`. There's no daemon to reach and no image to pull, because you bring a prepared root filesystem, so a box comes up fast.
+**It's quick to start and simple to install.** hort is one binary, written in Rust, that you drop into `~/.local/bin`. There's no daemon to reach and no image to pull, because you bring a prepared root filesystem, so a box comes up fast.
 
 **Your repository is never on the line.** The real `.git` stays on the host. The agent only ever sees a throwaway worktree on its own branch, so the worst a bad command can do is ruin a scratch branch. Inside, your session is root of its own user namespace, mapped to your own unprivileged user on the host and holding no capabilities, so being root in there buys nothing on the machine.
 
@@ -75,7 +77,20 @@ hort ls                  # see what's running
 hort down api-feature    # tear it down (asks first if sessions are open)
 ```
 
-Inside, you run agents however you already do: `claude`, `aider`, `gemini`, whatever you reach for. hort doesn't wrap them or replace them. It just makes the ground under them safe to stand on.
+Inside, you run agents however you already do: `claude`, `aider`, `gemini`, whatever you reach for. hort doesn't wrap them or replace them. It just makes the ground under them safe to stand on. The agent writes files; you review and commit them from the host, where your real repository lives. (Git does not work inside a box today. An opt-in mode giving a box its own clone, so an agent can commit and open pull requests itself, is [planned but not available yet](./docs/roadmap.md#clone-mode-opt-in).)
+
+<br>
+
+## Documentation
+
+Read it at **<https://johnsilverio.github.io/hort/>**, or browse [`docs/`](./docs/README.md) here:
+
+- [Installation](./docs/installation.md) and [Preparing a rootfs](./docs/rootfs.md)
+- [Quickstart](./docs/quickstart.md): from nothing to an agent in a sandbox, review, commit, tear down
+- [Concepts](./docs/concepts.md), [Running agents in parallel](./docs/parallel-agents.md), [Networking and egress](./docs/networking.md)
+- Reference: [commands](./docs/commands/index.md), [configuration](./docs/configuration.md), [security model](./docs/security.md), [troubleshooting](./docs/troubleshooting.md)
+- [Working inside a hort sandbox](./docs/agents.md): a page to hand to your agent
+- [Roadmap](./docs/roadmap.md): planned work, not available yet
 
 <br>
 
@@ -83,7 +98,7 @@ Inside, you run agents however you already do: `claude`, `aider`, `gemini`, what
 
 Linux only; the isolation is built directly on Linux kernel features, and running on a VPS over SSH is a first-class case rather than an afterthought. macOS is out of scope.
 
-You need unprivileged user namespaces enabled, and [`pasta`](https://passt.top/) and `git` on your `PATH`. The project itself doesn't have to be a git repository: if the directory you run hort from, or one above it, holds a `.hort.json` or a `.devcontainer/devcontainer.json`, the folder holding it gets a box too, mounted directly, so you keep full container isolation but lose per-branch worktrees. You also bring a base root filesystem with your agents baked in; hort runs it, it doesn't build it for you. [`example.Dockerfile`](./example.Dockerfile) shows how to make one. Inside the box your session is root of its own user namespace, so an agent that refuses to run as root needs its sandbox setting in that filesystem (for Claude Code, `IS_SANDBOX=1`).
+You need unprivileged user namespaces enabled, and [`pasta`](https://passt.top/) and `git` on your `PATH`; `hort doctor` checks all of it. The project itself doesn't have to be a git repository: if the directory you run hort from, or one above it, holds a `.hort.json` or a `.devcontainer/devcontainer.json`, the folder holding it gets a box too, mounted directly, so you keep full container isolation but lose per-branch worktrees. You also bring a base root filesystem with your agents baked in; hort runs it, it doesn't build it for you. [`example.Dockerfile`](./example.Dockerfile) shows how to make one, and [Preparing a rootfs](./docs/rootfs.md) walks through it. Inside the box your session is root of its own user namespace, so an agent that refuses to run as root needs its sandbox setting in that filesystem (for Claude Code, `IS_SANDBOX=1`).
 
 <br>
 

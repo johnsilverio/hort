@@ -1,0 +1,20 @@
+[book]
+title = "hort"
+description = "Ephemeral sandboxes for running coding agents without risking your machine."
+authors = ["John Silverio"]
+language = "en"
+# The pages live directly in docs/ so they read the same on GitHub as in the built site.
+src = "."
+
+[build]
+# The rendered site lands in docs/book/, which is ignored by git.
+build-dir = "book"
+create-missing = false
+
+[output.html]
+site-url = "/hort/"
+git-repository-url = "https://github.com/johnsilverio/hort"
+edit-url-template = "https://github.com/johnsilverio/hort/edit/main/docs/{path}"
+# Keep straight quotes and double hyphens exactly as written: flags such as --force and the
+# messages hort prints must render character for character.
+smart-punctuation = false
