@@ -31,6 +31,7 @@ use hort::adapters::notify::FileNotifyProvider;
 use hort::adapters::pasta::PastaNetworkProvider;
 use hort::adapters::runtime::LibcontainerRuntime;
 use hort::domain::model::{LivenessToken, SandboxName};
+use hort::domain::mounts::GIT_OBJECTS;
 use hort::ports::{
     ContainerRuntime, LivenessProbe, MetadataStore, NetworkProvider, NotifyProvider,
 };
@@ -4424,6 +4425,208 @@ fn cli_run_reports_a_signalled_command_as_128_plus_the_signal() {
         .args(["run", sandbox.name().as_str(), "--", "sh", "-c", "kill -KILL $$"])
         .assert()
         .code(137);
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
+
+/// The prepared rootfs, when it carries a git a session can actually run.
+///
+/// Asked of the directory entry and never of what the entry points at: every
+/// program in a busybox rootfs is a symlink to an absolute path that resolves
+/// only inside the box, so a question that follows the link answers "absent"
+/// for every one of them.
+fn rootfs_carrying_git() -> Option<String> {
+    let rootfs = prepared_rootfs()?;
+    let root = Path::new(&rootfs);
+    if fs::symlink_metadata(root.join("usr/bin/git")).is_ok()
+        || fs::symlink_metadata(root.join("bin/git")).is_ok()
+    {
+        return Some(rootfs);
+    }
+    eprintln!("skipped: the prepared rootfs carries no git, so no session in it can run one");
+    None
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_a_clone_mode_sandbox_can_write_the_git_directory_of_its_own_clone() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", "--git", "clone", sandbox.name().as_str()])
+        .assert()
+        .success();
+
+    // In clone mode `/workdir/.git` is the box's own repository directory, and
+    // every commit the agent makes writes into it. The read-only bind that a
+    // worktree's pointer file carries would refuse all of it, so in this mode
+    // the bind is gone and the directory answers a write.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["run", sandbox.name().as_str(), "--", "touch", "/workdir/.git/written-inside"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_a_clone_mode_sandbox_reads_the_host_object_store_it_cannot_write() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", "--git", "clone", sandbox.name().as_str()])
+        .assert()
+        .success();
+
+    // The clone borrows every object it did not make from the host store, at the
+    // one address it recorded inside itself, so the box finds no commit at all
+    // without this mount. Every git repository keeps a `pack` directory under
+    // its objects, so a listing naming it is what tells "lent" from "not there".
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["run", sandbox.name().as_str(), "--", "ls", GIT_OBJECTS])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("pack"));
+
+    // And what is lent is the user's real history, which nothing in the box may
+    // rewrite. The listing above is what makes this refusal attributable: a
+    // write to an address nothing is mounted at is refused too, and for a
+    // reason that would leave the guarantee unmeasured.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args([
+            "run",
+            sandbox.name().as_str(),
+            "--",
+            "touch",
+            &format!("{GIT_OBJECTS}/written-inside"),
+        ])
+        .assert()
+        .failure();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs carrying git (HORT_TEST_ROOTFS) and pasta"]
+fn cli_an_agent_commits_inside_a_clone_mode_sandbox_and_the_host_repository_is_unchanged() {
+    let Some(rootfs) = rootfs_carrying_git() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", "--git", "clone", sandbox.name().as_str()])
+        .assert()
+        .success();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args([
+            "run",
+            sandbox.name().as_str(),
+            "--",
+            "sh",
+            "-c",
+            "echo 'work the agent did' >> /workdir/README.md",
+        ])
+        .assert()
+        .success();
+
+    // The whole point of clone mode, and the one thing no spike measured: git
+    // itself, running under the seccomp profile hort gives every process of a
+    // sandbox, reading borrowed objects through a read-only mount and writing
+    // its own into the box. A commit exercises all three at once.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args([
+            "run",
+            sandbox.name().as_str(),
+            "--",
+            "git",
+            "-c",
+            "user.name=hort agent",
+            "-c",
+            "user.email=agent@hort.invalid",
+            "commit",
+            "-am",
+            "committed from inside the box",
+        ])
+        .assert()
+        .success();
+
+    // The host repository lent its objects and nothing else: the commit the box
+    // made lives in the box's own clone, and the branch the user works on here
+    // reads exactly as it did before the sandbox existed.
+    assert_eq!(git_output(&repo_path, &["log", "--format=%s", "main"]), "initial\n");
 
     Command::cargo_bin("hort")
         .unwrap()

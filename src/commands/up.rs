@@ -28,8 +28,8 @@ use crate::domain::egress::{
 use crate::domain::error::HortError;
 use crate::domain::model::{BranchName, LivenessToken, SandboxName, SandboxRecord, Warning};
 use crate::domain::mounts::{
-    WORKDIR, cache_landing_error, cache_landings, cache_mount_plan, declared_read_only_sources,
-    read_only_mount_plan,
+    GIT_OBJECTS, WORKDIR, cache_landing_error, cache_landings, cache_mount_plan,
+    declared_read_only_sources, read_only_mount_plan,
 };
 use crate::domain::network::declared_databases;
 use crate::domain::notify::{
@@ -385,18 +385,35 @@ impl UpCommand<'_> {
         self.cache.ensure(&caches.iter().map(|cache| cache.source.clone()).collect::<Vec<_>>())?;
         mounts.extend(caches);
 
-        // The worktree's `.git` is a pointer file the box can reach on the
+        // What a git project lends `/workdir` differs by mode, and only a
+        // project with git lends anything: no-git mounts the project folder
+        // itself and its `.git` is the user's own.
+        //
+        // A worktree's `.git` is a pointer file the box can reach on the
         // writable `/workdir`. A box that rewrites it makes a later host `git`
         // in this worktree read configuration the box chose, running as the user
         // outside every layer hort has. Binding it read-only denies the rewrite:
         // with no capability to remount, the box can neither replace the pointer
-        // nor unlink the mountpoint. Only in git mode, where `.git` is a pointer;
-        // no-git mounts the project folder itself and its `.git` is the user's own.
+        // nor unlink the mountpoint.
+        //
+        // A clone owns its `.git` instead, a directory every commit the agent
+        // makes writes into, so the same bind would refuse the first one and
+        // would protect nothing: nothing outside the box reads that repository.
+        // What it needs instead is the history it did not commit itself, lent
+        // from the host object store at the one address the clone's `alternates`
+        // records, and read-only because that store is the user's real history.
         if is_git_repo {
-            mounts.push(SandboxMount {
-                source: worktree_path.join(".git"),
-                target: Path::new(WORKDIR).join(".git"),
-                access: MountAccess::ReadOnly,
+            mounts.push(match mode {
+                GitMode::Worktree => SandboxMount {
+                    source: worktree_path.join(".git"),
+                    target: Path::new(WORKDIR).join(".git"),
+                    access: MountAccess::ReadOnly,
+                },
+                GitMode::Clone => SandboxMount {
+                    source: project_dir.join(".git").join("objects"),
+                    target: PathBuf::from(GIT_OBJECTS),
+                    access: MountAccess::ReadOnly,
+                },
             });
         }
 
@@ -606,6 +623,7 @@ mod tests {
         Agent, Auth, Cache, CacheDir, Egress, Mounts, Network, Notifications, Notify, Resources,
     };
     use crate::domain::model::{AnchorPid, Capabilities, CgroupCaps, LivenessToken, MountNsInode};
+    use crate::domain::mounts::GIT_OBJECTS;
     use crate::ports::{MountAccess, SandboxMount};
 
     use crate::fakes::{
@@ -618,9 +636,9 @@ mod tests {
         LivenessToken { pid: AnchorPid(1234), mnt_ns: MountNsInode(5678) }
     }
 
-    // The read-only bind of the worktree's `.git` pointer that a git-mode build
-    // always carries, so a host git reads the genuine pointer and not one the box
-    // rewrote. Ambient to every git-mode spec below, not the subject of any.
+    // The read-only bind of the worktree's `.git` pointer that a worktree-mode
+    // build carries, so a host git reads the genuine pointer and not one the box
+    // rewrote. Ambient to every worktree-mode spec below, not the subject of any.
     fn git_pointer_mount(name: &str) -> SandboxMount {
         SandboxMount {
             source: PathBuf::from(format!("/state/sandboxes/{name}/worktree-{name}/.git")),
@@ -1576,8 +1594,9 @@ mod tests {
         // Nothing inside the box ever writes to a channel no agent announces
         // into, and the mount is writable: a sandbox that gets one anyway hands
         // an agent running without restrictions a writable path to the host for
-        // nothing in return. Only the always-present read-only `.git` pointer is
-        // carried, so the absence of anything beside it is the guarantee.
+        // nothing in return. Only the read-only `.git` pointer every
+        // worktree-mode build carries is there, so the absence of anything
+        // beside it is the guarantee.
         assert_eq!(runtime.started_mounts(), vec![git_pointer_mount("demo")]);
     }
 
@@ -2808,6 +2827,71 @@ mod tests {
             .expect("a configured clone mode must not refuse a project without git");
 
         assert!(warnings.iter().any(|warning| warning.to_string().contains("clone")));
+    }
+
+    #[test]
+    fn up_in_clone_mode_binds_nothing_over_the_git_directory_the_clone_owns() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        command
+            .run(SandboxName::new("demo").unwrap(), None, Some(GitMode::Clone), false)
+            .expect("a clone mode build in a git project must go through");
+
+        // A clone keeps its index, its refs and every object it makes inside
+        // `.git`, so the read-only bind that protects a worktree's pointer would
+        // refuse the first commit the agent writes. The protection has nothing
+        // to do here either: a pointer is untrusted input a later host git
+        // obeys, while a clone's `.git` is read by nobody outside the box.
+        assert!(!runtime.started_mounts().contains(&git_pointer_mount("demo")));
+    }
+
+    #[test]
+    fn up_in_clone_mode_lends_the_host_object_store_read_only() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = healthy_config();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        command
+            .run(SandboxName::new("demo").unwrap(), None, Some(GitMode::Clone), false)
+            .expect("a clone mode build in a git project must go through");
+
+        // The clone borrows every object it did not make itself and records that
+        // address inside its own repository, so without this mount nothing in
+        // the box can read a single commit. Read-only because the store is the
+        // user's real history: the box may read all of it and rewrite none.
+        assert!(runtime.started_mounts().contains(&SandboxMount {
+            source: PathBuf::from("/project/.git/objects"),
+            target: PathBuf::from(GIT_OBJECTS),
+            access: MountAccess::ReadOnly,
+        }));
     }
 
     #[test]
