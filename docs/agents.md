@@ -27,6 +27,7 @@ You are running inside a **hort sandbox**: an isolated Linux container around a 
 - **Do not commit, and do not try to repair git** (do not run `git init`, do not delete or rewrite `/workdir/.git`, do not clone the repository again). Destroying `.git` in `/workdir` only breaks the user's review of your work.
 - Write your changes as files. The user reviews them with `git diff` on the host and commits them there.
 - When you finish, summarize what you changed and which files, since you cannot show a diff yourself.
+- **The GitHub CLI (`gh`) may still work for API operations** if the user forwarded a token: you can open a pull request, read issues or call `gh api` against a branch that already exists on the remote. You cannot commit or push from here, because that needs git, which does not work in this sandbox. If `gh` reports it is not authenticated, tell the user; do not run `gh auth login`.
 - A mode in which a sandbox has its own clone, so an agent can commit and open pull requests itself, is planned but **not available yet** (see the [Roadmap](roadmap.md#clone-mode-opt-in)). Do not assume it exists.
 
 ## Network

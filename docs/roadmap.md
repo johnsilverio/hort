@@ -6,7 +6,7 @@ This page lists work that has been decided but is **not available yet**. It desc
 
 Today git does not work inside a sandbox, and you commit from the host ([why](concepts.md#git-is-a-host-activity)). A planned opt-in mode gives a sandbox its own clone of the repository, so an agent can commit, create branches and open a pull request with its own tools. Your host repository is never written from inside. Pushing to a remote such as GitHub uses a narrowly scoped token you choose to pass in, so what the agent can do there is bounded by that token and by the remote's branch protection.
 
-On large repositories a clone costs noticeably more disk space and time than a worktree, which is why this mode will be opt-in and worktrees stay the default.
+The mechanism has been measured. The clone shares your repository's existing history read-only rather than copying it, so on typical repositories it costs about the same disk as a worktree today, and only a fully independent copy is heavier. This mode will still be opt-in, and worktrees stay the default.
 
 ## Deleting the sandbox's branch on `down` and `prune`
 

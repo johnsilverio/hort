@@ -90,6 +90,29 @@ hort attach fix-login
 
 If a variable is not set, the session opens without it and hort warns. Use development keys only: the agent can read anything you forward.
 
+### GitHub CLI without logging in each time
+
+The `gh` command reads a token from `GH_TOKEN` (or `GITHUB_TOKEN`). Forward it the same way, so `gh` inside the sandbox is authenticated on every session with no `gh auth login`:
+
+```jsonc
+{
+  "agents": [
+    { "command": "claude --dangerously-skip-permissions", "auth": { "env": ["GH_TOKEN"] } },
+  ],
+}
+```
+
+```bash
+export GH_TOKEN=github_pat_...   # in the terminal you run hort from
+hort up review-pr
+```
+
+Use a **fine-grained** token, scoped to the one repository you are working on with only the permissions you need (typically Contents and Pull requests). The sandbox runs an agent you are not watching line by line, so the token is what bounds what it can do on the remote; branch protection on the remote is the backstop.
+
+Under an egress allowlist the sandbox reaches nothing by default, so add `github.com` and `api.github.com` to the allowlist for `gh` to work. Under open egress they are reachable already.
+
+Git itself does not work inside the sandbox today, so `gh` covers what needs only the API: opening a pull request for a branch that is already on the remote, reading issues, `gh api`. Committing and pushing from inside is the planned [clone mode](roadmap.md#clone-mode-opt-in); until it lands, you commit and push from the host.
+
 ## Dependency caches
 
 Keep installs across sandboxes of the same project:
