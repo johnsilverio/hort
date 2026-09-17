@@ -62,6 +62,10 @@ pub enum HortError {
     /// on a read-only tree. A cache inside a read-only mount is otherwise legal
     /// and lands as a writable island.
     CacheTargetMissing { name: String, target: String, source: String },
+    /// `up`: two databases are declared on one port for different hosts. Inside
+    /// a sandbox every declared database is one loopback port, so only one of the
+    /// two can be reached there, and nothing in the configuration says which.
+    DatabasesShareAPort { port: u16, first: String, second: String },
     /// `attach`: the name has metadata but no live anchor.
     SandboxNotRunning { name: String },
     /// `attach`: no sandbox of this name is known ("what's alive" wording).
@@ -220,6 +224,10 @@ impl fmt::Display for HortError {
             HortError::CacheTargetMissing { name, target, source } => write!(
                 f,
                 "cache '{name}' targets '{target}', which does not exist inside the read-only mount '{source}' — point the cache elsewhere, or create it on the host first"
+            ),
+            HortError::DatabasesShareAPort { port, first, second } => write!(
+                f,
+                "two databases are declared on port {port} ({first} and {second}), and a sandbox can reach only one of them — remove one from \"network\" in your configuration or give it another port"
             ),
             HortError::SandboxNotRunning { name } => write!(
                 f,

@@ -23,6 +23,7 @@ use std::path::Path;
 use std::thread;
 
 use crate::adapters::helper::{HostHelper, splice};
+use crate::domain::network::one_database_per_port;
 use crate::ports::DbForward;
 
 /// The address a sandbox reaches every declared database at, which is also the
@@ -122,32 +123,11 @@ pub fn stop(sandbox_dir: &Path) -> Result<(), String> {
 /// own: one per port, minus those the splice already lands on. The one rule
 /// that decides both whether a forwarder is started and whether one is owed.
 fn needing_a_forwarder(forwards: &[DbForward]) -> Result<Vec<DbForward>, String> {
-    Ok(one_database_per_port(forwards)?
+    Ok(one_database_per_port(forwards)
+        .map_err(|refusal| refusal.to_string())?
         .into_iter()
         .filter(|forward| !reached_by_the_splice(forward))
-        .map(|forward| DbForward { host: forward.host.clone(), port: forward.port })
         .collect())
-}
-
-/// The declared databases, refusing a port declared for more than one of them.
-/// Inside the sandbox every declared database is one loopback port, so two
-/// declarations sharing a port are one address that can only be one of them, and
-/// nothing in the config says which.
-fn one_database_per_port(forwards: &[DbForward]) -> Result<Vec<&DbForward>, String> {
-    let mut declared: Vec<&DbForward> = Vec::new();
-    for forward in forwards {
-        match declared.iter().find(|other| other.port == forward.port) {
-            Some(other) if other.host != forward.host => {
-                return Err(format!(
-                    "port {} is declared for both {} and {}, and a sandbox reaches one of them",
-                    forward.port, other.host, forward.host
-                ));
-            }
-            Some(_) => {}
-            None => declared.push(forward),
-        }
-    }
-    Ok(declared)
 }
 
 /// Whether the sandbox already reaches this database without a listener of

@@ -31,6 +31,7 @@ use crate::domain::mounts::{
     cache_landing_error, cache_landings, cache_mount_plan, declared_read_only_sources,
     read_only_mount_plan,
 };
+use crate::domain::network::declared_databases;
 use crate::domain::notify::{
     channel_is_declared, channel_mount, channel_sink, notify_degradation_warning,
     render_notification, stop_hook_drop_ins,
@@ -159,6 +160,10 @@ impl UpCommand<'_> {
         // Everything the configuration can get wrong is read before the build
         // lock is taken: failing fast means failing before holding a resource.
         let (limits, mut warnings) = resource_limits(self.config.resources.as_ref(), &host.cgroup)?;
+        // A resume of a healthy sandbox wires its network again when it reads as
+        // not standing, and declarations no wiring can honor would be found out
+        // only then, by undoing the box with whoever is working inside it.
+        let databases = declared_databases(self.config)?;
         // Said here rather than by the sessions that run degraded, because by the
         // time one of those starts the sandbox exists and the user is inside it.
         warnings.extend(egress_degradation_warning(&egress, host.landlock_abi));
@@ -283,7 +288,7 @@ impl UpCommand<'_> {
             Some(SandboxState::Live) => stored.as_ref().and_then(SandboxRecord::liveness_token),
             _ => None,
         };
-        let posture = NetworkPosture::declared(self.config, egress);
+        let posture = NetworkPosture::declared(egress, databases);
         let anchoring = match recorded_anchor {
             Some(anchor) => {
                 Anchoring::Recorded { anchor, network: posture.attached_to(&name, &anchor) }
@@ -502,17 +507,9 @@ impl NetworkPosture {
     /// what the box's resolver file names and what the network is told to
     /// answer for, and a sandbox whose two halves disagree asks its questions
     /// where nothing is listening.
-    fn declared(config: &ResolvedConfig, egress: EgressPolicy) -> Self {
+    fn declared(egress: EgressPolicy, db_forwards: Vec<DbForward>) -> Self {
         let resolver = sandbox_resolver(&egress);
-        Self {
-            egress,
-            db_forwards: config
-                .network
-                .iter()
-                .map(|database| DbForward { host: database.host.clone(), port: database.port })
-                .collect(),
-            resolver,
-        }
+        Self { egress, db_forwards, resolver }
     }
 
     /// The network of the sandbox standing on `anchor`: pasta attaches to the
@@ -3355,5 +3352,116 @@ mod tests {
                 "runtime.teardown".to_string()
             ]
         );
+    }
+
+    /// Two databases on one port, the arrangement measured on a real sandbox:
+    /// inside the box both are the same loopback address.
+    fn config_declaring_two_databases_on_one_port() -> ResolvedConfig {
+        ResolvedConfig {
+            network: vec![
+                Network {
+                    mode: "network".to_string(),
+                    host: "10.255.255.1".to_string(),
+                    port: 5432,
+                },
+                Network {
+                    mode: "network".to_string(),
+                    host: "10.255.255.2".to_string(),
+                    port: 5432,
+                },
+            ],
+            ..healthy_config()
+        }
+    }
+
+    const TWO_DATABASES_ON_ONE_PORT: &str = "two databases are declared on port 5432 (10.255.255.1 and 10.255.255.2), and a sandbox can reach only one of them — remove one from \"network\" in your configuration or give it another port";
+
+    #[test]
+    fn up_refuses_two_databases_declared_on_one_port_before_starting_the_container() {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = config_declaring_two_databases_on_one_port();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+
+        // No build can keep that promise, so a refusal that waits for the
+        // network costs a container started and then undone for a
+        // configuration that was never going to work.
+        assert_eq!(result.unwrap_err().to_string(), TWO_DATABASES_ON_ONE_PORT);
+        assert!(runtime.started_env().is_empty());
+    }
+
+    #[test]
+    fn up_refuses_two_databases_declared_on_one_port_over_a_held_lock() {
+        let lock = FakeSandboxLock::held();
+        let store = InMemoryMetadataStore::new();
+        let probe = ScriptedLivenessProbe::new(false);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = config_declaring_two_databases_on_one_port();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        let result = command.run(SandboxName::new("demo").unwrap(), None, false);
+
+        // What the configuration gets wrong is wrong whoever holds the build,
+        // and it is said before hort takes anything: the lock is the first thing
+        // taken, so a refusal that waits behind it would send the person to wait
+        // for another build and then fail anyway.
+        assert_eq!(result.unwrap_err().to_string(), TWO_DATABASES_ON_ONE_PORT);
+    }
+
+    #[test]
+    fn up_leaves_a_live_sandbox_standing_when_its_configuration_declares_two_databases_on_one_port()
+    {
+        let lock = FakeSandboxLock::free();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo").with_token(canned_token())).unwrap();
+        let probe = ScriptedLivenessProbe::new(true);
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new()
+            .with_existing_branch("demo")
+            .with_listed_worktree(&SandboxName::new("demo").unwrap());
+        let runtime = FakeRuntime::new(a_token_no_record_carries());
+        // What the host-side provider answers for these declarations: no
+        // forwarder can be standing for them, and none can be started.
+        let network = FakeNetwork::nothing_standing().with_failing_provision();
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let env = FakeCapabilities::new(ready_host());
+        let config = config_declaring_two_databases_on_one_port();
+        let cache = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = up_command(
+            &lock, &store, &probe, &registry, &worktrees, &runtime, &network, &clock, &env, &cache,
+            &notify, &config,
+        );
+
+        let _ = command.run(SandboxName::new("demo").unwrap(), None, false);
+
+        // The box was built before its configuration turned illegal, and people
+        // may be working inside it. Taken for half-built, it would have its
+        // network wired again, fail, and be undone with them in it.
+        assert!(runtime.teardowns().is_empty());
     }
 }

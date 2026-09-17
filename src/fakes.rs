@@ -339,6 +339,13 @@ impl FakeNetwork {
         Self { nothing_standing: true, ..Self::default() }
     }
 
+    /// Script `provision` as failing on a provider built otherwise, the way the
+    /// real one fails to wire declarations it cannot make sense of.
+    pub fn with_failing_provision(mut self) -> Self {
+        self.provision_fails = true;
+        self
+    }
+
     /// Script the helper stop as failing too, standing in for a helper that will
     /// not go. It fails with a different variant from the provisioning failure,
     /// so a test can tell which of the two came back.
