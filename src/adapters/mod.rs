@@ -19,6 +19,7 @@ pub mod namespaces;
 pub mod notify;
 pub mod pasta;
 pub mod prompt;
+pub mod propose;
 pub mod proxy;
 pub mod runtime;
 pub mod streams;

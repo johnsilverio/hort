@@ -39,7 +39,8 @@ pub enum HortError {
     WorkdirNotWritable { path: String },
     /// `up`: a fully built sandbox of this name already exists.
     DuplicateName { name: String },
-    /// `up`: the new branch named after the sandbox already exists.
+    /// `up`: the new branch named after the sandbox already exists, and nobody at
+    /// a terminal took the offer to build the sandbox on it.
     BranchExists { name: String },
     /// `up`: the target branch is already checked out in another worktree.
     BranchCheckedOut { branch: String },
@@ -193,7 +194,7 @@ impl fmt::Display for HortError {
             ),
             HortError::BranchExists { name } => write!(
                 f,
-                "branch '{name}' already exists; run 'hort up {name} --branch {name}' to reuse it, or choose another name"
+                "branch '{name}' already exists (a 'hort down' keeps a sandbox's branch) — run 'hort up {name} --branch {name}' to build the sandbox on it, or choose another name"
             ),
             HortError::BranchCheckedOut { branch } => {
                 write!(f, "branch '{branch}' is already checked out in another worktree")
@@ -331,7 +332,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "branch 'demo' already exists; run 'hort up demo --branch demo' to reuse it, or choose another name"
+            "branch 'demo' already exists (a 'hort down' keeps a sandbox's branch) — run 'hort up demo --branch demo' to build the sandbox on it, or choose another name"
         );
     }
 

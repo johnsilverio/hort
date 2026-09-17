@@ -271,6 +271,16 @@ pub trait Confirmer {
     fn confirm(&self, message: &str) -> Result<bool, HortError>;
 }
 
+/// Offers the person at the terminal the step that gets past a refusal, where
+/// that step destroys nothing, and hands back whether they took it. Taking it is
+/// the answer a plain Enter gives, which is what separates this from
+/// `Confirmer`: a destructive action is declined unless someone says yes. Whether
+/// there is a terminal is not this port's concern, the CLI detects that and
+/// passes a plain bool into the command, which offers nothing without one.
+pub trait Proposer {
+    fn propose(&self, question: &str) -> Result<bool, HortError>;
+}
+
 /// Asks the onboarding questions and hands back what the person answered.
 ///
 /// Onboarding is a dialogue and not a single fact about the world: what it asks

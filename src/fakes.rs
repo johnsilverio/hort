@@ -21,9 +21,9 @@ use crate::domain::preconditions::{ConfiguredShell, RootfsFacts};
 use crate::ports::{
     CacheProvider, Clock, Confirmer, ContainerRegistry, ContainerRuntime, CorruptEntry, DbForward,
     EnvironmentProbe, LivenessProbe, MetadataStore, NetworkProvider, NetworkSpec, Notifier,
-    NotifyProvider, NotifySpec, NotifyWatcher, OciSpec, Prompter, ProxyEndpoint, RegistryEntry,
-    ResourceLimits, SandboxFile, SandboxLock, SandboxMount, Session, SessionProbe, SessionSpec,
-    Worktree, WorktreeProvider,
+    NotifyProvider, NotifySpec, NotifyWatcher, OciSpec, Prompter, Proposer, ProxyEndpoint,
+    RegistryEntry, ResourceLimits, SandboxFile, SandboxLock, SandboxMount, Session, SessionProbe,
+    SessionSpec, Worktree, WorktreeProvider,
 };
 
 /// The shared teardown-order witness threaded through the fakes that perform a
@@ -1190,6 +1190,37 @@ impl Confirmer for FakeConfirmer {
     fn confirm(&self, message: &str) -> Result<bool, HortError> {
         self.prompts.borrow_mut().push(message.to_owned());
         Ok(self.answer)
+    }
+}
+
+/// Answers every offer the same way and remembers each question it was put, so
+/// a test can tell a command that offered from one that did not.
+pub struct ScriptedProposer {
+    accepts: bool,
+    proposals: RefCell<Vec<String>>,
+}
+
+impl ScriptedProposer {
+    /// Takes every step it is offered.
+    pub fn accepting() -> Self {
+        Self { accepts: true, proposals: RefCell::new(Vec::new()) }
+    }
+
+    /// Turns down every step it is offered.
+    pub fn declining() -> Self {
+        Self { accepts: false, proposals: RefCell::new(Vec::new()) }
+    }
+
+    /// Every question put to it, in order.
+    pub fn proposals(&self) -> Vec<String> {
+        self.proposals.borrow().clone()
+    }
+}
+
+impl Proposer for ScriptedProposer {
+    fn propose(&self, question: &str) -> Result<bool, HortError> {
+        self.proposals.borrow_mut().push(question.to_owned());
+        Ok(self.accepts)
     }
 }
 

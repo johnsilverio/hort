@@ -27,6 +27,7 @@ use crate::adapters::metadata::FileMetadataStore;
 use crate::adapters::notify::FileNotifyProvider;
 use crate::adapters::pasta::PastaNetworkProvider;
 use crate::adapters::prompt::DialoguerPrompter;
+use crate::adapters::propose::DialoguerProposer;
 use crate::adapters::runtime::LibcontainerRuntime;
 use crate::adapters::terminal::HostTerminal;
 use crate::adapters::worktree::GitWorktreeProvider;
@@ -117,6 +118,7 @@ pub struct RealDeps {
     clock: SystemClock,
     confirmer: StdinConfirmer,
     prompts: DialoguerPrompter,
+    proposer: DialoguerProposer,
     env: HostEnvironmentProbe,
     cache: FileCacheProvider,
     notify: FileNotifyProvider,
@@ -187,6 +189,7 @@ impl RealDeps {
             clock: SystemClock,
             confirmer: StdinConfirmer,
             prompts: DialoguerPrompter,
+            proposer: DialoguerProposer,
             env: HostEnvironmentProbe,
             cache: FileCacheProvider::new(state_root.clone()),
             notify: FileNotifyProvider::new(state_root.clone(), runtime_root.clone()),
@@ -293,13 +296,14 @@ pub fn run(cli: Cli, deps: &RealDeps) -> Result<u8, HortError> {
                 &deps.env,
                 &deps.cache,
                 &deps.notify,
+                &deps.proposer,
                 deps.state_root.clone(),
                 deps.project_dir.clone(),
                 deps.current_dir.clone(),
                 deps.host_home.clone(),
                 &config,
             );
-            let warnings = command.run(name.clone(), branch)?;
+            let warnings = command.run(name.clone(), branch, std::io::stdin().is_terminal())?;
             eprint!("{}", render_warnings(&config_warnings, &warnings));
             if detach {
                 return Ok(HORT_SUCCEEDED);

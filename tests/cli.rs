@@ -2717,6 +2717,95 @@ fn cli_up_brings_the_network_of_a_live_sandbox_back() {
     assert!(names_pasta(revived), "pasta.pid names {revived}, which is not a running pasta");
 }
 
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_up_refuses_a_branch_a_down_kept_without_offering_it_when_stdin_is_not_a_terminal() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+    let name = sandbox.name().as_str();
+    // What a `down` leaves of a sandbox: its branch, and no worktree or record.
+    git(&repo_path, &["branch", name]);
+    let mut hort = std::process::Command::new(assert_cmd::cargo::cargo_bin("hort"));
+    hort.env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", name]);
+
+    let transcript = output_only_terminal(hort);
+
+    // The whole of what reached the terminal, so a question put there fails
+    // this. Only stdin is kept off the terminal, because a prompt looks at
+    // stderr: with every stream piped, a question asked anyway would refuse on
+    // its own and hand back this very sentence.
+    assert_eq!(
+        transcript,
+        format!(
+            "branch '{name}' already exists (a 'hort down' keeps a sandbox's branch) — run 'hort up {name} --branch {name}' to build the sandbox on it, or choose another name\r\n"
+        )
+    );
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_up_builds_on_a_branch_a_down_kept_when_the_offer_is_taken_at_a_terminal() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+    let name = sandbox.name().as_str();
+    // A commit only the kept branch carries, so a worktree cut from HEAD instead
+    // is told apart from one on the branch by what is in it.
+    git(&repo_path, &["checkout", "-q", "-b", name]);
+    fs::write(repo_path.join("kept-by-the-branch.txt"), "kept\n").unwrap();
+    git(&repo_path, &["add", "kept-by-the-branch.txt"]);
+    git(
+        &repo_path,
+        &[
+            "-c",
+            "user.name=hort tests",
+            "-c",
+            "user.email=tests@hort.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "work a down kept",
+        ],
+    );
+    git(&repo_path, &["checkout", "-q", "main"]);
+    let mut hort = std::process::Command::new(assert_cmd::cargo::cargo_bin("hort"));
+    hort.env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", name]);
+
+    // Enter alone, because taking the offer is what the question defaults to.
+    let (how_it_ended, transcript) = ended_at_the_terminal(hort, "\r");
+
+    assert_eq!(how_it_ended.code(), Some(0), "the offer taken builds the sandbox: {transcript}");
+    assert!(
+        sandbox
+            .state_dir()
+            .join(format!("worktree-{name}"))
+            .join("kept-by-the-branch.txt")
+            .exists(),
+        "on the branch that was kept, holding the work committed there: {transcript}"
+    );
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", name])
+        .assert()
+        .success();
+}
+
 /// The file a session writes into the merged root, and the bytes that say the
 /// write landed. A read back is `cat`, which complains to stderr about a file
 /// that is not there, so the content is the only thing that can reach stdout.
