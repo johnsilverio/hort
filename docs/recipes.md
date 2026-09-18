@@ -92,7 +92,7 @@ If a variable is not set, the session opens without it and hort warns. Use devel
 
 ### GitHub CLI without logging in each time
 
-The `gh` command reads a token from `GH_TOKEN` (or `GITHUB_TOKEN`). Forward it the same way, so `gh` inside the sandbox is authenticated on every session with no `gh auth login`:
+This recipe needs `gh` itself in the rootfs; see [Preparing a rootfs](rootfs.md#what-a-rootfs-must-provide). It reads a token from `GH_TOKEN` (or `GITHUB_TOKEN`), so forward that the same way and `gh` inside the sandbox is authenticated on every session with no `gh auth login`:
 
 ```jsonc
 {

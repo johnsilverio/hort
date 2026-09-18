@@ -57,6 +57,8 @@ The difference is deliberate: a flag is a request for this one build, while a gl
 
 `/workdir` is a clone of your repository, with a real writable `.git` directory of its own. The branch rule is the same as in worktree mode: `hort up <name>` creates and checks out a branch named `<name>`, and `--branch <existing>` checks out one that already exists.
 
+The git binary that works on it comes from the rootfs, so a rootfs without git leaves the clone unusable from inside (see [Preparing a rootfs](rootfs.md#what-a-rootfs-must-provide)).
+
 Inside, the clone has two remotes:
 
 | Remote | Points at | Push |

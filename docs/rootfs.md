@@ -12,7 +12,13 @@ You prepare it once, and again whenever you want to change what is inside.
 4. **A world-writable `/workdir`.** It is where hort binds the worktree. Create it with `mkdir -p /workdir && chmod 1777 /workdir`. hort refuses a rootfs whose `/workdir` is not world-writable.
 5. **No command that starts an agent.** hort starts its own idle process as the container's first process. An image `CMD` or `ENTRYPOINT` is ignored.
 
-Useful in practice, though not checked: `ca-certificates` (anything using TLS needs them), `git` only if tools you run expect the binary to exist (git commands still do not work inside, see [Concepts](concepts.md#git-is-a-host-activity)), and the shell you use on the host if you want it inside (see [the `shell` key](configuration.md#shell)).
+Beyond those five nothing is checked, and a binary the rootfs does not carry is one no sandbox has. In practice that means:
+
+- `ca-certificates`, for anything that uses TLS.
+- `git`, **required** in [clone mode](git-modes.md), where the agent commits and pushes from inside the sandbox. In the default worktree mode no git command works inside (see [Concepts](concepts.md#git-is-a-host-activity)), and the binary is then worth having only for tools that expect it to exist.
+- `gh`, if you forward a GitHub token with [the GitHub CLI recipe](recipes.md#github-cli-without-logging-in-each-time), or let an agent open its own pull requests from a clone-mode sandbox.
+- The shell you use on the host, if you want it inside (see [the `shell` key](configuration.md#shell)).
+- Whatever your own agent hooks call. A Claude Code hook in the `~/.claude` you mount read-only runs inside the sandbox, so a hook built around `jq` needs `jq` here. The completion hook hort installs for [notifications](recipes.md#notifications) needs nothing beyond the shell.
 
 ## Agents that refuse to run as root
 
@@ -28,6 +34,22 @@ Claude Code accepts that mode as root when `IS_SANDBOX=1` is set. Set it **in th
 - For fish: `mkdir -p /etc/fish/conf.d && printf 'set -gx IS_SANDBOX 1\n' > /etc/fish/conf.d/hort-sandbox.fish`
 
 Other agents have their own switch, or none; check each one's documentation.
+
+## Install into the system, not into a home directory
+
+A sandbox never gets the home directory your build ran as. hort gives every sandbox a home of its own at `/home/hort`, created in memory at boot and holding nothing but the read-only files you chose to mount there, and a session's `PATH` is the plain system one, with no home directory on it (the exact value is in [Configuration](configuration.md#environment-variables)).
+
+An installer that drops its binary under `$HOME` at build time therefore fails in a way that is easy to miss. Nothing is lost: the file is still in the rootfs, under the home the build used, `/root/.local/bin` for example. It is simply under a home no session has, on no `PATH` any session reads, and the line the installer appended to that home's shell configuration is never read either. The build goes green and the tool is missing the first time an agent asks for it.
+
+Install into `/usr/local/bin` instead. `uv` is the usual case, because its installer defaults to `$HOME/.local/bin`:
+
+```dockerfile
+RUN curl -LsSf https://astral.sh/uv/install.sh \
+    | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh \
+    && uv --version
+```
+
+Ending the step with `uv --version` is deliberate: it runs the binary from the system `PATH` while the build is still going, so a misplaced install fails the build instead of a sandbox weeks later. Any installer with the same habit gets the same treatment.
 
 ## Building one from a Dockerfile
 
