@@ -698,6 +698,8 @@ pub struct FakeWorktreeProvider {
     checked_out_branches: Vec<(BranchName, PathBuf)>,
     dirty_worktrees: Vec<SandboxName>,
     failing_dirty_probes: Vec<SandboxName>,
+    unreturned_work: Vec<SandboxName>,
+    failing_unreturned_probes: Vec<SandboxName>,
     prune_stale_calls: RefCell<usize>,
     trace: Option<TeardownTrace>,
 }
@@ -715,6 +717,8 @@ impl FakeWorktreeProvider {
             checked_out_branches: Vec::new(),
             dirty_worktrees: Vec::new(),
             failing_dirty_probes: Vec::new(),
+            unreturned_work: Vec::new(),
+            failing_unreturned_probes: Vec::new(),
             prune_stale_calls: RefCell::new(0),
             trace: None,
         }
@@ -793,6 +797,20 @@ impl FakeWorktreeProvider {
     /// standing in for a worktree git cannot inspect.
     pub fn with_failing_dirty_probe(mut self, name: &SandboxName) -> Self {
         self.failing_dirty_probes.push(name.clone());
+        self
+    }
+
+    /// Script this sandbox's `/workdir` as holding committed work the host
+    /// repository does not have: `holds_unreturned_work` answers `Ok(true)`.
+    pub fn with_unreturned_work(mut self, name: &SandboxName) -> Self {
+        self.unreturned_work.push(name.clone());
+        self
+    }
+
+    /// Script this sandbox's unreturned-work probe as failing: it answers `Err`,
+    /// standing in for a `/workdir` whose own git hort cannot read.
+    pub fn with_failing_unreturned_work_probe(mut self, name: &SandboxName) -> Self {
+        self.failing_unreturned_probes.push(name.clone());
         self
     }
 
@@ -898,6 +916,17 @@ impl WorktreeProvider for FakeWorktreeProvider {
             });
         }
         Ok(self.dirty_worktrees.contains(name))
+    }
+
+    fn holds_unreturned_work(&self, name: &SandboxName) -> Result<bool, HortError> {
+        if self.failing_unreturned_probes.contains(name) {
+            // An unasserted stand-in error: no consumer asserts the variant,
+            // only that it is an `Err`.
+            return Err(HortError::InvalidConfig {
+                detail: "fake worktree: unreturned-work probe scripted to fail".to_string(),
+            });
+        }
+        Ok(self.unreturned_work.contains(name))
     }
 
     fn prune_stale(&self) -> Result<(), HortError> {

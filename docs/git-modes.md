@@ -125,12 +125,23 @@ The same limit applies to fetching from that directory, which is why work comes 
 
 ### What is not there yet
 
-Clone mode works, and two rough edges remain:
+Clone mode works, and one rough edge remains:
 
-- **`hort down` leaves the pinned ref behind.** It removes the clone and the record, but `refs/hort/<name>/base` stays in your repository. Remove it by hand when you no longer want it: `git update-ref -d refs/hort/<name>/base`.
 - **`hort ls` does not say which mode a sandbox was built in.** Its dirty column also reads `-` for a clone, because that check asks your repository about a worktree and a clone is not one. The branch column is correct.
 
-Both are on the [Roadmap](roadmap.md).
+It is on the [Roadmap](roadmap.md).
+
+### What `hort down` does with a clone
+
+`down` removes the clone along with the sandbox, and a commit that never left the box goes with it. So before it removes anything it compares the clone's tip against your repository and asks when your repository does not have it:
+
+```text
+sandbox 'fix-login' holds commits the project repository does not have; tear it down anyway? [y/N]
+```
+
+Anything but `y` leaves the sandbox standing. `hort down -f` skips the question, and without a terminal `down` refuses rather than guess. See [hort down](commands/down.md#unreturned-work).
+
+It also deletes that sandbox's pinned ref `refs/hort/<name>/base`, the one your repository was holding so its gc would leave the clone's borrowed objects alone. The pins of your other clone-mode sandboxes stay where they are.
 
 ### Changing the mode of a sandbox that exists
 

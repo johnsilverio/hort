@@ -177,6 +177,18 @@ pub trait WorktreeProvider {
     /// Whether this sandbox's worktree has uncommitted changes; untracked files
     /// count. The first behavioral consumer is `prune`.
     fn is_dirty(&self, name: &SandboxName) -> Result<bool, HortError>;
+    /// Whether this sandbox's `/workdir` holds committed work the host
+    /// repository does not have.
+    ///
+    /// It is the question a repository of the sandbox's own makes destructive.
+    /// A worktree commits into the project repository's own object store, so a
+    /// commit outlives the box that made it; a clone keeps its objects to
+    /// itself, and collecting the box collects them too. Both reads are cheap
+    /// and host-side: reading a ref touches no object, so the clone's tip is
+    /// readable even though the objects it borrows are mounted only inside the
+    /// box, and the host repository is then asked whether it already has that
+    /// commit.
+    fn holds_unreturned_work(&self, name: &SandboxName) -> Result<bool, HortError>;
     /// Clear every stale `.git/worktrees` registration whose directory vanished.
     /// `prune` runs it once per non-refused, non-declined run; the per-name
     /// `remove` already clears only its own stale entry.

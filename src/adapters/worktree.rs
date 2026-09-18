@@ -178,8 +178,26 @@ impl GitWorktreeProvider {
             return Ok(());
         }
         let commit = String::from_utf8_lossy(&base.stdout).trim().to_string();
-        let pin = format!("refs/hort/{}/base", name.as_str());
-        run(&self.repo_dir, "update-ref", &["update-ref", &pin, &commit]).map(|_| ())
+        run(&self.repo_dir, "update-ref", &["update-ref", &self.base_pin(name), &commit])
+            .map(|_| ())
+    }
+
+    /// Release the commit this sandbox stood on, so the host's own gc is free to
+    /// collect it again: once the clone is gone the pin holds an object for
+    /// nobody. It is named after the one sandbox rather than swept, because the
+    /// other pins are what keep the boxes still standing one `git gc` away from
+    /// a `/workdir` whose objects cannot be read.
+    ///
+    /// Only clone mode ever writes one, and deleting a ref that is not there is
+    /// already the state asked for, so the worktree route passes through
+    /// untouched and a clone whose directory vanished still gets collected.
+    fn unpin_clone_base(&self, name: &SandboxName) -> Result<(), HortError> {
+        run(&self.repo_dir, "update-ref", &["update-ref", "-d", &self.base_pin(name)]).map(|_| ())
+    }
+
+    /// The ref the host repository holds a sandbox's base commit under.
+    fn base_pin(&self, name: &SandboxName) -> String {
+        format!("refs/hort/{}/base", name.as_str())
     }
 }
 
@@ -199,6 +217,7 @@ impl WorktreeProvider for GitWorktreeProvider {
     }
 
     fn remove(&self, name: &SandboxName) -> Result<(), HortError> {
+        self.unpin_clone_base(name)?;
         let path = self.worktree_path(name);
         let porcelain = run(&self.repo_dir, "worktree list", &["worktree", "list", "--porcelain"])?;
         let records = parse_worktree_records(&porcelain);
@@ -301,6 +320,19 @@ impl WorktreeProvider for GitWorktreeProvider {
             ],
         )?;
         Ok(!porcelain.trim().is_empty())
+    }
+
+    fn holds_unreturned_work(&self, name: &SandboxName) -> Result<bool, HortError> {
+        // Two host-side reads, neither of which enters the box. Resolving the
+        // tip touches no object, so it answers even inside a clone whose
+        // borrowed objects are mounted only in the sandbox. A worktree's tip is
+        // always a commit the project repository has, since that is the object
+        // store it committed into, so this reads false there without a mode of
+        // its own.
+        let workdir = self.worktree_path(name);
+        let tip = run(&workdir, "rev-parse", &["rev-parse", "HEAD"])?;
+        let host = capture(&self.repo_dir, "cat-file", &["cat-file", "-e", tip.trim()])?;
+        Ok(!host.status.success())
     }
 
     fn prune_stale(&self) -> Result<(), HortError> {
@@ -474,6 +506,31 @@ mod tests {
             .args(args)
             .output()
             .unwrap()
+    }
+
+    /// Commit inside a clone the way the box does, lending it the host object
+    /// store the box has by mount, and return the commit it left at the tip.
+    fn commit_in_clone(clone: &Path, objects: &Path, file: &str) -> String {
+        fs::write(clone.join(file), "work\n").unwrap();
+        let staged = git_borrowing_objects(clone, objects, &["add", file]);
+        assert!(staged.status.success(), "git add failed in the clone");
+        let committed = git_borrowing_objects(
+            clone,
+            objects,
+            &[
+                "-c",
+                "user.name=hort-test",
+                "-c",
+                "user.email=hort-test@localhost",
+                "commit",
+                "-m",
+                "work",
+            ],
+        );
+        assert!(committed.status.success(), "git commit failed in the clone");
+        let head = git_borrowing_objects(clone, objects, &["rev-parse", "HEAD"]);
+        assert!(head.status.success(), "git rev-parse failed in the clone");
+        String::from_utf8(head.stdout).unwrap().trim().to_string()
     }
 
     fn rev_parse(dir: &Path, rev: &str) -> String {
@@ -1147,6 +1204,81 @@ mod tests {
         );
 
         assert_eq!(git(&repo, &["branch", "--list", "demo"]).trim(), "");
+    }
+
+    #[test]
+    fn clone_mode_reports_work_the_host_repository_does_not_have() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let branch = BranchName::new("demo").unwrap();
+        let workdir = provider.create(&name, &branch, GitMode::Clone).unwrap();
+        commit_in_clone(&workdir.path, &repo.join(".git").join("objects"), "work.txt");
+
+        assert!(provider.holds_unreturned_work(&name).unwrap());
+    }
+
+    #[test]
+    fn clone_mode_reports_no_unreturned_work_when_the_host_repository_has_the_tip() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let branch = BranchName::new("demo").unwrap();
+        provider.create(&name, &branch, GitMode::Clone).unwrap();
+
+        // A fresh clone stands on the commit it was cloned from, which is the
+        // host's own. The pair matters more than either half: without this one a
+        // probe that always says yes passes, and a guard that always asks turns
+        // every `down` of a clone into a prompt the user learns to answer blind.
+        assert!(!provider.holds_unreturned_work(&name).unwrap());
+    }
+
+    #[test]
+    fn clone_mode_remove_deletes_the_pinned_base_ref_from_the_host_repository() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let branch = BranchName::new("demo").unwrap();
+        provider.create(&name, &branch, GitMode::Clone).unwrap();
+
+        provider.remove(&name).unwrap();
+
+        // The pin exists to keep the host's gc off an object the clone borrows.
+        // Once the clone is gone it holds a commit for nobody, in a repository
+        // no hort command will ever visit again with that sandbox's name.
+        let pinned = Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "--verify", "--quiet", "refs/hort/demo/base"])
+            .output()
+            .unwrap();
+        assert!(!pinned.status.success(), "the pinned base ref outlived the sandbox");
+    }
+
+    #[test]
+    fn clone_mode_remove_leaves_another_sandboxs_pinned_base_ref_intact() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let base = rev_parse(&repo, "HEAD");
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let going = SandboxName::new("demo").unwrap();
+        let staying = SandboxName::new("other").unwrap();
+        provider.create(&going, &BranchName::new("demo").unwrap(), GitMode::Clone).unwrap();
+        provider.create(&staying, &BranchName::new("other").unwrap(), GitMode::Clone).unwrap();
+
+        provider.remove(&going).unwrap();
+
+        // The pin is what keeps the host's gc off the objects a clone borrows
+        // rather than owns, so collecting one box by sweeping every pin leaves
+        // the boxes still standing one `git gc` away from an unreadable
+        // `/workdir`.
+        assert_eq!(rev_parse(&repo, "refs/hort/other/base"), base);
     }
 
     #[test]

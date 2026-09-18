@@ -18,14 +18,18 @@ use crate::domain::idle::IdleState;
 use crate::domain::model::SandboxName;
 use crate::domain::reconcile::SandboxState;
 
-/// What a candidate's worktree holds, as far as hort was able to determine.
+/// What a candidate's `/workdir` holds, as far as hort was able to determine.
 ///
-/// The three states are deliberately distinct. A single value carrying both
-/// "nothing at risk" and "could not tell" leaves the gate to resolve the
-/// ambiguity, and a gate resolves it toward removal, which is the direction that
-/// costs a user their uncommitted work.
+/// The states are deliberately distinct. A single value carrying both "nothing
+/// at risk" and "could not tell" leaves the gate to resolve the ambiguity, and a
+/// gate resolves it toward removal, which is the direction that costs a user
+/// their uncommitted work. `HoldsUnreturnedWork` is apart from `HoldsWork` for
+/// the same kind of reason one level down: what it holds back is committed, and
+/// only a `/workdir` with a repository of its own can hold a commit the project
+/// repository will never see.
 pub enum WorktreeRisk {
     HoldsWork,
+    HoldsUnreturnedWork,
     NothingAtRisk,
     Unknown,
 }
@@ -91,13 +95,18 @@ pub struct CacheInput {
 /// gone sends the user hunting for uncommitted changes git can no longer
 /// enumerate, and that report is what they read before deciding to force. The
 /// cache reasons are separate from it for the same reason they exist at all: one
-/// word for both questions sends that reader to the wrong place. `UnknownIdle`
+/// word for both questions sends that reader to the wrong place.
+/// `UnreturnedWork` is apart from `Dirty` on the same ground: the work it holds
+/// back is committed, so a reader told the box is dirty goes looking for
+/// uncommitted changes, finds none, and forces away the commits themselves.
+/// `UnknownIdle`
 /// is the third question and has no "something at risk" twin, because a sandbox
 /// that is definitely busy was never withheld out of uncertainty: only the
 /// uncertainty needs a voice.
 #[derive(Debug, PartialEq)]
 pub enum SkipReason {
     Dirty,
+    UnreturnedWork,
     Unknown,
     LiveProject,
     UnknownProject,
@@ -227,6 +236,7 @@ fn protected(risk: &WorktreeRisk, force: bool) -> Option<SkipReason> {
     }
     match risk {
         WorktreeRisk::HoldsWork => Some(SkipReason::Dirty),
+        WorktreeRisk::HoldsUnreturnedWork => Some(SkipReason::UnreturnedWork),
         WorktreeRisk::Unknown => Some(SkipReason::Unknown),
         WorktreeRisk::NothingAtRisk => None,
     }

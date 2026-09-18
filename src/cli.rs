@@ -95,7 +95,7 @@ pub enum CliCommand {
     Down {
         /// The sandbox to tear down.
         name: String,
-        /// Skip the open-sessions confirmation.
+        /// Skip the confirmations for open sessions and unreturned work.
         #[arg(short, long)]
         force: bool,
     },
@@ -788,6 +788,7 @@ fn render_line(entry: &LsEntry) -> String {
 fn skip_reason_label(reason: &SkipReason) -> &'static str {
     match reason {
         SkipReason::Dirty => "dirty",
+        SkipReason::UnreturnedWork => "work only in the box",
         SkipReason::Unknown => "unknown",
         SkipReason::LiveProject => "project on disk",
         SkipReason::UnknownProject => "project unreadable",
@@ -1031,6 +1032,26 @@ mod tests {
         // --force, and "dirty" would send them looking for uncommitted changes
         // in a worktree whose repository is gone.
         assert!(rendered.contains("unknown"));
+    }
+
+    #[test]
+    fn render_prune_reports_work_only_the_box_holds_as_its_own_reason() {
+        let report = PruneReport {
+            removed: Vec::new(),
+            removed_caches: Vec::new(),
+            skipped: vec![PruneSkip {
+                name: "demo".to_string(),
+                reason: SkipReason::UnreturnedWork,
+            }],
+        };
+
+        let rendered = render_prune(&report);
+
+        // Same argument as the unknown arm above: this line is read before
+        // deciding whether to force, and "dirty" would send the user looking for
+        // uncommitted changes in a box whose work is committed, finding none,
+        // and forcing away the commits themselves.
+        assert!(rendered.contains("work only in the box"));
     }
 
     #[test]

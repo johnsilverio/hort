@@ -20,6 +20,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::commands::{last_announced_completion, present_worktrees};
 use crate::domain::cache::project_from_cache_key;
+use crate::domain::config::GitMode;
 use crate::domain::error::HortError;
 use crate::domain::idle::{IdleState, idle, parse_timestamp};
 use crate::domain::model::{SandboxName, SandboxRecord};
@@ -268,26 +269,41 @@ impl PruneCommand<'_> {
         if !self.worktrees.exists(record.worktree_path()) {
             return WorktreeRisk::NothingAtRisk;
         }
-        self.probed_risk(record.name())
+        self.probed_risk(record.name(), record.worktree_path())
     }
 
     /// What a corrupt dir's worktree holds. A corrupt entry has no record to read
     /// the path from, so the canonical state-root layout supplies it; from there
     /// the question and its answers are the record path's.
     fn corrupt_risk(&self, name: &str) -> WorktreeRisk {
-        if !self.worktrees.exists(&self.corrupt_worktree_path(name)) {
+        let workdir = self.corrupt_worktree_path(name);
+        if !self.worktrees.exists(&workdir) {
             return WorktreeRisk::NothingAtRisk;
         }
         let Ok(sandbox_name) = SandboxName::new(name) else {
             return WorktreeRisk::NothingAtRisk;
         };
-        self.probed_risk(&sandbox_name)
+        self.probed_risk(&sandbox_name, &workdir)
     }
 
-    /// The dirty probe read as risk. It lives in one place because the two paths
-    /// that ask it gate the same deletion, and a mapping that drifts between them
-    /// reopens the data-loss path on whichever side was left behind.
-    fn probed_risk(&self, name: &SandboxName) -> WorktreeRisk {
+    /// The two probes of a `/workdir` read as one risk. It lives in one place
+    /// because the two paths that ask it gate the same deletion, and a mapping
+    /// that drifts between them reopens the data-loss path on whichever side was
+    /// left behind.
+    ///
+    /// The commits come first because the remedies differ and only one of the
+    /// two words can be printed: told a clone is dirty, a user goes looking for
+    /// uncommitted changes and forces away the commits nothing else holds. Only
+    /// a `/workdir` built as a clone is asked, since a worktree commits into the
+    /// project repository's own object store and its commits outlive the box.
+    fn probed_risk(&self, name: &SandboxName, workdir: &Path) -> WorktreeRisk {
+        if matches!(self.worktrees.git_mode_at(workdir), Some(GitMode::Clone)) {
+            match self.worktrees.holds_unreturned_work(name) {
+                Ok(true) => return WorktreeRisk::HoldsUnreturnedWork,
+                Ok(false) => {}
+                Err(_) => return WorktreeRisk::Unknown,
+            }
+        }
         match self.worktrees.is_dirty(name) {
             Ok(true) => WorktreeRisk::HoldsWork,
             Ok(false) => WorktreeRisk::NothingAtRisk,
@@ -570,6 +586,41 @@ mod tests {
 
         assert!(report.removed.contains(&"rotten".to_string()));
         assert!(store.list_corrupt().unwrap().is_empty());
+    }
+
+    #[test]
+    fn prune_skips_a_clone_holding_work_the_host_repository_lacks() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo")).unwrap();
+        // No live anchor, so the box is orphaned debris and a candidate on every
+        // run: what holds it back has to be the guard and not the selection.
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees =
+            FakeWorktreeProvider::new().with_clone_workdir(&name).with_unreturned_work(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches, &notify,
+        );
+
+        let report = command.run(None, false, true).unwrap();
+
+        // `down` and `prune` tear down through the same plan, so a guard on one
+        // door only moves the loss to the other. The reason is its own because
+        // the remedy is: this box holds commits, not edits, and reading "dirty"
+        // sends the user looking for changes git already took.
+        assert_eq!(
+            report.skipped,
+            vec![PruneSkip { name: "demo".to_string(), reason: SkipReason::UnreturnedWork }]
+        );
+        assert!(report.removed.is_empty());
     }
 
     #[test]

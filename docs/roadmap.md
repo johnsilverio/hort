@@ -4,9 +4,8 @@ This page lists work that has been decided but is **not available yet**. It desc
 
 ## Cleaning up after clone mode
 
-[Clone mode](git-modes.md) works today. Two pieces of it are still missing:
+[Clone mode](git-modes.md) works today. One piece of it is still missing:
 
-- `hort down` leaves the pinned ref `refs/hort/<name>/base` in your repository; today you remove it with `git update-ref -d refs/hort/<name>/base`. Planned: `down` removes it, and warns when the sandbox holds commits you never pushed.
 - `hort ls` does not show which git mode a sandbox was built in, and its dirty column reads `-` for a clone. Planned: the mode is visible in the listing.
 
 ## Deleting the sandbox's branch on `down` and `prune`

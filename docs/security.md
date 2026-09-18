@@ -36,7 +36,7 @@ You commit the work from the host, in that same worktree, while the sandbox is u
 - its **object store is mounted read-only**, so the clone reads all of your history and can rewrite none of it (a write there is refused by the kernel with `Read-only file system`);
 - the remote pointing back at your repository, `hort-base`, is **fetch only**, because a plain shared clone would otherwise be able to push new branches straight into it.
 
-After an agent commits inside such a sandbox, your repository's `.git` is byte for byte what it was. The one thing hort writes there is a ref, `refs/hort/<name>/base`, which pins the commit the clone started from so your own `git gc` cannot prune objects the clone borrows.
+After an agent commits inside such a sandbox, your repository's `.git` is byte for byte what it was. The one thing hort writes there is a ref, `refs/hort/<name>/base`, which pins the commit the clone started from so your own `git gc` cannot prune objects the clone borrows. `hort down` deletes that sandbox's ref along with the sandbox, leaving the refs of your other clone-mode sandboxes alone.
 
 What clone mode does change is where a credential lives. If you want the agent to push, you forward a token into a box you are not watching, so the token is what bounds the damage: scope it to one repository, give it only the permissions the job needs, and protect the branches on the remote.
 
