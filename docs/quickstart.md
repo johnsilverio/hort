@@ -109,7 +109,7 @@ $ hort down fix-login
 tear down sandbox 'fix-login' with open sessions? [y/N] y
 ```
 
-`down` asks only when sessions are still open (`-f` skips the question). It stops everything in the box, removes the container, **deletes the worktree with any uncommitted changes**, and removes hort's record. It prints nothing when it succeeds.
+`down` asks before it destroys something you cannot get back: when sessions are still open, and, in [clone mode](git-modes.md), when the box holds commits your repository does not have (`-f` skips both questions). It stops everything in the box, removes the container, **deletes the worktree with any uncommitted changes**, and removes hort's record. It prints nothing when it succeeds.
 
 It keeps the **branch** and every commit on it. If you run `hort up fix-login` again later, hort notices the branch and offers to build on it:
 

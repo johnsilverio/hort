@@ -75,7 +75,7 @@ hort up api-feature      # branch + worktree, start the box, drop you in
 hort attach api-feature  # open another session from any terminal
 hort run api-feature -- cargo test   # one command inside, exit code and all
 hort ls                  # see what's running
-hort down api-feature    # tear it down (asks first if sessions are open)
+hort down api-feature    # tear it down (asks first if sessions are open, or if a clone holds unpushed work)
 ```
 
 Inside, you run agents however you already do: `claude`, `aider`, `gemini`, whatever you reach for. hort doesn't wrap them or replace them. It just makes the ground under them safe to stand on.
