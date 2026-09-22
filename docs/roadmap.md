@@ -2,6 +2,26 @@
 
 This page lists work that has been decided but is **not available yet**. It describes what you will be able to do, not when: there are no dates and no promised order, and any of it may change. Everything else in this book describes hort as it works today.
 
+## Closing the host's loopback to an open sandbox
+
+Today an open sandbox reaches every service listening on your host's `127.0.0.1`: a development database, a cache with no password, an admin panel a project left running. That is the default mapping of the network helper, and hort unmaps it only under an [allowlist](networking.md#an-egress-allowlist), so the only way to close it is to change the whole egress posture. Planned: an open sandbox reaches the host's loopback only at the ports its [declared databases](networking.md#databases) name, and the rest of that interface is closed unless you ask for it.
+
+## Preparing a rootfs with hort itself
+
+Today you build a rootfs, export it into a directory and fix the mode of its `/workdir` by hand ([Preparing a rootfs](rootfs.md#building-one-from-a-dockerfile)), and a forgotten final `chmod` makes `hort up` refuse the directory after all that work. Planned: `hort rootfs import` takes the tarball `podman export` or `docker export` writes, unpacks it into a directory of its own, sets the mode `/workdir` needs, checks it against [what a rootfs must provide](rootfs.md#what-a-rootfs-must-provide) and records the path in your configuration.
+
+## A credentials question that defaults to no
+
+Today the agent question in `hort config` offers to mount an agent's credential directory read-only, and answering it with nothing but Enter accepts ([the dialogue](commands/config.md#the-dialogue)). Read-only keeps the agent from changing those credentials; it does not keep it from reading them and, under open egress, sending them on ([what you mount into the box](security.md#what-you-mount-into-the-box)). Planned: the question's default answer is no, and it says what mounting the directory exposes before you answer it.
+
+## Saying what posture a sandbox starts in
+
+Today nothing at `up` time tells you which posture the box you just opened runs in. Open egress and mounted credentials are each documented, and the rule against leaving them together on an unattended box is written down ([the rules that follow](security.md#the-rules-that-follow)), but you have to remember what you configured to know that is what you have. Planned: `hort up` names the posture it built, open or allowlisted, and what it mounted, so the two are in front of you before you walk away from the box.
+
+## Installing without a Rust toolchain
+
+Today hort is built from source, which means a Rust toolchain, the libseccomp headers and a release build before the first sandbox ([Building the binary](installation.md#building-the-binary)). Planned: a released binary for Linux you download and run, so trying hort does not begin with a compiler.
+
 ## Cleaning up after clone mode
 
 [Clone mode](git-modes.md) works today. One piece of it is still missing:

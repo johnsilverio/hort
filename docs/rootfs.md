@@ -64,7 +64,7 @@ podman rm "$cid"
 chmod 1777 ~/.local/share/hort/devbox/workdir
 ```
 
-The final `chmod` is not optional: extracting as a normal user drops the mode the image gave `/workdir`.
+The final `chmod` is not optional: extracting as a normal user drops the mode the image gave `/workdir`. Having hort do this whole export for you is [planned](roadmap.md#preparing-a-rootfs-with-hort-itself).
 
 Then point hort at the directory, in `~/.config/hort/config.json` or a project's `.hort.json`:
 

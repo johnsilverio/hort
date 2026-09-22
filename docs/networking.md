@@ -7,7 +7,7 @@ Every sandbox has its own network namespace, bridged to the host by [`pasta`](ht
 With `egress` absent or `true`, the sandbox reaches whatever your host reaches. Nothing is filtered and no proxy runs. This is what most agents need out of the box: they talk to their model provider directly.
 
 - **Name resolution** works: hort writes an `/etc/resolv.conf` into the sandbox naming `198.51.100.53`, and pasta answers that address by forwarding the query to your host's resolver.
-- **Services on the host's loopback are reachable** at `127.0.0.1` inside the sandbox. A development server or database listening on `127.0.0.1:5432` on your host answers on `127.0.0.1:5432` inside the box, with no configuration.
+- **Services on the host's loopback are reachable** at `127.0.0.1` inside the sandbox. A development server or database listening on `127.0.0.1:5432` on your host answers on `127.0.0.1:5432` inside the box, with no configuration. Closing that interface without changing the whole posture is [planned](roadmap.md#closing-the-hosts-loopback-to-an-open-sandbox).
 - **No proxy variables** are set.
 
 Open egress does not prevent exfiltration. A hostile repository could send data anywhere, including to services on your host's loopback. See the [Security model](security.md).
