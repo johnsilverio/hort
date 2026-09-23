@@ -39,6 +39,8 @@ hort up ship-it --git clone            # give the box its own clone, so git work
 10. **Starts the notification watcher**, if an agent declares `notify.stopHook`. If that fails, it warns and carries on.
 11. **Opens a session**, unless `-d`: exactly what `hort attach <name>` does.
 
+What `up` prints says what it built, not the posture it built it in: whether the box has open egress, and what it mounted, is what you configured rather than something the command repeats back. Naming that posture at `up` time is [planned](../roadmap.md#saying-what-posture-a-sandbox-starts-in).
+
 If starting the container or its networking fails after the container is up, `up` undoes what it started (helpers, then container) and keeps the worktree and the record. The sandbox then shows as `orphaned`, and running `hort up <name>` again retries.
 
 `hort up <name>` without `-d` behaves exactly like `hort up <name> -d` followed by `hort attach <name>`, including its [exit status](attach.md#exit-status).

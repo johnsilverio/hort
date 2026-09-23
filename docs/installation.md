@@ -22,7 +22,7 @@ You also need a **prepared rootfs directory**: the base filesystem, with your ag
 
 ## Building the binary
 
-You need a Rust toolchain, version 1.89 or newer, and the libseccomp development package (`libseccomp-devel` on Fedora, `libseccomp-dev` on Debian and Ubuntu).
+You need a Rust toolchain, version 1.89 or newer, and the libseccomp development package (`libseccomp-devel` on Fedora, `libseccomp-dev` on Debian and Ubuntu). A released binary, so that none of this is needed to try hort, is [planned](roadmap.md#installing-without-a-rust-toolchain).
 
 ```bash
 git clone https://github.com/johnsilverio/hort.git
@@ -43,6 +43,7 @@ Usage: hort <COMMAND>
 Commands:
   up      Build a sandbox and open a session in it
   attach  Open one more session in a running sandbox
+  run     Run one command in a running sandbox with no terminal
   ls      List every sandbox with its reconciled state
   down    Tear a sandbox down in the mandatory order
   prune   Remove idle sandboxes and abrupt-death debris after confirming

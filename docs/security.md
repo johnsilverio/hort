@@ -53,11 +53,11 @@ What clone mode does change is where a credential lives. If you want the agent t
 
 ### Exfiltration under open egress
 
-By default a sandbox has open network access, because agents need to reach their model provider. A hostile repository, or an agent tricked by a prompt injection, can send anything it can read to any server. That includes services listening on your host's loopback interface, which are reachable at `127.0.0.1` from inside an open sandbox.
+By default a sandbox has open network access, because agents need to reach their model provider. A hostile repository, or an agent tricked by a prompt injection, can send anything it can read to any server. That includes services listening on your host's loopback interface, which are reachable at `127.0.0.1` from inside an open sandbox. Today an allowlist is what closes that interface; closing it on its own is [planned](roadmap.md#closing-the-hosts-loopback-to-an-open-sandbox).
 
 ### What you mount into the box
 
-Read-only means the agent cannot modify your dotfiles and credentials. It can still **read** them, and under open egress it can send them anywhere. Mount only what the agent needs, and only development or personal session credentials. Environment variables you forward with `auth.env` are equally readable.
+Read-only means the agent cannot modify your dotfiles and credentials. It can still **read** them, and under open egress it can send them anywhere. Mount only what the agent needs, and only development or personal session credentials. Environment variables you forward with `auth.env` are equally readable. Nothing is mounted until you configure it: both lists start empty, and `hort config` offers an agent's credential directory rather than assuming it ([a safer default for that question is planned](roadmap.md#a-credentials-question-that-defaults-to-no)).
 
 ### Abuse of an allowed host
 

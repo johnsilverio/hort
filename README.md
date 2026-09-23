@@ -46,7 +46,7 @@ That single change is what makes the rest possible:
 
 ## What makes it good to use
 
-**It runs your setup, not a generic one.** Your dotfiles are mounted read-only, so your shell, your editor, and your keybindings come with you. The box feels like your machine because it is running your machine's config.
+**It runs your setup, not a generic one.** The dotfiles you name are mounted read-only, so your shell, your editor, and your keybindings come with you. Nothing is carried in until you say so: the mount list starts empty. The box feels like your machine because it is running your machine's config.
 
 **It's light.** There's no background daemon the way Docker has one. The read-only base image is shared by every box, so running ten of them at once doesn't copy it ten times. Each box is held open by a single idle process and nothing more, so the overhead hort itself adds is small.
 

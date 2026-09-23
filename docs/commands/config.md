@@ -34,7 +34,7 @@ warning: no rootfs directory was given, so 'rootfs' is written commented out: ho
 
 1. **rootfs.** If you answer yes, it asks `path to the prepared rootfs directory` and checks it at once. A directory that could not build a sandbox is still written, with a warning carrying the same message `hort up` would print.
 2. **Dotfiles.** A multi-select of `~/.config/nvim`, `~/.config/fish`, `~/.tmux.conf` and `~/.gitconfig`, showing only those that exist. Move with the arrow keys, toggle each item with Space (select as many as you like), confirm with Enter. A hint on the prompt itself is [planned](../roadmap.md#friendlier-hort-config). (Prefer individual fish files over the whole directory; see [the fish tip](../recipes.md#fish-and-a-read-only-config-directory).)
-3. **Agents.** Offered only when their credentials exist on the host: Claude Code when `~/.claude` exists, written as `claude --dangerously-skip-permissions` with `~/.claude` read-only and its completion hook enabled.
+3. **Agents.** Offered only when their credentials exist on the host: Claude Code when `~/.claude` exists, written as `claude --dangerously-skip-permissions` with `~/.claude` read-only and its completion hook enabled. Answering with Enter alone accepts; a default answer of no, and a question that says what the mount exposes, are [planned](../roadmap.md#a-credentials-question-that-defaults-to-no).
 4. **Notifications.** Whether to raise a desktop notification when an agent finishes.
 
 ## What it writes
