@@ -4768,13 +4768,17 @@ fn cli_an_agent_commits_inside_a_clone_mode_sandbox_and_the_host_repository_is_u
     // reads exactly as it did before the sandbox existed.
     assert_eq!(git_output(&repo_path, &["log", "--format=%s", "main"]), "initial\n");
 
+    // That same commit now exists nowhere but in the box, and `down` will not
+    // destroy work like that unless it is told to. The commit is a fixture and
+    // the guarantee above is already measured, so this teardown gives it up on
+    // purpose.
     Command::cargo_bin("hort")
         .unwrap()
         .env("XDG_STATE_HOME", sandbox.state_home())
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
         .current_dir(&repo_path)
-        .args(["down", sandbox.name().as_str()])
+        .args(["down", "--force", sandbox.name().as_str()])
         .assert()
         .success();
 }
