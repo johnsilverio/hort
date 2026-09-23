@@ -699,6 +699,7 @@ pub struct FakeWorktreeProvider {
     dirty_worktrees: Vec<SandboxName>,
     failing_dirty_probes: Vec<SandboxName>,
     unreturned_work: Vec<SandboxName>,
+    work_returned_only_to: Vec<(SandboxName, PathBuf)>,
     failing_unreturned_probes: Vec<SandboxName>,
     prune_stale_calls: RefCell<usize>,
     trace: Option<TeardownTrace>,
@@ -718,6 +719,7 @@ impl FakeWorktreeProvider {
             dirty_worktrees: Vec::new(),
             failing_dirty_probes: Vec::new(),
             unreturned_work: Vec::new(),
+            work_returned_only_to: Vec::new(),
             failing_unreturned_probes: Vec::new(),
             prune_stale_calls: RefCell::new(0),
             trace: None,
@@ -804,6 +806,15 @@ impl FakeWorktreeProvider {
     /// repository does not have: `holds_unreturned_work` answers `Ok(true)`.
     pub fn with_unreturned_work(mut self, name: &SandboxName) -> Self {
         self.unreturned_work.push(name.clone());
+        self
+    }
+
+    /// Script the tip of this sandbox's `/workdir` as present in the repository
+    /// at `project` and in no other, which is how a real clone reads: asked of
+    /// its own project it holds nothing, asked of any other repository it holds
+    /// work that repository lacks.
+    pub fn with_work_returned_only_to(mut self, name: &SandboxName, project: &Path) -> Self {
+        self.work_returned_only_to.push((name.clone(), project.to_path_buf()));
         self
     }
 
@@ -918,13 +929,16 @@ impl WorktreeProvider for FakeWorktreeProvider {
         Ok(self.dirty_worktrees.contains(name))
     }
 
-    fn holds_unreturned_work(&self, name: &SandboxName) -> Result<bool, HortError> {
+    fn holds_unreturned_work(&self, name: &SandboxName, project: &Path) -> Result<bool, HortError> {
         if self.failing_unreturned_probes.contains(name) {
             // An unasserted stand-in error: no consumer asserts the variant,
             // only that it is an `Err`.
             return Err(HortError::InvalidConfig {
                 detail: "fake worktree: unreturned-work probe scripted to fail".to_string(),
             });
+        }
+        if let Some((_, home)) = self.work_returned_only_to.iter().find(|(held, _)| held == name) {
+            return Ok(home != project);
         }
         Ok(self.unreturned_work.contains(name))
     }

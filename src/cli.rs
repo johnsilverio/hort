@@ -35,7 +35,7 @@ use crate::commands::attach::AttachCommand;
 use crate::commands::config::ConfigCommand;
 use crate::commands::doctor::{ConfigurationReport, DoctorCommand, DoctorReport};
 use crate::commands::down::DownCommand;
-use crate::commands::ls::{LsCommand, LsEntry};
+use crate::commands::ls::{LsCommand, LsEntry, WorkdirGit};
 use crate::commands::prune::{PruneCommand, PruneReport};
 use crate::commands::up::UpCommand;
 use crate::domain::config::{GitMode, ResolvedConfig};
@@ -764,16 +764,34 @@ pub fn session_exit_code(wait_status: i32) -> u8 {
 }
 
 fn render_line(entry: &LsEntry) -> String {
-    format!(
-        "{}  {}  {}  {}  {}  {}  {}",
-        entry.name.as_str(),
-        state_label(entry.state),
+    let mut columns = vec![
+        entry.name.as_str().to_string(),
+        state_label(entry.state).to_string(),
         render_sessions(entry.sessions),
         render_duration(entry.age),
         render_idle(entry.idle.as_ref()),
-        render_branch(entry.branch.as_ref()),
-        render_dirty(entry.dirty),
-    )
+    ];
+    columns.extend(entry.git.map(render_git));
+    columns.push(render_branch(entry.branch.as_ref()));
+    columns.push(render_dirty(entry.dirty));
+    columns.join("  ")
+}
+
+/// How the box was built and, for a clone, whether it holds commits its own
+/// project lacks, in the words `prune` skips such a box with, since it is the
+/// same question. A clone hort could not read says so rather than printing like
+/// one holding nothing, which is the row somebody collects. A row with no mode
+/// to report (no record, no git, or a `/workdir` gone) has no such column at
+/// all, which keeps branch and dirty the last two columns of every row.
+fn render_git(git: WorkdirGit) -> String {
+    match git {
+        WorkdirGit::Worktree => "worktree".to_string(),
+        WorkdirGit::Clone { unreturned: Some(false) } => "clone".to_string(),
+        WorkdirGit::Clone { unreturned: Some(true) } => {
+            format!("clone, {}", skip_reason_label(&SkipReason::UnreturnedWork))
+        }
+        WorkdirGit::Clone { unreturned: None } => "clone, work unknown".to_string(),
+    }
 }
 
 /// Each reason in the words that send the reader to the right place. A cache skip
@@ -868,6 +886,7 @@ mod tests {
     use std::fs;
     use std::time::Duration;
 
+    use crate::commands::ls::WorkdirGit;
     use crate::domain::idle::IdleState;
     use crate::domain::model::{BranchName, Capabilities, CgroupCaps, SandboxName, Warning};
     use crate::domain::prune::{PruneSkip, SkipReason};
@@ -883,6 +902,7 @@ mod tests {
             idle: Some(IdleState::Idle(Duration::from_secs(300))),
             branch: Some(BranchName::new("demo").unwrap()),
             dirty: Some(false),
+            git: Some(WorkdirGit::Worktree),
         };
 
         let rendered = render_ls(&[entry]);
@@ -905,6 +925,7 @@ mod tests {
             idle: None,
             branch: None,
             dirty: None,
+            git: None,
         };
 
         let rendered = render_ls(&[entry]);
@@ -923,6 +944,7 @@ mod tests {
             idle: Some(IdleState::Active),
             branch: Some(BranchName::new("demo").unwrap()),
             dirty: Some(false),
+            git: Some(WorkdirGit::Worktree),
         };
         let lost = LsEntry {
             name: SandboxName::new("ghost").unwrap(),
@@ -932,6 +954,7 @@ mod tests {
             idle: None,
             branch: None,
             dirty: None,
+            git: None,
         };
 
         let rendered = render_ls(&[live, lost]);
@@ -956,6 +979,7 @@ mod tests {
             idle: Some(IdleState::Idle(Duration::from_secs(300))),
             branch: Some(BranchName::new("demo").unwrap()),
             dirty: Some(false),
+            git: Some(WorkdirGit::Worktree),
         };
 
         let rendered = render_ls(&[entry]);
@@ -996,6 +1020,7 @@ mod tests {
             idle: Some(IdleState::Active),
             branch: Some(BranchName::new("demo").unwrap()),
             dirty: Some(false),
+            git: Some(WorkdirGit::Worktree),
         };
 
         let rendered = render_ls(&[entry]);
@@ -1319,11 +1344,72 @@ mod tests {
             idle: Some(IdleState::Idle(Duration::from_secs(300))),
             branch: Some(BranchName::new("demo").unwrap()),
             dirty: Some(true),
+            git: Some(WorkdirGit::Worktree),
         };
 
         let rendered = render_ls(&[entry]);
 
         assert!(rendered.contains("dirty"));
+    }
+
+    fn clone_entry(unreturned: Option<bool>) -> LsEntry {
+        LsEntry {
+            name: SandboxName::new("demo").unwrap(),
+            state: SandboxState::Orphaned,
+            sessions: Some(0),
+            age: Some(Duration::from_secs(3600)),
+            idle: Some(IdleState::Idle(Duration::from_secs(300))),
+            branch: Some(BranchName::new("demo").unwrap()),
+            dirty: None,
+            git: Some(WorkdirGit::Clone { unreturned }),
+        }
+    }
+
+    #[test]
+    fn render_ls_names_a_clone_by_its_mode() {
+        let rendered = render_ls(&[clone_entry(Some(false))]);
+
+        assert!(rendered.contains("clone"));
+    }
+
+    #[test]
+    fn render_ls_names_a_worktree_by_its_mode() {
+        let entry = LsEntry {
+            name: SandboxName::new("demo").unwrap(),
+            state: SandboxState::Live,
+            sessions: Some(0),
+            age: Some(Duration::from_secs(3600)),
+            idle: Some(IdleState::Idle(Duration::from_secs(300))),
+            branch: Some(BranchName::new("demo").unwrap()),
+            dirty: Some(false),
+            git: Some(WorkdirGit::Worktree),
+        };
+
+        let rendered = render_ls(&[entry]);
+
+        assert!(rendered.contains("worktree"));
+    }
+
+    #[test]
+    fn render_ls_says_a_clone_holds_work_only_in_the_box() {
+        let holding = render_ls(&[clone_entry(Some(true))]);
+        let returned = render_ls(&[clone_entry(Some(false))]);
+
+        // The same words `prune` skips such a box with, because it is the same
+        // question: a reader who sees them in both places knows it is one fact.
+        assert!(holding.contains("work only in the box"));
+        assert!(!returned.contains("work only in the box"));
+    }
+
+    #[test]
+    fn render_ls_tells_an_unread_clone_from_one_holding_nothing() {
+        let unread = render_ls(&[clone_entry(None)]);
+        let returned = render_ls(&[clone_entry(Some(false))]);
+
+        // After a reboot this row is how somebody decides whether a box is safe
+        // to collect, and an unread clone printed like an empty one is a yes
+        // nobody checked.
+        assert_ne!(unread, returned);
     }
 
     #[test]

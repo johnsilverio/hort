@@ -1,5 +1,6 @@
 //! `ls`: list every sandbox with its reconciled state and the figures a caller
-//! needs to judge a forgotten box: session count, age, idle, and branch.
+//! needs to judge a forgotten box: session count, age, idle, branch, dirty
+//! state, and how its git was built.
 //!
 //! It cross-checks the on-disk records against the live anchors and the
 //! worktrees still on disk, joins each verdict back to its record, and derives
@@ -11,13 +12,15 @@
 //! each record's own worktree path on disk, so a sandbox of another project
 //! reports its dirty state like any other; the forgotten box holding
 //! uncommitted work is the one this listing exists to surface, and it is rarely
-//! the box of the project you are standing in. A record with a corrupt
-//! timestamp degrades only its own row to an unknown age and idle, and the
-//! listing never mutates anything.
+//! the box of the project you are standing in. The git mode is read the same
+//! way, and a clone's commits are looked for in the project its record names,
+//! for the same reason. A record with a corrupt timestamp degrades only its own
+//! row to an unknown age and idle, and the listing never mutates anything.
 
 use std::time::{Duration, SystemTime};
 
 use crate::commands::{last_announced_completion, present_worktrees};
+use crate::domain::config::GitMode;
 use crate::domain::error::HortError;
 use crate::domain::idle::{IdleState, age, idle, parse_timestamp};
 use crate::domain::model::{BranchName, SandboxName, SandboxRecord};
@@ -47,6 +50,21 @@ pub struct LsEntry {
     pub idle: Option<IdleState>,
     pub branch: Option<BranchName>,
     pub dirty: Option<bool>,
+    pub git: Option<WorkdirGit>,
+}
+
+/// How a sandbox's `/workdir` carries its git, as `ls` reports it. `None` on the
+/// entry means there is nothing to say: no record, a no-git record, or a
+/// `/workdir` no longer on disk.
+///
+/// Only a clone is asked about its commits, because a worktree commits into the
+/// project repository's own object store and cannot hold one the project lacks.
+/// For a clone `unreturned` is `None` when hort could not tell, which a reader
+/// must be able to see: a box read as holding nothing is one somebody collects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkdirGit {
+    Worktree,
+    Clone { unreturned: Option<bool> },
 }
 
 /// Coordinates `ls` over the read ports it depends on. It carries no
@@ -89,9 +107,10 @@ impl LsCommand<'_> {
                 let sessions = self.observe_sessions(&name, state);
                 let record = records.iter().find(|record| record.name() == &name);
                 let dirty = record.and_then(|record| self.observe_dirty(record));
+                let git = record.and_then(|record| self.observe_git(record));
                 let last_event =
                     record.and_then(|record| last_announced_completion(self.notify, record));
-                build_entry(name, state, sessions, record, dirty, last_event, now)
+                build_entry(name, state, sessions, record, Observed { dirty, git, last_event }, now)
             })
             .collect();
 
@@ -128,6 +147,34 @@ impl LsCommand<'_> {
         }
         self.worktrees.is_dirty(record.name()).ok()
     }
+
+    /// How a git record's `/workdir` was built, read from the disk at the
+    /// record's own path, and for a clone whether it holds commits its own
+    /// project lacks. The mode is asked only of a git record, because a no-git
+    /// box mounts the user's folder and a `git init` there later would read as a
+    /// clone hort never made. The commits are asked of the project the record
+    /// names: this listing is global, and the repository it runs from would flag
+    /// every other project's box. A record naming no project and a read that
+    /// failed both leave the answer unknown, never "nothing held".
+    fn observe_git(&self, record: &SandboxRecord) -> Option<WorkdirGit> {
+        record.branch()?;
+        match self.worktrees.git_mode_at(record.worktree_path())? {
+            GitMode::Worktree => Some(WorkdirGit::Worktree),
+            GitMode::Clone => {
+                let unreturned = record.project_path().and_then(|project| {
+                    self.worktrees.holds_unreturned_work(record.name(), project).ok()
+                });
+                Some(WorkdirGit::Clone { unreturned })
+            }
+        }
+    }
+}
+
+/// What `ls` read about a record beyond its reconciled state and sessions.
+struct Observed {
+    dirty: Option<bool>,
+    git: Option<WorkdirGit>,
+    last_event: Option<SystemTime>,
 }
 
 fn build_entry(
@@ -135,18 +182,18 @@ fn build_entry(
     state: SandboxState,
     sessions: Option<usize>,
     record: Option<&SandboxRecord>,
-    dirty: Option<bool>,
-    last_event: Option<SystemTime>,
+    observed: Observed,
     now: SystemTime,
 ) -> LsEntry {
+    let Observed { dirty, git, last_event } = observed;
     let Some(record) = record else {
-        return LsEntry { name, state, sessions, age: None, idle: None, branch: None, dirty };
+        return LsEntry { name, state, sessions, age: None, idle: None, branch: None, dirty, git };
     };
 
     let branch = record.branch().cloned();
     let parsed = (parse_timestamp(record.created_at()), parse_timestamp(record.last_attach_at()));
     let (Ok(created), Ok(attach)) = parsed else {
-        return LsEntry { name, state, sessions, age: None, idle: None, branch, dirty };
+        return LsEntry { name, state, sessions, age: None, idle: None, branch, dirty, git };
     };
 
     LsEntry {
@@ -157,6 +204,7 @@ fn build_entry(
         idle: sessions.map(|count| idle(count, created, attach, last_event, now)),
         branch,
         dirty,
+        git,
     }
 }
 
@@ -164,7 +212,7 @@ fn build_entry(
 mod tests {
     use super::*;
 
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::SystemTime;
 
     use crate::domain::model::{AnchorPid, LivenessToken, MountNsInode, SandboxRecord};
@@ -172,6 +220,20 @@ mod tests {
         FakeNotifyProvider, FakeRegistry, FakeSessionProbe, FakeWorktreeProvider,
         InMemoryMetadataStore, ScriptedClock, sample_record,
     };
+
+    /// A record written before hort remembered which project a sandbox was built
+    /// from, the one kind of record that cannot name it.
+    const RECORD_WITHOUT_PROJECT: &str = r#"{
+        "schemaVersion": 1,
+        "name": "demo",
+        "branch": "demo",
+        "worktreePath": "/state/sandboxes/demo/worktree-demo",
+        "overlayPath": "/state/sandboxes/demo/overlay",
+        "createdAt": "2026-06-11T12:00:00Z",
+        "lastAttachAt": "2026-06-11T12:00:00Z",
+        "notifyChannel": null,
+        "token": null
+    }"#;
 
     fn canned_token() -> LivenessToken {
         LivenessToken { pid: AnchorPid(1234), mnt_ns: MountNsInode(5678) }
@@ -704,5 +766,153 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].dirty, None);
+    }
+
+    #[test]
+    fn ls_reports_a_sandbox_built_as_a_clone_in_clone_mode() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo").with_token(canned_token())).unwrap();
+        let registry = FakeRegistry::new(vec![(name.clone(), canned_token())]);
+        let worktrees = FakeWorktreeProvider::new().with_clone_workdir(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
+
+        let entries = command.run().unwrap();
+
+        assert_eq!(entries[0].git, Some(WorkdirGit::Clone { unreturned: Some(false) }));
+    }
+
+    #[test]
+    fn ls_reports_a_sandbox_built_as_a_worktree_in_worktree_mode() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo").with_token(canned_token())).unwrap();
+        let registry = FakeRegistry::new(vec![(name.clone(), canned_token())]);
+        let worktrees = FakeWorktreeProvider::new().with_listed_worktree(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
+
+        let entries = command.run().unwrap();
+
+        assert_eq!(entries[0].git, Some(WorkdirGit::Worktree));
+    }
+
+    #[test]
+    fn ls_reports_an_orphaned_clone_holding_commits_its_project_lacks() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo")).unwrap();
+        // No live anchor: the box after a reboot, which is when somebody reads
+        // this listing to decide what is safe to collect.
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees =
+            FakeWorktreeProvider::new().with_clone_workdir(&name).with_unreturned_work(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
+
+        let entries = command.run().unwrap();
+
+        assert_eq!(entries[0].state, SandboxState::Orphaned);
+        assert_eq!(entries[0].git, Some(WorkdirGit::Clone { unreturned: Some(true) }));
+    }
+
+    #[test]
+    fn ls_asks_a_clone_about_its_commits_of_the_project_its_record_names() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo")).unwrap();
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new()
+            .with_clone_workdir(&name)
+            .with_work_returned_only_to(&name, Path::new("/home/tester/projects/demo"));
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
+
+        let entries = command.run().unwrap();
+
+        // `ls` is global. Asked of any repository but the one the box came from,
+        // this clone reads as holding work, and every box of every other project
+        // would be flagged from wherever the listing happened to run.
+        assert_eq!(entries[0].git, Some(WorkdirGit::Clone { unreturned: Some(false) }));
+    }
+
+    #[test]
+    fn ls_reports_unreturned_work_as_unknown_when_the_read_fails() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo")).unwrap();
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new()
+            .with_clone_workdir(&name)
+            .with_failing_unreturned_work_probe(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
+
+        let entries = command.run().unwrap();
+
+        // Printed as "nothing held", an unread clone is one somebody collects.
+        assert_eq!(entries[0].git, Some(WorkdirGit::Clone { unreturned: None }));
+    }
+
+    #[test]
+    fn ls_reports_unreturned_work_as_unknown_for_a_record_that_names_no_project() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&serde_json::from_str::<SandboxRecord>(RECORD_WITHOUT_PROJECT).unwrap()).unwrap();
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new().with_clone_workdir(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
+
+        let entries = command.run().unwrap();
+
+        // With no project to ask, there is no repository whose answer means
+        // anything, and the one the listing runs from is somebody else's.
+        assert_eq!(entries[0].git, Some(WorkdirGit::Clone { unreturned: None }));
+    }
+
+    #[test]
+    fn ls_reports_no_git_mode_for_a_no_git_record_whose_folder_became_a_repository() {
+        let name = SandboxName::new("demo").unwrap();
+        let record = SandboxRecord::new(
+            name.clone(),
+            None,
+            PathBuf::from("/state/sandboxes/demo/worktree-demo"),
+            PathBuf::from("/state/sandboxes/demo/overlay"),
+            "2026-06-11T12:00:00Z".to_string(),
+            "2026-06-11T12:00:00Z".to_string(),
+            None,
+            PathBuf::from("/home/tester/projects/demo"),
+        )
+        .with_token(canned_token());
+        let store = InMemoryMetadataStore::new();
+        store.put(&record).unwrap();
+        let registry = FakeRegistry::new(vec![(name.clone(), canned_token())]);
+        let worktrees = FakeWorktreeProvider::new().with_clone_workdir(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
+
+        let entries = command.run().unwrap();
+
+        // Without git the box mounts the user's own folder, and a `git init` run
+        // there later gives it a `.git` directory that reads exactly like a
+        // clone's. The mode is what hort built, so a box it built with no git
+        // has none to report.
+        assert_eq!(entries[0].git, None);
     }
 }

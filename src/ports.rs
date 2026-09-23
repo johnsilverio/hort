@@ -177,8 +177,8 @@ pub trait WorktreeProvider {
     /// Whether this sandbox's worktree has uncommitted changes; untracked files
     /// count. The first behavioral consumer is `prune`.
     fn is_dirty(&self, name: &SandboxName) -> Result<bool, HortError>;
-    /// Whether this sandbox's `/workdir` holds committed work the host
-    /// repository does not have.
+    /// Whether this sandbox's `/workdir` holds committed work the repository at
+    /// `project` does not have.
     ///
     /// It is the question a repository of the sandbox's own makes destructive.
     /// A worktree commits into the project repository's own object store, so a
@@ -186,9 +186,16 @@ pub trait WorktreeProvider {
     /// itself, and collecting the box collects them too. Both reads are cheap
     /// and host-side: reading a ref touches no object, so the clone's tip is
     /// readable even though the objects it borrows are mounted only inside the
-    /// box, and the host repository is then asked whether it already has that
-    /// commit.
-    fn holds_unreturned_work(&self, name: &SandboxName) -> Result<bool, HortError>;
+    /// box, and the project repository is then asked whether it already has
+    /// that commit.
+    ///
+    /// The project is a parameter because the answer depends on which
+    /// repository is asked: the commands that ask are global, so the repository
+    /// they happen to run from is some other project's as often as not, and a
+    /// clone asked of a repository it never came from reads as holding work. A
+    /// project that is not a git repository cannot answer, which is an error
+    /// rather than a verdict either way.
+    fn holds_unreturned_work(&self, name: &SandboxName, project: &Path) -> Result<bool, HortError>;
     /// Clear every stale `.git/worktrees` registration whose directory vanished.
     /// `prune` runs it once per non-refused, non-declined run; the per-name
     /// `remove` already clears only its own stale entry.

@@ -322,17 +322,25 @@ impl WorktreeProvider for GitWorktreeProvider {
         Ok(!porcelain.trim().is_empty())
     }
 
-    fn holds_unreturned_work(&self, name: &SandboxName) -> Result<bool, HortError> {
+    fn holds_unreturned_work(&self, name: &SandboxName, project: &Path) -> Result<bool, HortError> {
         // Two host-side reads, neither of which enters the box. Resolving the
         // tip touches no object, so it answers even inside a clone whose
         // borrowed objects are mounted only in the sandbox. A worktree's tip is
         // always a commit the project repository has, since that is the object
         // store it committed into, so this reads false there without a mode of
-        // its own.
+        // its own. `cat-file -e` exits 0 for a commit the project has and 1 for
+        // one it lacks; anything else, such as 128 in a folder that is no
+        // repository, is a question the project could not answer.
         let workdir = self.worktree_path(name);
         let tip = run(&workdir, "rev-parse", &["rev-parse", "HEAD"])?;
-        let host = capture(&self.repo_dir, "cat-file", &["cat-file", "-e", tip.trim()])?;
-        Ok(!host.status.success())
+        let lookup = capture(project, "cat-file", &["cat-file", "-e", tip.trim()])?;
+        match lookup.status.code() {
+            Some(0) => Ok(false),
+            Some(1) => Ok(true),
+            _ => Err(HortError::GitCommandFailed {
+                detail: format!("cat-file: {}", String::from_utf8_lossy(&lookup.stderr).trim()),
+            }),
+        }
     }
 
     fn prune_stale(&self) -> Result<(), HortError> {
@@ -1217,7 +1225,7 @@ mod tests {
         let workdir = provider.create(&name, &branch, GitMode::Clone).unwrap();
         commit_in_clone(&workdir.path, &repo.join(".git").join("objects"), "work.txt");
 
-        assert!(provider.holds_unreturned_work(&name).unwrap());
+        assert!(provider.holds_unreturned_work(&name, &repo).unwrap());
     }
 
     #[test]
@@ -1234,7 +1242,47 @@ mod tests {
         // host's own. The pair matters more than either half: without this one a
         // probe that always says yes passes, and a guard that always asks turns
         // every `down` of a clone into a prompt the user learns to answer blind.
-        assert!(!provider.holds_unreturned_work(&name).unwrap());
+        assert!(!provider.holds_unreturned_work(&name, &repo).unwrap());
+    }
+
+    #[test]
+    fn clone_mode_asks_the_project_it_names_rather_than_the_repository_it_runs_from() {
+        let (_project, project) = temp_dir();
+        let (_elsewhere, elsewhere) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&project);
+        git(&elsewhere, &["init", "-b", "main"]);
+        let name = SandboxName::new("demo").unwrap();
+        let branch = BranchName::new("demo").unwrap();
+        GitWorktreeProvider::new(project.clone(), state_root.clone())
+            .create(&name, &branch, GitMode::Clone)
+            .unwrap();
+        let run_from_elsewhere = GitWorktreeProvider::new(elsewhere, state_root);
+
+        // `ls`, `down` and `prune` are global, so the repository a provider is
+        // rooted at is whichever one the user is standing in. This clone holds
+        // nothing its own project lacks, and asked of any other repository it
+        // would read as holding work: every box of another project would be
+        // flagged, and every `down` of one would ask about commits that exist.
+        assert!(!run_from_elsewhere.holds_unreturned_work(&name, &project).unwrap());
+    }
+
+    #[test]
+    fn clone_mode_cannot_answer_for_a_project_that_is_not_a_git_repository() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        let (_plain, plain) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo, state_root);
+        let name = SandboxName::new("demo").unwrap();
+        let branch = BranchName::new("demo").unwrap();
+        provider.create(&name, &branch, GitMode::Clone).unwrap();
+
+        // A project folder that was deleted, or stopped being a repository,
+        // says nothing about where the clone's commits are. Read as "holding
+        // work" it prints a claim nobody checked; read as "nothing held" it lets
+        // a teardown take commits it never looked for.
+        assert!(provider.holds_unreturned_work(&name, &plain).is_err());
     }
 
     #[test]

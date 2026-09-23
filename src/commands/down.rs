@@ -109,10 +109,13 @@ impl DownCommand<'_> {
     /// `/workdir` built as a clone can hold one: a worktree commits into the
     /// project repository's own object store, so its commits outlive the box,
     /// and the mode is read from the disk at the record's own path because the
-    /// record does not carry it.
+    /// record does not carry it. The commits are looked for in the project the
+    /// record names, never in the repository `down` happens to run from, which
+    /// is some other project's as often as not.
     ///
-    /// A read that failed asks anyway, which is the opposite of how the session
-    /// gate above degrades. The costs are opposite too: read the other way round
+    /// A read that failed asks anyway, and so does a record that names no
+    /// project, since that is a read that could not be made. Both are the
+    /// opposite of how the session gate above degrades. The costs are opposite too: read the other way round
     /// this one destroys the commits it could not see, while a session list is
     /// unreadable for every box on the machine after a reboot, and protecting
     /// there would lock the user out of their own cleanup.
@@ -120,7 +123,10 @@ impl DownCommand<'_> {
         if !matches!(self.worktrees.git_mode_at(record.worktree_path()), Some(GitMode::Clone)) {
             return false;
         }
-        self.worktrees.holds_unreturned_work(record.name()).unwrap_or(true)
+        let Some(project) = record.project_path() else {
+            return true;
+        };
+        self.worktrees.holds_unreturned_work(record.name(), project).unwrap_or(true)
     }
 
     /// Whether the kernel is running an anchor under this name. It is the second
@@ -136,7 +142,7 @@ mod tests {
     use super::*;
 
     use std::cell::RefCell;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::rc::Rc;
 
     use crate::domain::model::{AnchorPid, LivenessToken, MountNsInode, SandboxRecord};
@@ -144,6 +150,20 @@ mod tests {
         FakeConfirmer, FakeNetwork, FakeNotifyProvider, FakeRegistry, FakeRuntime,
         FakeSessionProbe, FakeWorktreeProvider, InMemoryMetadataStore, sample_record,
     };
+
+    /// A record written before hort remembered which project a sandbox was built
+    /// from, the one kind of record that cannot name it.
+    const RECORD_WITHOUT_PROJECT: &str = r#"{
+        "schemaVersion": 1,
+        "name": "demo",
+        "branch": "demo",
+        "worktreePath": "/state/sandboxes/demo/worktree-demo",
+        "overlayPath": "/state/sandboxes/demo/overlay",
+        "createdAt": "2026-06-11T12:00:00Z",
+        "lastAttachAt": "2026-06-11T12:00:00Z",
+        "notifyChannel": null,
+        "token": null
+    }"#;
 
     fn canned_token() -> LivenessToken {
         LivenessToken { pid: AnchorPid(1234), mnt_ns: MountNsInode(5678) }
@@ -670,5 +690,57 @@ mod tests {
 
         assert!(confirmer.prompts().is_empty());
         assert_eq!(store.get(&name).unwrap(), None);
+    }
+
+    #[test]
+    fn down_does_not_ask_when_the_sandboxes_own_project_has_the_clones_work() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo")).unwrap();
+        let sessions = FakeSessionProbe::new(vec![]);
+        let confirmer = FakeConfirmer::no();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let worktrees = FakeWorktreeProvider::new()
+            .with_clone_workdir(&name)
+            .with_work_returned_only_to(&name, Path::new("/home/tester/projects/demo"));
+        let notify = FakeNotifyProvider::new();
+        let registry = nothing_live();
+        let command = down_command(
+            &store, &registry, &sessions, &confirmer, &runtime, &network, &worktrees, &notify,
+        );
+
+        command.run(name.clone(), false, true).unwrap();
+
+        // `down` runs from wherever the user is standing. Asked of any
+        // repository but the one this box came from, a clone whose work is safe
+        // reads as holding commits, and the prompt fires on every box of every
+        // other project until the user learns to answer it without reading.
+        assert!(confirmer.prompts().is_empty());
+        assert_eq!(store.get(&name).unwrap(), None);
+    }
+
+    #[test]
+    fn down_asks_before_tearing_down_a_clone_whose_record_names_no_project() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&serde_json::from_str::<SandboxRecord>(RECORD_WITHOUT_PROJECT).unwrap()).unwrap();
+        let sessions = FakeSessionProbe::new(vec![]);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let worktrees = FakeWorktreeProvider::new().with_clone_workdir(&name);
+        let notify = FakeNotifyProvider::new();
+        let registry = nothing_live();
+        let command = down_command(
+            &store, &registry, &sessions, &confirmer, &runtime, &network, &worktrees, &notify,
+        );
+
+        command.run(name, false, true).unwrap();
+
+        // A record that cannot name its project leaves no repository whose
+        // answer means anything, which is a read that could not be made, and
+        // that asks for the same reason a read that failed does.
+        assert_eq!(confirmer.prompts().len(), 1);
     }
 }
