@@ -39,9 +39,9 @@ hort prune --idle 36h -f # no question, and dirty worktrees too
 
 Without `-f`, a candidate is removed only when hort can **prove** nothing is at risk:
 
-- a sandbox whose worktree has uncommitted changes is skipped as `dirty`;
+- a sandbox whose worktree has uncommitted changes is skipped as `dirty`. That is checked in the repository of the project the sandbox was built from, never the one you run `prune` in;
 - a [clone-mode](../git-modes.md) sandbox holding commits the repository of its own project does not have is skipped as `work only in the box`: its own word, because the work is committed and looking for uncommitted changes would find nothing. That repository is the one the sandbox was built from, never the one you run `prune` in;
-- a sandbox whose worktree state cannot be read is skipped as `unknown`;
+- a sandbox whose worktree state cannot be read is skipped as `unknown`, and so is a broken record whose worktree is still on disk, because the record that named its project is the part that broke;
 - a cache whose project directory still exists is skipped as `project on disk`;
 - a cache whose project hort cannot check is skipped as `project unreadable`.
 

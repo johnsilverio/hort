@@ -26,7 +26,7 @@ Always in this order, because deleting a directory that a running process still 
 
 1. Stops the notification watcher and the host-side network helpers (pasta, the egress proxy, database forwarders).
 2. Removes the container, which ends every session and the anchor and releases the worktree mount.
-3. In a git project, **removes the worktree directory, including uncommitted changes**, and its registration in your repository. In [clone mode](../git-modes.md) that directory is the sandbox's clone, so every commit made inside it that was not pushed or fetched out goes with it, which is why `down` asks first (see [Unreturned work](#unreturned-work)). That step also deletes the sandbox's pinned ref `refs/hort/<name>/base` from your repository; the pins of your other clone-mode sandboxes are left alone.
+3. In a git project, **removes the worktree directory, including uncommitted changes**, and its registration in your repository. In [clone mode](../git-modes.md) that directory is the sandbox's clone, so every commit made inside it that was not pushed or fetched out goes with it, which is why `down` asks first (see [Unreturned work](#unreturned-work)). That step also deletes the sandbox's pinned ref `refs/hort/<name>/base` from the repository of the project the sandbox was built from, whatever directory you run `down` in; the pins of your other clone-mode sandboxes are left alone.
 4. Removes hort's record of the sandbox.
 
 It **keeps** the branch and its commits (deleting it from `down` is [planned](../roadmap.md#deleting-the-sandboxs-branch-on-down-and-prune)), your repository, and the project's dependency caches. In a project without git it never touches your folder: only the container and the record go.
