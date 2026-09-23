@@ -10,9 +10,9 @@ Today an open sandbox reaches every service listening on your host's `127.0.0.1`
 
 Today you build a rootfs, export it into a directory and fix the mode of its `/workdir` by hand ([Preparing a rootfs](rootfs.md#building-one-from-a-dockerfile)), and a forgotten final `chmod` makes `hort up` refuse the directory after all that work. Planned: `hort rootfs import` takes the tarball `podman export` or `docker export` writes, unpacks it into a directory of its own, sets the mode `/workdir` needs, checks it against [what a rootfs must provide](rootfs.md#what-a-rootfs-must-provide) and records the path in your configuration.
 
-## A credentials question that defaults to no
+## A credentials question that says what it exposes
 
-Today the agent question in `hort config` offers to mount an agent's credential directory read-only, and answering it with nothing but Enter accepts ([the dialogue](commands/config.md#the-dialogue)). Read-only keeps the agent from changing those credentials; it does not keep it from reading them and, under open egress, sending them on ([what you mount into the box](security.md#what-you-mount-into-the-box)). Planned: the question's default answer is no, and it says what mounting the directory exposes before you answer it.
+Today the agent question in `hort config` offers to mount an agent's credential directory read-only and names nothing but the directory ([the dialogue](commands/config.md#the-dialogue)). It has no default answer, so nothing is mounted until you press `y`. Read-only keeps the agent from changing those credentials; it does not keep it from reading them and, under open egress, sending them on ([what you mount into the box](security.md#what-you-mount-into-the-box)). Planned: the question says what mounting the directory exposes before you answer it.
 
 ## Saying what posture a sandbox starts in
 

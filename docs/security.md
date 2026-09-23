@@ -57,7 +57,7 @@ By default a sandbox has open network access, because agents need to reach their
 
 ### What you mount into the box
 
-Read-only means the agent cannot modify your dotfiles and credentials. It can still **read** them, and under open egress it can send them anywhere. Mount only what the agent needs, and only development or personal session credentials. Environment variables you forward with `auth.env` are equally readable. Nothing is mounted until you configure it: both lists start empty, and `hort config` offers an agent's credential directory rather than assuming it ([a safer default for that question is planned](roadmap.md#a-credentials-question-that-defaults-to-no)).
+Read-only means the agent cannot modify your dotfiles and credentials. It can still **read** them, and under open egress it can send them anywhere. Mount only what the agent needs, and only development or personal session credentials. Environment variables you forward with `auth.env` are equally readable. Nothing is mounted until you configure it: both lists start empty, and `hort config` offers an agent's credential directory rather than assuming it ([a question that says what the mount exposes is planned](roadmap.md#a-credentials-question-that-says-what-it-exposes)).
 
 ### Abuse of an allowed host
 
