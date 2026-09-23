@@ -89,12 +89,13 @@ impl DownCommand<'_> {
             }
         }
 
+        let project = record.as_ref().and_then(SandboxRecord::project_path);
         for step in plan {
             match step {
                 TeardownStep::StopWatcher => self.notify.teardown(&name)?,
                 TeardownStep::StopNetwork => self.network.teardown(&name)?,
                 TeardownStep::StopContainer => self.runtime.teardown(&name)?,
-                TeardownStep::RemoveWorktree => self.worktrees.remove(&name)?,
+                TeardownStep::RemoveWorktree => self.worktrees.remove(&name, project)?,
                 TeardownStep::RemoveMetadata => self.store.remove(&name)?,
             }
         }
@@ -742,5 +743,32 @@ mod tests {
         // answer means anything, which is a read that could not be made, and
         // that asks for the same reason a read that failed does.
         assert_eq!(confirmer.prompts().len(), 1);
+    }
+
+    #[test]
+    fn down_releases_a_clone_base_pin_in_the_project_its_record_names() {
+        let name = SandboxName::new("demo").unwrap();
+        let project = Path::new("/home/tester/projects/demo");
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo")).unwrap();
+        let registry = nothing_live();
+        let sessions = FakeSessionProbe::new(vec![]);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let worktrees = FakeWorktreeProvider::new()
+            .with_clone_workdir(&name)
+            .with_pinned_base_in(&name, project);
+        let notify = FakeNotifyProvider::new();
+        let command = down_command(
+            &store, &registry, &sessions, &confirmer, &runtime, &network, &worktrees, &notify,
+        );
+
+        command.run(name.clone(), true, false).unwrap();
+
+        // `down` runs from wherever the user stands. Released in that
+        // repository, the pin stays in the project, holding a commit for a
+        // sandbox no hort command will ever name again.
+        assert!(!worktrees.pinned_base_in(&name, project));
     }
 }

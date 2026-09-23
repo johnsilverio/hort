@@ -9,12 +9,11 @@
 //! working all afternoon is not reported as untouched since its shell was
 //! opened. Liveness comes from matching the record tokens against the registry
 //! entries, so there is no liveness probe here. The dirty column is asked at
-//! each record's own worktree path on disk, so a sandbox of another project
-//! reports its dirty state like any other; the forgotten box holding
+//! each record's own worktree path on disk, of the project that record names,
+//! so a sandbox of another project reports its dirty state like any other; the forgotten box holding
 //! uncommitted work is the one this listing exists to surface, and it is rarely
 //! the box of the project you are standing in. The git mode is read the same
-//! way, and a clone's commits are looked for in the project its record names,
-//! for the same reason. A record with a corrupt timestamp degrades only its own
+//! way, and a clone's commits are looked for in the same project. A record with a corrupt timestamp degrades only its own
 //! row to an unknown age and idle, and the listing never mutates anything.
 
 use std::time::{Duration, SystemTime};
@@ -137,15 +136,18 @@ impl LsCommand<'_> {
     }
 
     /// Whether a sandbox's worktree is dirty, observed only when there is a git
-    /// record whose worktree is still on disk at the path that record names. A
-    /// failed probe degrades to unknown, which `ls` reports honestly rather than
+    /// record whose worktree is still on disk at the path that record names. It
+    /// is asked of the project the record names, since this listing is global
+    /// and the repository it runs from keeps nothing for another project's
+    /// worktree; a record naming no project leaves it unknown. A failed probe degrades to unknown, which `ls` reports honestly rather than
     /// guessing; nothing here gates a deletion, so unknown costs a dash.
     fn observe_dirty(&self, record: &SandboxRecord) -> Option<bool> {
         record.branch()?;
+        let project = record.project_path()?;
         if !self.worktrees.exists(record.worktree_path()) {
             return None;
         }
-        self.worktrees.is_dirty(record.name()).ok()
+        self.worktrees.is_dirty(record.name(), project).ok()
     }
 
     /// How a git record's `/workdir` was built, read from the disk at the
@@ -701,6 +703,50 @@ mod tests {
         // being lost. Printing a dash for it from anywhere but its own directory
         // hides exactly the row that needed attention.
         assert_eq!(entries[0].dirty, Some(true));
+    }
+
+    #[test]
+    fn ls_asks_a_worktree_whether_it_is_dirty_of_the_project_its_record_names() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo")).unwrap();
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new()
+            .with_present_worktree(&name)
+            .with_dirty_worktree(&name)
+            .with_worktree_registered_only_in(&name, Path::new("/home/tester/projects/demo"));
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
+
+        let entries = command.run().unwrap();
+
+        // Only the project a worktree came from keeps the administrative
+        // directory its state is read through. Asked of the repository the
+        // listing runs from, every other project's box prints a dash, and the
+        // uncommitted work in it goes unnoticed.
+        assert_eq!(entries[0].dirty, Some(true));
+    }
+
+    #[test]
+    fn ls_reports_dirty_as_unknown_for_a_record_that_names_no_project() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&serde_json::from_str::<SandboxRecord>(RECORD_WITHOUT_PROJECT).unwrap()).unwrap();
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees =
+            FakeWorktreeProvider::new().with_present_worktree(&name).with_dirty_worktree(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(SystemTime::UNIX_EPOCH);
+        let notify = FakeNotifyProvider::new();
+        let command = ls_command(&store, &registry, &worktrees, &sessions, &clock, &notify);
+
+        let entries = command.run().unwrap();
+
+        // With no project to ask, the only repository left is the one the
+        // listing runs from, whose answer is about some other project.
+        assert_eq!(entries[0].dirty, None);
     }
 
     #[test]

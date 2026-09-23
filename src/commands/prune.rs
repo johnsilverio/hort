@@ -169,7 +169,9 @@ impl PruneCommand<'_> {
                     TeardownStep::StopWatcher => self.notify.teardown(name)?,
                     TeardownStep::StopNetwork => self.network.teardown(name)?,
                     TeardownStep::StopContainer => self.runtime.teardown(name)?,
-                    TeardownStep::RemoveWorktree => self.worktrees.remove(name)?,
+                    TeardownStep::RemoveWorktree => {
+                        self.worktrees.remove(name, record.project_path())?
+                    }
                     TeardownStep::RemoveMetadata => self.store.remove(name)?,
                 }
             }
@@ -180,7 +182,7 @@ impl PruneCommand<'_> {
             let sandbox_name = SandboxName::new(name)?;
             self.network.teardown(&sandbox_name)?;
             self.runtime.teardown(&sandbox_name)?;
-            self.worktrees.remove(&sandbox_name)?;
+            self.worktrees.remove(&sandbox_name, None)?;
             self.store.remove(&sandbox_name)?;
             removed.push(name.clone());
         }
@@ -260,8 +262,11 @@ impl PruneCommand<'_> {
     /// and a worktree already gone from disk has nothing left to lose, which is
     /// what keeps that debris prunable. Presence is read from the disk at the
     /// record's own path, so a sandbox is judged by what is there rather than by
-    /// whether the current repository happens to list it. A probe git cannot
-    /// answer leaves the state unknown, and unknown protects.
+    /// whether the current repository happens to list it. The state is asked
+    /// of the project the record names, because `prune` is global and the
+    /// repository it runs from is somebody else's as often as not; a record
+    /// naming no project, like a probe git cannot answer, leaves the state
+    /// unknown, and unknown protects.
     fn sandbox_risk(&self, record: &SandboxRecord) -> WorktreeRisk {
         if record.branch().is_none() {
             return WorktreeRisk::NothingAtRisk;
@@ -269,55 +274,40 @@ impl PruneCommand<'_> {
         if !self.worktrees.exists(record.worktree_path()) {
             return WorktreeRisk::NothingAtRisk;
         }
-        self.probed_risk(record.name(), record.worktree_path(), record.project_path())
+        let Some(project) = record.project_path() else {
+            return WorktreeRisk::Unknown;
+        };
+        self.probed_risk(record.name(), record.worktree_path(), project)
     }
 
     /// What a corrupt dir's worktree holds. A corrupt entry has no record to read
-    /// the path from, so the canonical state-root layout supplies it; from there
-    /// the question and its answers are the record path's. The project the
-    /// record would have named is lost with it, so a clone there cannot be
-    /// asked about its commits and reads as unknown.
+    /// the path from, so the canonical state-root layout supplies it. The
+    /// project the record would have named is lost with it, and only that
+    /// project can say what the worktree holds, so one still on disk is unknown.
     fn corrupt_risk(&self, name: &str) -> WorktreeRisk {
         let workdir = self.corrupt_worktree_path(name);
-        if !self.worktrees.exists(&workdir) {
+        if !self.worktrees.exists(&workdir) || SandboxName::new(name).is_err() {
             return WorktreeRisk::NothingAtRisk;
         }
-        let Ok(sandbox_name) = SandboxName::new(name) else {
-            return WorktreeRisk::NothingAtRisk;
-        };
-        self.probed_risk(&sandbox_name, &workdir, None)
+        WorktreeRisk::Unknown
     }
 
-    /// The two probes of a `/workdir` read as one risk. It lives in one place
-    /// because the two paths that ask it gate the same deletion, and a mapping
-    /// that drifts between them reopens the data-loss path on whichever side was
-    /// left behind.
+    /// The two probes of a `/workdir` read as one risk, both asked of `project`.
     ///
     /// The commits come first because the remedies differ and only one of the
     /// two words can be printed: told a clone is dirty, a user goes looking for
     /// uncommitted changes and forces away the commits nothing else holds. Only
     /// a `/workdir` built as a clone is asked, since a worktree commits into the
     /// project repository's own object store and its commits outlive the box.
-    /// A clone is asked of its own project, because `prune` is global and the
-    /// repository it runs from is somebody else's as often as not; with no
-    /// project to ask, the answer is unknown, and unknown protects.
-    fn probed_risk(
-        &self,
-        name: &SandboxName,
-        workdir: &Path,
-        project: Option<&Path>,
-    ) -> WorktreeRisk {
+    fn probed_risk(&self, name: &SandboxName, workdir: &Path, project: &Path) -> WorktreeRisk {
         if matches!(self.worktrees.git_mode_at(workdir), Some(GitMode::Clone)) {
-            let Some(project) = project else {
-                return WorktreeRisk::Unknown;
-            };
             match self.worktrees.holds_unreturned_work(name, project) {
                 Ok(true) => return WorktreeRisk::HoldsUnreturnedWork,
                 Ok(false) => {}
                 Err(_) => return WorktreeRisk::Unknown,
             }
         }
-        match self.worktrees.is_dirty(name) {
+        match self.worktrees.is_dirty(name, project) {
             Ok(true) => WorktreeRisk::HoldsWork,
             Ok(false) => WorktreeRisk::NothingAtRisk,
             Err(_) => WorktreeRisk::Unknown,
@@ -637,15 +627,14 @@ mod tests {
     }
 
     #[test]
-    fn prune_skips_corrupt_entry_with_dirty_worktree() {
+    fn prune_skips_a_corrupt_worktree_entry_as_unknown() {
         let rotten = SandboxName::new("rotten").unwrap();
         let store = InMemoryMetadataStore::new().with_corrupt_entry("rotten", "broken json");
         let registry = FakeRegistry::new(vec![]);
-        let worktrees =
-            FakeWorktreeProvider::new().with_listed_worktree(&rotten).with_dirty_worktree(&rotten);
+        let worktrees = FakeWorktreeProvider::new().with_present_worktree(&rotten);
         let sessions = FakeSessionProbe::new(vec![]);
         let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
-        let confirmer = FakeConfirmer::no();
+        let confirmer = FakeConfirmer::yes();
         let runtime = FakeRuntime::new(canned_token());
         let network = FakeNetwork::new();
         let caches = FakeCacheProvider::new();
@@ -655,11 +644,15 @@ mod tests {
             &caches, &notify,
         );
 
-        let report = command.run(None, false, false).unwrap();
+        let report = command.run(None, false, true).unwrap();
 
+        // The record that would name the project is the part that is corrupt,
+        // and only that project keeps the administrative directory a worktree's
+        // state is read through. The repository `prune` runs from answers about
+        // somebody else's work, so the state is unknown, and unknown protects.
         assert_eq!(
             report.skipped,
-            vec![PruneSkip { name: "rotten".to_string(), reason: SkipReason::Dirty }]
+            vec![PruneSkip { name: "rotten".to_string(), reason: SkipReason::Unknown }]
         );
         assert_eq!(store.list_corrupt().unwrap().len(), 1);
     }
@@ -886,33 +879,6 @@ mod tests {
         assert_eq!(
             report.skipped,
             vec![PruneSkip { name: "demo".to_string(), reason: SkipReason::Dirty }]
-        );
-    }
-
-    #[test]
-    fn prune_spares_a_dirty_corrupt_entry_whose_worktree_this_repository_does_not_list() {
-        let rotten = SandboxName::new("rotten").unwrap();
-        let store = InMemoryMetadataStore::new().with_corrupt_entry("rotten", "broken json");
-        let registry = FakeRegistry::new(vec![]);
-        let worktrees =
-            FakeWorktreeProvider::new().with_present_worktree(&rotten).with_dirty_worktree(&rotten);
-        let sessions = FakeSessionProbe::new(vec![]);
-        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
-        let confirmer = FakeConfirmer::yes();
-        let runtime = FakeRuntime::new(canned_token());
-        let network = FakeNetwork::new();
-        let caches = FakeCacheProvider::new();
-        let notify = FakeNotifyProvider::new();
-        let command = prune_command(
-            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
-            &caches, &notify,
-        );
-
-        let report = command.run(None, false, true).unwrap();
-
-        assert_eq!(
-            report.skipped,
-            vec![PruneSkip { name: "rotten".to_string(), reason: SkipReason::Dirty }]
         );
     }
 
@@ -1795,5 +1761,95 @@ mod tests {
             report.skipped,
             vec![PruneSkip { name: "rotten".to_string(), reason: SkipReason::Unknown }]
         );
+    }
+
+    #[test]
+    fn prune_collects_a_clean_worktree_asked_of_the_project_its_record_names() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo")).unwrap();
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new()
+            .with_present_worktree(&name)
+            .with_worktree_registered_only_in(&name, Path::new("/home/tester/projects/demo"));
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches, &notify,
+        );
+
+        let report = command.run(None, false, true).unwrap();
+
+        // Asked of the repository `prune` runs from, which keeps nothing for
+        // another project's worktree, this clean debris reads as unknown and is
+        // spared on every run, until the user reaches for `--force`, the flag
+        // that takes real work too.
+        assert_eq!(report.removed, vec!["demo".to_string()]);
+    }
+
+    #[test]
+    fn prune_skips_a_worktree_whose_record_names_no_project_as_unknown() {
+        let name = SandboxName::new("demo").unwrap();
+        let store = InMemoryMetadataStore::new();
+        store.put(&serde_json::from_str::<SandboxRecord>(RECORD_WITHOUT_PROJECT).unwrap()).unwrap();
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new().with_present_worktree(&name);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches, &notify,
+        );
+
+        let report = command.run(None, false, true).unwrap();
+
+        // With no project to ask, a clean answer could only come from the
+        // repository `prune` runs from, which is an answer about somebody
+        // else's work, and the guard only lets through what it knows holds
+        // nothing.
+        assert_eq!(
+            report.skipped,
+            vec![PruneSkip { name: "demo".to_string(), reason: SkipReason::Unknown }]
+        );
+    }
+
+    #[test]
+    fn prune_releases_a_clone_base_pin_in_the_project_its_record_names() {
+        let name = SandboxName::new("demo").unwrap();
+        let project = Path::new("/home/tester/projects/demo");
+        let store = InMemoryMetadataStore::new();
+        store.put(&sample_record("demo")).unwrap();
+        let registry = FakeRegistry::new(vec![]);
+        let worktrees = FakeWorktreeProvider::new()
+            .with_clone_workdir(&name)
+            .with_pinned_base_in(&name, project);
+        let sessions = FakeSessionProbe::new(vec![]);
+        let clock = ScriptedClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let confirmer = FakeConfirmer::yes();
+        let runtime = FakeRuntime::new(canned_token());
+        let network = FakeNetwork::new();
+        let caches = FakeCacheProvider::new();
+        let notify = FakeNotifyProvider::new();
+        let command = prune_command(
+            &store, &registry, &worktrees, &sessions, &clock, &confirmer, &runtime, &network,
+            &caches, &notify,
+        );
+
+        command.run(None, true, false).unwrap();
+
+        // Released in the repository `prune` runs from, the pin stays in the
+        // project, holding a commit for a sandbox that no longer exists.
+        assert!(!worktrees.pinned_base_in(&name, project));
     }
 }

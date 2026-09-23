@@ -146,8 +146,11 @@ pub trait WorktreeProvider {
     /// build interrupted between the two leaves one without the other. An
     /// unanswerable read is absence, like `exists`.
     fn git_mode_at(&self, path: &Path) -> Option<GitMode>;
-    /// Remove this sandbox's worktree.
-    fn remove(&self, name: &SandboxName) -> Result<(), HortError>;
+    /// Remove this sandbox's worktree, releasing in `project` the pin a clone
+    /// held there. The project is the one the sandbox was built from, never the
+    /// repository the command happens to run from; with none to name, the pin
+    /// is released in the repository the provider is rooted at.
+    fn remove(&self, name: &SandboxName, project: Option<&Path>) -> Result<(), HortError>;
     /// Every worktree currently registered.
     fn list(&self) -> Result<Vec<Worktree>, HortError>;
     /// Whether a worktree is still on disk at `path`.
@@ -176,7 +179,14 @@ pub trait WorktreeProvider {
     fn branch_held_at(&self, path: &Path) -> Result<Option<BranchName>, HortError>;
     /// Whether this sandbox's worktree has uncommitted changes; untracked files
     /// count. The first behavioral consumer is `prune`.
-    fn is_dirty(&self, name: &SandboxName) -> Result<bool, HortError>;
+    ///
+    /// The verdict is read through the administrative directory `project`
+    /// keeps for the worktree, never through the worktree's own `.git`
+    /// pointer, which the sandbox can rewrite. The project is a parameter for
+    /// the reason `holds_unreturned_work` takes one: the commands that ask are
+    /// global, and the repository they run from keeps no such directory for
+    /// another project's sandbox.
+    fn is_dirty(&self, name: &SandboxName, project: &Path) -> Result<bool, HortError>;
     /// Whether this sandbox's `/workdir` holds committed work the repository at
     /// `project` does not have.
     ///

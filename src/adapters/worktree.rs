@@ -47,20 +47,20 @@ impl GitWorktreeProvider {
             .join(format!("worktree-{}", name.as_str()))
     }
 
-    /// The administrative directory git keeps on the host for the linked
-    /// worktree at `worktree`. Discovered by matching git's own `gitdir` records
-    /// under `<repo>/.git/worktrees/`, never by reading the worktree's `.git`
+    /// The administrative directory the repository at `project` keeps on the
+    /// host for the linked worktree at `worktree`. Discovered by matching git's
+    /// own `gitdir` records under `<project>/.git/worktrees/`, never by reading the worktree's `.git`
     /// pointer: that file lives on the writable `/workdir` a tenant controls, so
     /// inspecting the worktree through it would run whatever git command the
     /// tenant configured there. Absence of a match is reported as a git failure,
     /// so a worktree hort cannot vouch for degrades to an error rather than a
     /// false verdict.
-    fn worktree_admin_dir(&self, worktree: &Path) -> Result<PathBuf, HortError> {
+    fn worktree_admin_dir(project: &Path, worktree: &Path) -> Result<PathBuf, HortError> {
         let missing = || HortError::GitCommandFailed {
             detail: format!("worktree admin dir: none registered for {}", worktree.display()),
         };
         let dot_git = std::fs::canonicalize(worktree.join(".git")).map_err(|_| missing())?;
-        let registry = self.repo_dir.join(".git").join("worktrees");
+        let registry = project.join(".git").join("worktrees");
         let entries = std::fs::read_dir(&registry).map_err(|err| HortError::GitCommandFailed {
             detail: format!("worktree admin dir: {err}"),
         })?;
@@ -182,7 +182,7 @@ impl GitWorktreeProvider {
             .map(|_| ())
     }
 
-    /// Release the commit this sandbox stood on, so the host's own gc is free to
+    /// Release, in `repository`, the commit this sandbox stood on, so the host's own gc is free to
     /// collect it again: once the clone is gone the pin holds an object for
     /// nobody. It is named after the one sandbox rather than swept, because the
     /// other pins are what keep the boxes still standing one `git gc` away from
@@ -191,8 +191,8 @@ impl GitWorktreeProvider {
     /// Only clone mode ever writes one, and deleting a ref that is not there is
     /// already the state asked for, so the worktree route passes through
     /// untouched and a clone whose directory vanished still gets collected.
-    fn unpin_clone_base(&self, name: &SandboxName) -> Result<(), HortError> {
-        run(&self.repo_dir, "update-ref", &["update-ref", "-d", &self.base_pin(name)]).map(|_| ())
+    fn unpin_clone_base(&self, name: &SandboxName, repository: &Path) -> Result<(), HortError> {
+        run(repository, "update-ref", &["update-ref", "-d", &self.base_pin(name)]).map(|_| ())
     }
 
     /// The ref the host repository holds a sandbox's base commit under.
@@ -216,8 +216,8 @@ impl WorktreeProvider for GitWorktreeProvider {
         Ok(Worktree { path })
     }
 
-    fn remove(&self, name: &SandboxName) -> Result<(), HortError> {
-        self.unpin_clone_base(name)?;
+    fn remove(&self, name: &SandboxName, project: Option<&Path>) -> Result<(), HortError> {
+        self.unpin_clone_base(name, project.unwrap_or(&self.repo_dir))?;
         let path = self.worktree_path(name);
         let porcelain = run(&self.repo_dir, "worktree list", &["worktree", "list", "--porcelain"])?;
         let records = parse_worktree_records(&porcelain);
@@ -302,13 +302,13 @@ impl WorktreeProvider for GitWorktreeProvider {
             .transpose()
     }
 
-    fn is_dirty(&self, name: &SandboxName) -> Result<bool, HortError> {
+    fn is_dirty(&self, name: &SandboxName, project: &Path) -> Result<bool, HortError> {
         let worktree = self.worktree_path(name);
-        let admin = self.worktree_admin_dir(&worktree)?;
+        let admin = Self::worktree_admin_dir(project, &worktree)?;
         let admin_arg = admin.to_string_lossy();
         let worktree_arg = worktree.to_string_lossy();
         let porcelain = run(
-            &self.repo_dir,
+            project,
             "status",
             &[
                 "--git-dir",
@@ -690,7 +690,7 @@ mod tests {
         let worktree =
             provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
 
-        provider.remove(&name).unwrap();
+        provider.remove(&name, Some(&repo)).unwrap();
 
         assert!(!worktree.path.exists());
         let listed = provider.list().unwrap();
@@ -705,7 +705,7 @@ mod tests {
         let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
         let name = SandboxName::new("never-created").unwrap();
 
-        assert!(provider.remove(&name).is_ok());
+        assert!(provider.remove(&name, Some(&repo)).is_ok());
     }
 
     #[test]
@@ -719,7 +719,7 @@ mod tests {
             provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
         fs::remove_dir_all(&worktree.path).unwrap();
 
-        provider.remove(&name).unwrap();
+        provider.remove(&name, Some(&repo)).unwrap();
 
         let porcelain = git(&repo, &["worktree", "list", "--porcelain"]);
         assert!(!porcelain.contains("worktree-demo"));
@@ -740,7 +740,7 @@ mod tests {
         // distracted recursive remove produces, leaves a directory git refuses
         // to remove. Without a route out of that state the sandbox the user
         // named can only be collected by hand.
-        assert!(provider.remove(&name).is_ok());
+        assert!(provider.remove(&name, Some(&repo)).is_ok());
     }
 
     #[test]
@@ -754,7 +754,7 @@ mod tests {
             provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
         fs::remove_file(worktree.path.join(".git")).unwrap();
 
-        provider.remove(&name).unwrap();
+        provider.remove(&name, Some(&repo)).unwrap();
 
         let porcelain = git(&repo, &["worktree", "list", "--porcelain"]);
         assert!(!porcelain.contains("worktree-demo"));
@@ -772,7 +772,7 @@ mod tests {
         let tip = commit_in_worktree(&worktree.path, "work.txt", "work\n");
         fs::remove_file(worktree.path.join(".git")).unwrap();
 
-        provider.remove(&name).unwrap();
+        provider.remove(&name, Some(&repo)).unwrap();
 
         // Committed work survives the box that produced it, and the route that
         // collects a worktree with no pointer is a second way into that
@@ -791,7 +791,7 @@ mod tests {
             provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
         let tip = commit_in_worktree(&worktree.path, "work.txt", "work\n");
 
-        provider.remove(&name).unwrap();
+        provider.remove(&name, Some(&repo)).unwrap();
 
         assert_eq!(rev_parse(&repo, "refs/heads/demo"), tip);
     }
@@ -935,7 +935,7 @@ mod tests {
         let name = SandboxName::new("demo").unwrap();
         provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
 
-        assert!(!provider.is_dirty(&name).unwrap());
+        assert!(!provider.is_dirty(&name, &repo).unwrap());
     }
 
     #[test]
@@ -949,7 +949,7 @@ mod tests {
             provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
         fs::write(worktree.path.join("README.md"), "changed\n").unwrap();
 
-        assert!(provider.is_dirty(&name).unwrap());
+        assert!(provider.is_dirty(&name, &repo).unwrap());
     }
 
     #[test]
@@ -963,7 +963,7 @@ mod tests {
             provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
         fs::write(worktree.path.join("untracked.txt"), "x\n").unwrap();
 
-        assert!(provider.is_dirty(&name).unwrap());
+        assert!(provider.is_dirty(&name, &repo).unwrap());
     }
 
     #[test]
@@ -976,7 +976,7 @@ mod tests {
         provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
         fs::remove_dir_all(&repo).unwrap();
 
-        let result = provider.is_dirty(&name);
+        let result = provider.is_dirty(&name, &repo);
 
         // The worktree is still on disk and is now the only copy of everything
         // it holds, committed work included. Answering "clean" here would let
@@ -1017,7 +1017,7 @@ mod tests {
         );
         fs::write(worktree.path.join(".git"), format!("gitdir: {}\n", planted.display())).unwrap();
 
-        let _ = provider.is_dirty(&name);
+        let _ = provider.is_dirty(&name, &repo);
 
         // Inspecting the worktree must read git configuration from the trusted
         // host-side administrative directory, never from the pointer the box
@@ -1050,7 +1050,29 @@ mod tests {
         );
         fs::write(worktree.path.join(".git"), format!("gitdir: {}\n", decoy.display())).unwrap();
 
-        assert!(!provider.is_dirty(&name).unwrap());
+        assert!(!provider.is_dirty(&name, &repo).unwrap());
+    }
+
+    #[test]
+    fn git_worktree_is_dirty_asks_the_project_it_names_rather_than_the_repository_it_runs_from() {
+        let (_project, project) = temp_dir();
+        let (_elsewhere, elsewhere) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&project);
+        init_repo_with_commit(&elsewhere);
+        let name = SandboxName::new("demo").unwrap();
+        let worktree = GitWorktreeProvider::new(project.clone(), state_root.clone())
+            .create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree)
+            .unwrap();
+        fs::write(worktree.path.join("untracked.txt"), "x\n").unwrap();
+        let run_from_elsewhere = GitWorktreeProvider::new(elsewhere, state_root);
+
+        // `ls` and `prune` are global, so the repository a provider is rooted
+        // at is whichever one the user is standing in, and that one keeps no
+        // administrative directory for another project's worktree. Asked there,
+        // every box of another project reads as unknown: a dash in `ls` and a
+        // false skip in `prune`.
+        assert!(run_from_elsewhere.is_dirty(&name, &project).unwrap());
     }
 
     #[test]
@@ -1295,7 +1317,7 @@ mod tests {
         let branch = BranchName::new("demo").unwrap();
         provider.create(&name, &branch, GitMode::Clone).unwrap();
 
-        provider.remove(&name).unwrap();
+        provider.remove(&name, Some(&repo)).unwrap();
 
         // The pin exists to keep the host's gc off an object the clone borrows.
         // Once the clone is gone it holds a commit for nobody, in a repository
@@ -1320,13 +1342,62 @@ mod tests {
         provider.create(&going, &BranchName::new("demo").unwrap(), GitMode::Clone).unwrap();
         provider.create(&staying, &BranchName::new("other").unwrap(), GitMode::Clone).unwrap();
 
-        provider.remove(&going).unwrap();
+        provider.remove(&going, Some(&repo)).unwrap();
 
         // The pin is what keeps the host's gc off the objects a clone borrows
         // rather than owns, so collecting one box by sweeping every pin leaves
         // the boxes still standing one `git gc` away from an unreadable
         // `/workdir`.
         assert_eq!(rev_parse(&repo, "refs/hort/other/base"), base);
+    }
+
+    #[test]
+    fn clone_mode_remove_deletes_the_pinned_base_ref_from_the_project_it_names() {
+        let (_project, project) = temp_dir();
+        let (_elsewhere, elsewhere) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&project);
+        init_repo_with_commit(&elsewhere);
+        let name = SandboxName::new("demo").unwrap();
+        GitWorktreeProvider::new(project.clone(), state_root.clone())
+            .create(&name, &BranchName::new("demo").unwrap(), GitMode::Clone)
+            .unwrap();
+        let run_from_elsewhere = GitWorktreeProvider::new(elsewhere, state_root);
+
+        run_from_elsewhere.remove(&name, Some(&project)).unwrap();
+
+        // `down` and `prune` run from wherever the user stands. Released in that
+        // repository, the pin stays in the project, holding a commit for a
+        // sandbox no hort command will ever name again.
+        let pinned = Command::new("git")
+            .current_dir(&project)
+            .args(["rev-parse", "--verify", "--quiet", "refs/hort/demo/base"])
+            .output()
+            .unwrap();
+        assert!(!pinned.status.success(), "the pinned base ref outlived the sandbox");
+    }
+
+    #[test]
+    fn clone_mode_remove_without_a_project_deletes_the_pinned_base_ref_where_it_runs() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Clone).unwrap();
+
+        provider.remove(&name, None).unwrap();
+
+        // A corrupt entry has lost the record that named its project. Run from
+        // that project, releasing the pin there is what hort did before it
+        // could name one, and a sandbox that cannot say where it came from is
+        // no reason to leak the ref in the one repository that holds it.
+        let pinned = Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "--verify", "--quiet", "refs/hort/demo/base"])
+            .output()
+            .unwrap();
+        assert!(!pinned.status.success(), "the pinned base ref outlived the sandbox");
     }
 
     #[test]

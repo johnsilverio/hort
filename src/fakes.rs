@@ -698,6 +698,8 @@ pub struct FakeWorktreeProvider {
     checked_out_branches: Vec<(BranchName, PathBuf)>,
     dirty_worktrees: Vec<SandboxName>,
     failing_dirty_probes: Vec<SandboxName>,
+    registered_only_in: Vec<(SandboxName, PathBuf)>,
+    pinned_bases: RefCell<Vec<(SandboxName, PathBuf)>>,
     unreturned_work: Vec<SandboxName>,
     work_returned_only_to: Vec<(SandboxName, PathBuf)>,
     failing_unreturned_probes: Vec<SandboxName>,
@@ -718,6 +720,8 @@ impl FakeWorktreeProvider {
             checked_out_branches: Vec::new(),
             dirty_worktrees: Vec::new(),
             failing_dirty_probes: Vec::new(),
+            registered_only_in: Vec::new(),
+            pinned_bases: RefCell::new(Vec::new()),
             unreturned_work: Vec::new(),
             work_returned_only_to: Vec::new(),
             failing_unreturned_probes: Vec::new(),
@@ -802,6 +806,28 @@ impl FakeWorktreeProvider {
         self
     }
 
+    /// Script the worktree of `name` as registered in the repository at
+    /// `project` and in no other, which is how a real worktree reads: only its
+    /// own project keeps the administrative directory its dirty state is read
+    /// through, so `is_dirty` asked of any other repository answers `Err`.
+    pub fn with_worktree_registered_only_in(mut self, name: &SandboxName, project: &Path) -> Self {
+        self.registered_only_in.push((name.clone(), project.to_path_buf()));
+        self
+    }
+
+    /// Seed the pinned base ref of the clone `name` in the repository at
+    /// `project`, the ref a clone-mode build leaves there.
+    pub fn with_pinned_base_in(self, name: &SandboxName, project: &Path) -> Self {
+        self.pinned_bases.borrow_mut().push((name.clone(), project.to_path_buf()));
+        self
+    }
+
+    /// Whether the repository at `project` still holds the pinned base ref of
+    /// `name`.
+    pub fn pinned_base_in(&self, name: &SandboxName, project: &Path) -> bool {
+        self.pinned_bases.borrow().iter().any(|(held, repo)| held == name && repo == project)
+    }
+
     /// Script this sandbox's `/workdir` as holding committed work the host
     /// repository does not have: `holds_unreturned_work` answers `Ok(true)`.
     pub fn with_unreturned_work(mut self, name: &SandboxName) -> Self {
@@ -875,7 +901,13 @@ impl WorktreeProvider for FakeWorktreeProvider {
             .map(|(_, mode)| *mode)
     }
 
-    fn remove(&self, name: &SandboxName) -> Result<(), HortError> {
+    fn remove(&self, name: &SandboxName, project: Option<&Path>) -> Result<(), HortError> {
+        // With no project named, the pin is released where the real provider
+        // releases it then: the repository it is rooted at.
+        let repository = project.map_or_else(fake_main_checkout, Path::to_path_buf);
+        self.pinned_bases
+            .borrow_mut()
+            .retain(|(held, repo)| !(held == name && *repo == repository));
         let path = fake_worktree_path(name);
         self.paths.borrow_mut().retain(|listed| listed != &path);
         self.present.borrow_mut().retain(|on_disk| on_disk != &path);
@@ -918,8 +950,12 @@ impl WorktreeProvider for FakeWorktreeProvider {
             .map(|(branch, _)| branch.clone()))
     }
 
-    fn is_dirty(&self, name: &SandboxName) -> Result<bool, HortError> {
-        if self.failing_dirty_probes.contains(name) {
+    fn is_dirty(&self, name: &SandboxName, project: &Path) -> Result<bool, HortError> {
+        let asked_elsewhere = self
+            .registered_only_in
+            .iter()
+            .any(|(registered, home)| registered == name && home != project);
+        if self.failing_dirty_probes.contains(name) || asked_elsewhere {
             // An unasserted stand-in error: no consumer asserts the variant,
             // only that it is an `Err`.
             return Err(HortError::InvalidConfig {
