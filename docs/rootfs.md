@@ -33,6 +33,8 @@ Claude Code accepts that mode as root when `IS_SANDBOX=1` is set. Set it **in th
 - For `sh` and `bash` login shells: `printf 'export IS_SANDBOX=1\n' > /etc/profile.d/hort-sandbox.sh`
 - For fish: `mkdir -p /etc/fish/conf.d && printf 'set -gx IS_SANDBOX 1\n' > /etc/fish/conf.d/hort-sandbox.fish`
 
+A shell reads these files as it starts, and [`hort run`](commands/run.md#what-it-does) starts none for the command you give it, so that command does not see the variable unless you run it through a login shell, as in `hort run <name> -- bash -lc '...'`.
+
 Other agents have their own switch, or none; check each one's documentation.
 
 ## Install into the system, not into a home directory

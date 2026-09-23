@@ -29,6 +29,12 @@ Like `attach`, it never builds anything and checks only that the kernel allows u
 
 **The environment** of the session is the same one `attach` builds: `HORT_SANDBOX` and `HORT_WORKTREE`, `HOME=/home/hort` and the `XDG_*` directories under it, a standard `PATH`, the variables your agents declare in `auth.env`, and, if the sandbox runs an egress proxy, the proxy variables. Nothing else is inherited from your host environment.
 
+**No shell configuration is read.** Because hort starts no shell for it, nothing your rootfs sets in its shell configuration, `/etc/profile.d` for example, exists for the command, including the `IS_SANDBOX=1` that lets Claude Code run unrestricted as root ([Agents that refuse to run as root](../rootfs.md#agents-that-refuse-to-run-as-root)). So `hort run fix-login -- claude --dangerously-skip-permissions` is refused by Claude Code, while the same command wrapped in a login shell starts:
+
+```bash
+hort run fix-login -- bash -lc 'claude --dangerously-skip-permissions -p "run the tests"'
+```
+
 **No terminal is allocated.** A command that ends is not a shell you type into, so `run` never asks the sandbox for a pty and never lends it yours. The command runs on hort's standard streams.
 
 `run` records the time, the same as `attach`, so a box an orchestrator is driving command by command does not read as idle to `hort prune --idle` between two of them.
