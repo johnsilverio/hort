@@ -5,7 +5,7 @@
 | [`hort up <name>`](up.md) | Build a sandbox (or finish a half-built one) and open a session in it. | yes |
 | [`hort attach <name>`](attach.md) | Open another session in a running sandbox. | records the attach time |
 | [`hort run <name> -- <cmd>`](run.md) | Run one command in a running sandbox with no terminal, exiting with its status. | records the attach time |
-| [`hort ls`](ls.md) | List every sandbox with its state, sessions, age, idle time, branch and dirty state. | no |
+| [`hort ls`](ls.md) | List every sandbox with its state, sessions, age, idle time, git mode, branch and dirty state. | no |
 | [`hort down <name>`](down.md) | Tear a sandbox down: processes, container, worktree, record. | yes |
 | [`hort prune`](prune.md) | Remove debris and, if asked, idle sandboxes, after confirming. | yes |
 | [`hort config`](config.md) | Answer a few questions and write the global configuration. | writes `~/.config/hort/config.json` |

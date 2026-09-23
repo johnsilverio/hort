@@ -51,13 +51,13 @@ refusing to down without confirmation: stdin is not a TTY (pass --force to proce
 
 ## Unreturned work
 
-In [clone mode](../git-modes.md) the sandbox's `/workdir` is a repository of its own, so a commit made inside it lives nowhere else until it is pushed or fetched out. Before removing such a sandbox, `down` compares the clone's tip against your repository and asks on a terminal when your repository does not have it:
+In [clone mode](../git-modes.md) the sandbox's `/workdir` is a repository of its own, so a commit made inside it lives nowhere else until it is pushed or fetched out. Before removing such a sandbox, `down` compares the clone's tip against the repository of the project the sandbox was built from, whatever directory you run `down` in, and asks on a terminal when that repository does not have it:
 
 ```text
 sandbox 'fix-login' holds commits the project repository does not have; tear it down anyway? [y/N]
 ```
 
-Both reads happen on the host and neither needs the box running. Answering anything but `y` or `yes` leaves the sandbox alone and exits `0`; `-f` skips the question; without a terminal and without `-f`, `down` refuses with the same message as above. If hort cannot read the clone at all, it asks anyway, because the alternative is deleting commits it could not see.
+Both reads happen on the host and neither needs the box running. Answering anything but `y` or `yes` leaves the sandbox alone and exits `0`; `-f` skips the question; without a terminal and without `-f`, `down` refuses with the same message as above. If hort cannot read the clone at all, or its record does not say which project it was built from, it asks anyway, because the alternative is deleting commits it could not see. [`hort ls`](ls.md) shows the same answer ahead of time, as `clone, work only in the box`.
 
 Worktree-mode sandboxes are never asked about: their commits go straight into your repository, so tearing the box down does not touch them.
 

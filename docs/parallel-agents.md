@@ -34,8 +34,8 @@ A pane whose session ends simply closes. Neither closing a pane nor killing the 
 ```console
 $ tmux kill-server
 $ hort ls
-fix-login  live  0  1h 12m 3s 402ms 118us 20ns  3s 970ms 710us 293ns  fix-login  dirty
-search-api  live  0  1h 11m 58s 77ms 5us 301ns  1h 11m 58s 77ms 5us 301ns  search-api  clean
+fix-login  live  0  1h 12m 3s 402ms 118us 20ns  3s 970ms 710us 293ns  worktree  fix-login  dirty
+search-api  live  0  1h 11m 58s 77ms 5us 301ns  1h 11m 58s 77ms 5us 301ns  worktree  search-api  clean
 ```
 
 Reattach whenever you like, with a new pane and `hort attach fix-login`. The same holds over SSH: sandboxes on a remote machine keep running when the connection drops. Run tmux on the remote machine and your panes survive too.

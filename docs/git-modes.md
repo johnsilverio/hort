@@ -129,13 +129,13 @@ The same limit applies to fetching from that directory, which is why work comes 
 
 Clone mode works, and one rough edge remains:
 
-- **`hort ls` does not say which mode a sandbox was built in.** Its dirty column also reads `-` for a clone, because that check asks your repository about a worktree and a clone is not one. The branch column is correct.
+- **`hort ls` has no dirty state for a clone.** Its dirty column reads `-` for one, because that check asks your repository about a worktree and a clone is not one. The git mode column does say `clone`, and whether the clone holds commits your repository does not have (`clone, work only in the box`); the branch column is correct.
 
 It is on the [Roadmap](roadmap.md).
 
 ### What `hort down` does with a clone
 
-`down` removes the clone along with the sandbox, and a commit that never left the box goes with it. So before it removes anything it compares the clone's tip against your repository and asks when your repository does not have it:
+`down` removes the clone along with the sandbox, and a commit that never left the box goes with it. So before it removes anything it compares the clone's tip against the repository the sandbox was built from, whatever directory you run `down` in, and asks when that repository does not have it:
 
 ```text
 sandbox 'fix-login' holds commits the project repository does not have; tear it down anyway? [y/N]

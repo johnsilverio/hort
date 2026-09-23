@@ -59,7 +59,7 @@ So the division of labour is: **the agent writes files, you commit them from the
 - your repository and every other branch,
 - the project's [dependency caches](configuration.md#cache).
 
-Anything not committed when you run `down` is gone. Commit first. In [clone mode](git-modes.md) that means anything the agent did not push: the clone goes with the sandbox, and so does the pinned ref `refs/hort/<name>/base` your repository was holding for it. Because a clone keeps its commits to itself, `down` compares its tip against your repository first and asks before removing a sandbox holding work you never got back.
+Anything not committed when you run `down` is gone. Commit first. In [clone mode](git-modes.md) that means anything the agent did not push: the clone goes with the sandbox, and so does the pinned ref `refs/hort/<name>/base` your repository was holding for it. Because a clone keeps its commits to itself, `down` compares its tip against the repository it was built from first and asks before removing a sandbox holding work you never got back. `hort ls` shows such a sandbox as `clone, work only in the box`.
 
 Because the branch stays, `hort up <name>` later finds it already there. On a terminal, hort offers to build the sandbox on that branch; without a terminal it refuses and prints the command that does it (`hort up <name> --branch <name>`). Delete a branch you no longer need with `git branch -d <name>` on the host (a flag to do it from `down` is [planned](roadmap.md#deleting-the-sandboxs-branch-on-down-and-prune)).
 

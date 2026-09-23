@@ -26,7 +26,7 @@ Today hort is built from source, which means a Rust toolchain, the libseccomp he
 
 [Clone mode](git-modes.md) works today. One piece of it is still missing:
 
-- `hort ls` does not show which git mode a sandbox was built in, and its dirty column reads `-` for a clone. Planned: the mode is visible in the listing.
+- `hort ls` shows a clone's git mode and whether it holds commits your repository does not have, but its dirty column reads `-` for a clone, so uncommitted changes inside one do not show in the listing.
 
 ## Deleting the sandbox's branch on `down` and `prune`
 
