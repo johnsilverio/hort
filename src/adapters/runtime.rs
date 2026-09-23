@@ -3952,7 +3952,11 @@ mod privileged_tests {
         let provider = sandbox.network();
         let port = a_declared_port();
         let listening = TcpListener::bind(("127.0.0.1", port)).unwrap();
-        provider.provision(&open_network(&spec.name, token.pid.0)).unwrap();
+        let declaring_the_port = NetworkSpec {
+            db_forwards: vec![DbForward { host: "127.0.0.1".to_string(), port }],
+            ..open_network(&spec.name, token.pid.0)
+        };
+        provider.provision(&declaring_the_port).unwrap();
 
         runtime.join_session(&dialling_session(&spec.name, port)).unwrap();
 
@@ -3960,6 +3964,9 @@ mod privileged_tests {
         // ports at all. Reading that silence as an empty set would lock every
         // open sandbox out of the network it is entitled to, which is the shape
         // a fail-closed default takes when it is applied where nothing failed.
+        // The port is declared because the sandbox's loopback reaches only what
+        // the project declared, in this posture as in the other; what is under
+        // test is whether the session is let through to it.
         assert!(reached_within_deadline(&listening));
         provider.teardown(&spec.name).unwrap();
         runtime.teardown(&spec.name).unwrap();

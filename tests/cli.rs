@@ -3786,6 +3786,146 @@ fn cli_a_declared_database_answers_inside_an_allowlisted_sandbox() {
         .success();
 }
 
+/// A host loopback port nothing listens on yet, for a service that has to come
+/// up after the sandbox declaring it was built. The kernel picks it and it is let
+/// go at once, so the one assumption is that nothing takes it in between.
+///
+/// Picked by the kernel is load-bearing: it comes from the range the kernel hands
+/// out on its own, which pasta, left to scan for ports by itself, never forwards.
+/// A declared database on such a port is reached only because hort told pasta
+/// about it, which is the case a project whose database the kernel placed there
+/// actually has.
+fn a_loopback_port_nothing_listens_on() -> u16 {
+    TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port()
+}
+
+/// A service answering [`DATABASE_BANNER`] on this host loopback port from now
+/// on, never let go, like [`a_host_service_on_loopback`].
+fn a_host_service_on_loopback_port(port: u16) {
+    let listener = TcpListener::bind(("127.0.0.1", port)).expect("the declared port is still free");
+    std::thread::spawn(move || {
+        for mut dialled in listener.incoming().flatten() {
+            let _ = dialled.write_all(DATABASE_BANNER.as_bytes());
+        }
+    });
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_a_declared_database_answers_inside_an_open_sandbox() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let database = a_loopback_port_nothing_listens_on();
+    let (_config, config_home) = temp_config_home(&format!(
+        r#"{{ "rootfs": "{rootfs}",
+              "network": [ {{ "mode": "host", "host": "127.0.0.1", "port": {database} }} ] }}"#
+    ));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", sandbox.name().as_str()])
+        .assert()
+        .success();
+
+    // The database comes up only once the sandbox is standing, which is how a
+    // project starts its services in practice, so what the box reaches cannot
+    // depend on what happened to be listening on the host when it was built.
+    // The address is the one a declared database has in both postures, and the
+    // banner is what only that service says, so a transcript carrying it says the
+    // declaration, and nothing else, is what reached it. The status is echoed
+    // because this nc says nothing when a connection is refused, and a
+    // transcript that fails has to say which way it failed.
+    a_host_service_on_loopback_port(database);
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["run", sandbox.name().as_str(), "--", "sh", "-c"])
+        .arg(format!("nc -w 5 127.0.0.1 {database} < /dev/null; echo dialled=$?"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(DATABASE_BANNER.trim()));
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
+
+/// A service answering `banner` on a host loopback port below the range the
+/// kernel hands out on its own, given back so a project can leave it undeclared.
+///
+/// Below that range is load-bearing. pasta, left to scan for ports by itself,
+/// forwards only ports outside it, so an undeclared service on a port the kernel
+/// picked is refused inside the box whatever hort told pasta, and a probe
+/// against one could not tell a sandbox that reaches what nobody declared from
+/// one that does not. The range assumes the kernel's own starts above it, which
+/// is its default.
+fn a_host_service_below_the_ephemeral_range(banner: &'static str) -> u16 {
+    let listener = (20000..21000)
+        .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
+        .expect("a free host loopback port below the ephemeral range");
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut dialled in listener.incoming().flatten() {
+            let _ = dialled.write_all(banner.as_bytes());
+        }
+    });
+    port
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_a_host_loopback_port_an_open_sandbox_did_not_declare_is_refused() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let undeclared = a_host_service_below_the_ephemeral_range(UNDECLARED_BANNER);
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    // The sandbox's own loopback means what the project declared and nothing
+    // else, in this posture as in the other, so a service the project never
+    // named is not there even though open egress filters nothing on the way
+    // out. The status tells a refusal from a tool that is missing, and the
+    // banner is what only that service says, so the transcript not carrying it
+    // is the claim: nothing inside the box got to it.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", sandbox.name().as_str()])
+        .write_stdin(format!("nc -w 5 127.0.0.1 {undeclared} < /dev/null\necho undeclared=$?\n"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("undeclared=1\n"))
+        .stdout(predicate::str::contains(UNDECLARED_BANNER.trim()).not());
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
+
 /// A banner nothing on this machine but the undeclared service below answers
 /// with, so a transcript that carries it says where it came from.
 const UNDECLARED_BANNER: &str = "the-undeclared-service-answered\n";

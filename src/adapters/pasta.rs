@@ -3,12 +3,14 @@
 //! host. pasta provides connectivity and filters nothing; what closes an
 //! allowlist sandbox is the shape of the namespace it runs in.
 //!
-//! Open posture asks pasta to configure the namespace and to answer at the
-//! address the sandbox looks names up at, and stops there, so the sandbox
-//! reaches whatever the host reaches. An allowlist keeps pasta from
-//! mapping the host's loopback, splices only the declared ports, and then empties
-//! the namespace's route tables in both address families, which leaves
-//! `127.0.0.1:<declared port>` as the only address the sandbox can reach.
+//! Both postures splice the sandbox's loopback to the host's on the declared
+//! ports and no others, so `127.0.0.1` inside a sandbox means what the project
+//! declared. Open posture also asks pasta to configure the namespace and to
+//! answer at the address the sandbox looks names up at, and filters nothing on
+//! the way out. An allowlist keeps pasta from mapping the host's loopback, adds
+//! the proxy's port to the splice, and then empties the namespace's route tables
+//! in both address families, which leaves `127.0.0.1:<declared port>` as the only
+//! address the sandbox can reach.
 //! Emptying one family alone is the trap to avoid: a surviving IPv6 default route
 //! carries traffic straight out of a namespace that looks closed.
 //!
@@ -230,10 +232,13 @@ fn pasta_arguments(
             NO_PORTS.to_string(),
             "--map-guest-addr".to_string(),
             NO_PORTS.to_string(),
-            "-T".to_string(),
-            forwarded_ports(proxy_port, &spec.db_forwards),
         ]);
     }
+    // Always explicit, even with nothing to splice: left out, pasta scans for
+    // ports on its own and skips the range the kernel hands out, so what the
+    // sandbox's loopback reached would depend on which port a service landed on
+    // rather than on what the project declared.
+    arguments.extend(["-T".to_string(), spliced_ports(proxy_port, &spec.db_forwards)]);
 
     // pasta intercepts by destination address, so an address is a name server
     // only because pasta was told to answer for it, and the file naming it inside
@@ -259,11 +264,16 @@ fn reachable_ports(proxy_port: Option<u16>, forwards: &[DbForward]) -> Option<Ve
     Some(std::iter::once(proxy).chain(forwards.iter().map(|forward| forward.port)).collect())
 }
 
-fn forwarded_ports(proxy_port: Option<u16>, forwards: &[DbForward]) -> String {
-    let Some(ports) = reachable_ports(proxy_port, forwards) else {
-        return NO_PORTS.to_string();
-    };
-    ports.iter().map(u16::to_string).collect::<Vec<_>>().join(",")
+/// The ports pasta splices from the sandbox's loopback to the host's: the
+/// sandbox's own proxy, when it has one, and every declared database, whose host
+/// side is either the database itself or the forwarder standing in for it.
+fn spliced_ports(proxy_port: Option<u16>, forwards: &[DbForward]) -> String {
+    let ports: Vec<String> = proxy_port
+        .into_iter()
+        .chain(forwards.iter().map(|forward| forward.port))
+        .map(|port| port.to_string())
+        .collect();
+    if ports.is_empty() { NO_PORTS.to_string() } else { ports.join(",") }
 }
 
 /// The `ip` invocations that empty a sandbox's route tables, one per address
@@ -501,9 +511,11 @@ mod tests {
         // What `--no-netns-quit` gives up is pasta watching the directory of the
         // namespace file so it can leave when the file goes away. It cannot watch
         // one under /proc anyway, and without the flag it refuses to start.
-        // No mapping or forwarding flag belongs here: open mode is unfiltered by
-        // contract, and pasta's defaults already splice the sandbox's loopback to
-        // the host's, which is where a declared database answers in this posture.
+        // No mapping flag belongs here, since open mode is unfiltered by contract,
+        // but the forwarding flag does, even with nothing to forward. Left out,
+        // pasta falls back to scanning for ports on its own, and on some hosts
+        // that scan splices nothing at all, so what the sandbox's loopback reaches
+        // would depend on the host rather than on what the project declared.
         assert_eq!(
             arguments,
             [
@@ -513,6 +525,36 @@ mod tests {
                 "/proc/1234/ns/net",
                 "--config-net",
                 "--no-netns-quit",
+                "-T",
+                "none",
+                "-P",
+                "/runtime/sandboxes/demo/pasta.pid",
+            ]
+        );
+    }
+
+    #[test]
+    fn open_egress_forwards_the_declared_database_ports() {
+        let spec =
+            network_spec(EgressPolicy::Open, vec![database_on(5432), remote_database_on(6379)]);
+
+        let arguments = pasta_arguments(&spec, Path::new(USERNS), Path::new(PID_FILE), None);
+
+        // A declared database is reached at the sandbox's own loopback in both
+        // postures, and the splice is what carries that address to the host's.
+        // One on another address is spliced too, because the host side of it is
+        // the forwarder listening on the host's loopback for that port.
+        assert_eq!(
+            arguments,
+            [
+                "--userns",
+                "/proc/4242/ns/user",
+                "--netns",
+                "/proc/1234/ns/net",
+                "--config-net",
+                "--no-netns-quit",
+                "-T",
+                "5432,6379",
                 "-P",
                 "/runtime/sandboxes/demo/pasta.pid",
             ]
@@ -633,6 +675,8 @@ mod tests {
                 "/proc/1234/ns/net",
                 "--config-net",
                 "--no-netns-quit",
+                "-T",
+                "none",
                 "--dns-forward",
                 "203.0.113.53",
                 "-P",
