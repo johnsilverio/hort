@@ -87,7 +87,7 @@ Because the clone borrows objects instead of copying them, a `git gc` in your re
 refs/hort/<name>/base
 ```
 
-It is the one thing hort writes in your repository, it holds no work, and it is invisible to `git branch`. `hort down` does not remove it yet (see [what is missing](#what-is-not-there-yet)).
+It is the one thing hort writes in your repository, it holds no work, and it is invisible to `git branch`. `hort down` deletes it along with the sandbox (see [what `hort down` does with a clone](#what-hort-down-does-with-a-clone)).
 
 ### Sending the work back
 
