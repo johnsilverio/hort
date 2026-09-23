@@ -53,7 +53,7 @@ What clone mode does change is where a credential lives. If you want the agent t
 
 ### Exfiltration under open egress
 
-By default a sandbox has open network access, because agents need to reach their model provider. A hostile repository, or an agent tricked by a prompt injection, can send anything it can read to any server. That includes services listening on your host's loopback interface, which are reachable at `127.0.0.1` from inside an open sandbox. Today an allowlist is what closes that interface; closing it on its own is [planned](roadmap.md#closing-the-hosts-loopback-to-an-open-sandbox).
+By default a sandbox has open network access, because agents need to reach their model provider. A hostile repository, or an agent tricked by a prompt injection, can send anything it can read to any server. That includes services listening on your host's loopback interface: from inside an open sandbox the declared databases answer at `127.0.0.1`, and every service there, declared or not, answers at the address of the sandbox's default gateway. Today an allowlist is what closes that interface; closing it on its own is [planned](roadmap.md#closing-the-hosts-loopback-to-an-open-sandbox).
 
 ### What you mount into the box
 
