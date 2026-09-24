@@ -1412,6 +1412,9 @@ fn cli_ls_counts_the_session_open_in_a_sandbox() {
     // reads a probe that answers nothing as a box with nobody in it, so the whole
     // suite stays green while the column lies, `down` never asks before killing
     // somebody's work, and a box being typed in is offered to `prune --idle`.
+    // Read as the cells of this sandbox's row and never as a spaced string: the
+    // listing pads each column to its widest cell, and it lists every box the
+    // host is running, so how wide a column is here is not this test's to know.
     Command::cargo_bin("hort")
         .unwrap()
         .env("XDG_STATE_HOME", sandbox.state_home())
@@ -1421,7 +1424,10 @@ fn cli_ls_counts_the_session_open_in_a_sandbox() {
         .arg("ls")
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!("{}  live  1  ", sandbox.name().as_str())));
+        .stdout(
+            predicate::str::is_match(format!("(?m)^{} +live +1 ", sandbox.name().as_str()))
+                .unwrap(),
+        );
 
     drop(into_the_box);
     occupied.wait().unwrap();
@@ -2351,8 +2357,14 @@ fn cli_ls_reports_orphaned_after_the_anchor_is_killed() {
         .arg("ls")
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!("{}  orphaned  0  ", sandbox.name().as_str())))
-        .stdout(predicate::str::contains(format!("  {}  clean\n", sandbox.name().as_str())));
+        .stdout(
+            predicate::str::is_match(format!("(?m)^{} +orphaned +0 ", sandbox.name().as_str()))
+                .unwrap(),
+        )
+        .stdout(
+            predicate::str::is_match(format!("(?m) {} +clean *$", sandbox.name().as_str()))
+                .unwrap(),
+        );
 }
 
 #[test]
@@ -2389,8 +2401,13 @@ fn cli_ls_reports_inconsistent_when_the_worktree_is_deleted_under_a_live_box() {
         .arg("ls")
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!("{}  inconsistent  0  ", sandbox.name().as_str())))
-        .stdout(predicate::str::contains(format!("  {}  -\n", sandbox.name().as_str())));
+        .stdout(
+            predicate::str::is_match(format!("(?m)^{} +inconsistent +0 ", sandbox.name().as_str()))
+                .unwrap(),
+        )
+        .stdout(
+            predicate::str::is_match(format!("(?m) {} +- *$", sandbox.name().as_str())).unwrap(),
+        );
 }
 
 #[test]
@@ -2415,6 +2432,9 @@ fn cli_ls_reports_lost_record_when_the_metadata_of_a_live_box_is_removed() {
     // once, which is a different question from the one asked here.
     fs::remove_file(sandbox.state_dir().join("metadata.json")).unwrap();
 
+    // Every cell past the session count is a dash, however many columns the
+    // listing has: what a box with no record can show is this test's question,
+    // and which columns a row carries is the renderer's.
     Command::cargo_bin("hort")
         .unwrap()
         .env("XDG_STATE_HOME", sandbox.state_home())
@@ -2424,10 +2444,13 @@ fn cli_ls_reports_lost_record_when_the_metadata_of_a_live_box_is_removed() {
         .arg("ls")
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!(
-            "{}  lost-record  0  -  -  -  -\n",
-            sandbox.name().as_str()
-        )));
+        .stdout(
+            predicate::str::is_match(format!(
+                "(?m)^{} +lost-record +0( +-)+ *$",
+                sandbox.name().as_str()
+            ))
+            .unwrap(),
+        );
 }
 
 #[test]
@@ -2574,8 +2597,14 @@ fn cli_ls_reports_orphaned_after_up_was_killed_once_its_record_was_written() {
         .arg("ls")
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!("{}  orphaned  0  ", sandbox.name().as_str())))
-        .stdout(predicate::str::contains(format!("  {}  clean\n", sandbox.name().as_str())));
+        .stdout(
+            predicate::str::is_match(format!("(?m)^{} +orphaned +0 ", sandbox.name().as_str()))
+                .unwrap(),
+        )
+        .stdout(
+            predicate::str::is_match(format!("(?m) {} +clean *$", sandbox.name().as_str()))
+                .unwrap(),
+        );
 }
 
 #[test]
@@ -2609,8 +2638,14 @@ fn cli_up_completes_a_sandbox_whose_up_was_killed_once_its_record_was_written() 
         .arg("ls")
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!("{}  live  0  ", sandbox.name().as_str())))
-        .stdout(predicate::str::contains(format!("  {}  clean\n", sandbox.name().as_str())));
+        .stdout(
+            predicate::str::is_match(format!("(?m)^{} +live +0 ", sandbox.name().as_str()))
+                .unwrap(),
+        )
+        .stdout(
+            predicate::str::is_match(format!("(?m) {} +clean *$", sandbox.name().as_str()))
+                .unwrap(),
+        );
 }
 
 /// Whether the anchor `anchor` names stopped being alive, asked the way hort's
@@ -2685,7 +2720,10 @@ fn cli_up_completes_a_sandbox_whose_anchor_was_killed() {
         .arg("ls")
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!("{}  live  0  ", sandbox.name().as_str())));
+        .stdout(
+            predicate::str::is_match(format!("(?m)^{} +live +0 ", sandbox.name().as_str()))
+                .unwrap(),
+        );
 }
 
 #[test]

@@ -530,16 +530,27 @@ const HOST_CANNOT_BUILD_A_SANDBOX: u8 = 1;
 /// killed rather than one that returned.
 const SIGNALLED_EXIT_BASE: u8 = 128;
 
-/// Render the `ls` rows for the terminal: one line per sandbox with its name,
-/// lowercase state, session count, age, idle, branch, and worktree dirty state. A
-/// figure with no value renders as a dash, and a sandbox with a running session
-/// renders its idle as `active`. A sandbox the kernel is running and hort has no
-/// record of carries the command that collects it under its row.
+/// Render the `ls` listing for the terminal: a header naming each column, then
+/// one line per sandbox with its name, lowercase state, session count, age, idle,
+/// git mode, branch, and worktree dirty state, every column left-aligned under
+/// its header. Age and idle read in at most two units, the larger first. A figure
+/// with no value renders as a dash, and a sandbox with a running session renders
+/// its idle as `active`. A sandbox the kernel is running and hort has no record of
+/// carries the command that collects it under its row. A listing with no sandbox
+/// renders nothing at all, header included.
 pub fn render_ls(entries: &[LsEntry]) -> String {
-    entries
+    if entries.is_empty() {
+        return String::new();
+    }
+    let header = LS_HEADER.map(str::to_string);
+    let rows: Vec<[String; LS_COLUMNS]> = entries.iter().map(render_cells).collect();
+    let widths = column_widths(std::iter::once(&header).chain(&rows));
+    let body: String = entries
         .iter()
-        .map(|entry| format!("{}\n{}", render_line(entry), render_advice(entry)))
-        .collect()
+        .zip(&rows)
+        .map(|(entry, row)| format!("{}\n{}", align(row, &widths), render_advice(entry)))
+        .collect();
+    format!("{}\n{body}", align(&header, &widths))
 }
 
 /// Render the `prune` report for the terminal: the sandboxes it removed, the
@@ -763,26 +774,46 @@ pub fn session_exit_code(wait_status: i32) -> u8 {
     libc::WEXITSTATUS(wait_status) as u8
 }
 
-fn render_line(entry: &LsEntry) -> String {
-    let mut columns = vec![
+const LS_COLUMNS: usize = 8;
+
+/// Upper case because every value a row can hold is lower case, so no label can
+/// be read, or searched for, as the value of a row.
+const LS_HEADER: [&str; LS_COLUMNS] =
+    ["NAME", "STATE", "SESSIONS", "AGE", "IDLE", "GIT", "BRANCH", "DIRTY"];
+
+const COLUMN_GUTTER: &str = "  ";
+
+fn render_cells(entry: &LsEntry) -> [String; LS_COLUMNS] {
+    [
         entry.name.as_str().to_string(),
         state_label(entry.state).to_string(),
         render_sessions(entry.sessions),
         render_duration(entry.age),
         render_idle(entry.idle.as_ref()),
-    ];
-    columns.extend(entry.git.map(render_git));
-    columns.push(render_branch(entry.branch.as_ref()));
-    columns.push(render_dirty(entry.dirty));
-    columns.join("  ")
+        entry.git.map_or(DASH.to_string(), render_git),
+        render_branch(entry.branch.as_ref()),
+        render_dirty(entry.dirty),
+    ]
+}
+
+fn column_widths<'a>(rows: impl Iterator<Item = &'a [String; LS_COLUMNS]>) -> [usize; LS_COLUMNS] {
+    rows.fold([0; LS_COLUMNS], |widths, row| {
+        std::array::from_fn(|column| widths[column].max(row[column].chars().count()))
+    })
+}
+
+/// One line of the listing, each cell padded to the width of its column and none
+/// of that padding left after the last cell, which has no column to line up.
+fn align(row: &[String; LS_COLUMNS], widths: &[usize; LS_COLUMNS]) -> String {
+    let padded: Vec<String> =
+        row.iter().zip(widths).map(|(cell, &width)| format!("{cell:<width$}")).collect();
+    padded.join(COLUMN_GUTTER).trim_end().to_string()
 }
 
 /// How the box was built and, for a clone, whether it holds commits its own
 /// project lacks, in the words `prune` skips such a box with, since it is the
 /// same question. A clone hort could not read says so rather than printing like
-/// one holding nothing, which is the row somebody collects. A row with no mode
-/// to report (no record, no git, or a `/workdir` gone) has no such column at
-/// all, which keeps branch and dirty the last two columns of every row.
+/// one holding nothing, which is the row somebody collects.
 fn render_git(git: WorkdirGit) -> String {
     match git {
         WorkdirGit::Worktree => "worktree".to_string(),
@@ -859,7 +890,7 @@ fn state_label(state: SandboxState) -> &'static str {
 
 fn render_duration(duration: Option<Duration>) -> String {
     match duration {
-        Some(duration) => humantime::format_duration(duration).to_string(),
+        Some(duration) => render_elapsed(duration),
         None => DASH.to_string(),
     }
 }
@@ -867,8 +898,36 @@ fn render_duration(duration: Option<Duration>) -> String {
 fn render_idle(idle: Option<&IdleState>) -> String {
     match idle {
         Some(IdleState::Active) => "active".to_string(),
-        Some(IdleState::Idle(duration)) => humantime::format_duration(*duration).to_string(),
+        Some(IdleState::Idle(duration)) => render_elapsed(*duration),
         None => DASH.to_string(),
+    }
+}
+
+/// The units a listed duration is read in with the seconds each holds, largest
+/// first. The day is the largest because neither a month nor a year has a fixed
+/// number of days.
+const ELAPSED_UNITS: [(u64, &str); 4] = [(86_400, "d"), (3_600, "h"), (60, "m"), (1, "s")];
+
+/// A duration in its largest unit and the one right below it, the second left
+/// out when it is zero, so `1d 0h 5m` reads `1d`. Truncated and never rounded:
+/// `prune --idle` takes a box idle for at least the time it is given, so an idle
+/// time listed as `2h` has to be one `--idle 2h` takes, and the unit letters are
+/// ones `--idle` reads back. A box younger than a second reads `0s`, because a
+/// dash in this column says hort does not know.
+fn render_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    let Some(largest) = ELAPSED_UNITS.iter().position(|&(unit_seconds, _)| seconds >= unit_seconds)
+    else {
+        return "0s".to_string();
+    };
+    let (unit_seconds, unit) = ELAPSED_UNITS[largest];
+    let whole = format!("{}{unit}", seconds / unit_seconds);
+    let remainder = seconds % unit_seconds;
+    match ELAPSED_UNITS.get(largest + 1) {
+        Some(&(below_seconds, below_unit)) if remainder >= below_seconds => {
+            format!("{whole} {}{below_unit}", remainder / below_seconds)
+        }
+        _ => whole,
     }
 }
 
@@ -891,6 +950,7 @@ mod tests {
     use crate::domain::model::{BranchName, Capabilities, CgroupCaps, SandboxName, Warning};
     use crate::domain::prune::{PruneSkip, SkipReason};
     use crate::domain::reconcile::SandboxState;
+    use predicates::prelude::*;
 
     #[test]
     fn render_ls_includes_each_required_column_for_entry() {
@@ -930,8 +990,12 @@ mod tests {
 
         let rendered = render_ls(&[entry]);
 
-        assert!(rendered.contains("lost-record"));
-        assert!(rendered.contains("-"));
+        // Every cell after the session count, read by its place in the row: the
+        // state label and the advice line under it both carry a hyphen, so a
+        // dash searched for anywhere is found whatever the cells say.
+        let nothing_known_past_the_session_count =
+            predicate::str::is_match("(?m)^ghost +lost-record +0( +-)+ *$").unwrap();
+        assert!(nothing_known_past_the_session_count.eval(&rendered), "{rendered}");
     }
 
     #[test]
@@ -984,10 +1048,11 @@ mod tests {
 
         let rendered = render_ls(&[entry]);
 
-        // Every other column of this row is deliberately known, so the only
-        // dash the line can hold is the session count. Printed as a zero it
-        // reads as a box nobody is in, which is a claim hort did not make.
-        assert!(rendered.contains("-"));
+        // Printed as a zero it reads as a box nobody is in, which is a claim hort
+        // did not make. Asked of the cell right after the state, because a dash
+        // anywhere else in the listing would answer a search for one.
+        let unknown_session_count = predicate::str::is_match("(?m)^demo +live +- ").unwrap();
+        assert!(unknown_session_count.eval(&rendered), "{rendered}");
     }
 
     #[test]
@@ -1410,6 +1475,183 @@ mod tests {
         // to collect, and an unread clone printed like an empty one is a yes
         // nobody checked.
         assert_ne!(unread, returned);
+    }
+
+    #[test]
+    fn render_ls_reads_an_age_in_at_most_two_units() {
+        let entry = LsEntry {
+            name: SandboxName::new("demo").unwrap(),
+            state: SandboxState::Live,
+            sessions: Some(1),
+            // The age a real box was listed with: 1 day 19h 47m 41s 372ms 422us 969ns.
+            age: Some(Duration::new(157_661, 372_422_969)),
+            idle: Some(IdleState::Active),
+            branch: Some(BranchName::new("demo").unwrap()),
+            dirty: Some(false),
+            git: Some(WorkdirGit::Worktree),
+        };
+
+        let rendered = render_ls(&[entry]);
+
+        // This column exists so a forgotten box gets noticed, and nine words of
+        // it are read by nobody. The minutes are what a third unit would print.
+        assert!(!rendered.contains("47m"), "{rendered}");
+        assert!(rendered.contains("1d 19h"), "{rendered}");
+    }
+
+    #[test]
+    fn render_ls_reads_an_idle_time_in_at_most_two_units() {
+        let entry = LsEntry {
+            name: SandboxName::new("demo").unwrap(),
+            state: SandboxState::Orphaned,
+            sessions: Some(0),
+            age: Some(Duration::from_secs(172_800)),
+            // The idle time the same box was listed with: 1 day 17h 11m 54s 904ms 591us 660ns.
+            idle: Some(IdleState::Idle(Duration::new(148_314, 904_591_660))),
+            branch: Some(BranchName::new("demo").unwrap()),
+            dirty: Some(false),
+            git: Some(WorkdirGit::Worktree),
+        };
+
+        let rendered = render_ls(&[entry]);
+
+        assert!(!rendered.contains("11m"), "{rendered}");
+        assert!(rendered.contains("1d 17h"), "{rendered}");
+    }
+
+    #[test]
+    fn render_ls_reads_a_duration_under_a_minute_in_whole_seconds() {
+        let entry = LsEntry {
+            name: SandboxName::new("demo").unwrap(),
+            state: SandboxState::Live,
+            sessions: Some(1),
+            age: Some(Duration::new(42, 900_000_000)),
+            idle: Some(IdleState::Active),
+            branch: Some(BranchName::new("demo").unwrap()),
+            dirty: Some(false),
+            git: Some(WorkdirGit::Worktree),
+        };
+
+        let rendered = render_ls(&[entry]);
+
+        // Two units would still allow the milliseconds here, which is why the
+        // second is a floor of its own and not a consequence of the unit count.
+        assert!(rendered.contains("42s"), "{rendered}");
+        assert!(!rendered.contains("900ms"), "{rendered}");
+    }
+
+    #[test]
+    fn render_ls_reads_a_box_younger_than_a_second_as_zero_seconds() {
+        let entry = LsEntry {
+            name: SandboxName::new("demo").unwrap(),
+            state: SandboxState::Live,
+            sessions: Some(1),
+            age: Some(Duration::new(0, 255_702_705)),
+            idle: Some(IdleState::Active),
+            branch: Some(BranchName::new("demo").unwrap()),
+            dirty: Some(false),
+            git: Some(WorkdirGit::Worktree),
+        };
+
+        let rendered = render_ls(&[entry]);
+
+        // Spaced on both sides so that a 10s or a 20s cannot answer for it.
+        assert!(rendered.contains(" 0s "), "{rendered}");
+    }
+
+    #[test]
+    fn render_ls_opens_with_a_header_naming_each_column() {
+        let entry = LsEntry {
+            name: SandboxName::new("demo").unwrap(),
+            state: SandboxState::Live,
+            sessions: Some(1),
+            age: Some(Duration::from_secs(3600)),
+            idle: Some(IdleState::Active),
+            branch: Some(BranchName::new("demo").unwrap()),
+            dirty: Some(false),
+            git: Some(WorkdirGit::Worktree),
+        };
+
+        let rendered = render_ls(&[entry]);
+
+        // Upper case on purpose: every value a row can hold is lower case, so no
+        // label can answer a search for a value, `dirty` above all.
+        assert!(rendered.starts_with("NAME"), "{rendered}");
+        assert!(rendered.contains("STATE"), "{rendered}");
+        assert!(rendered.contains("SESSIONS"), "{rendered}");
+        assert!(rendered.contains("AGE"), "{rendered}");
+        assert!(rendered.contains("IDLE"), "{rendered}");
+        assert!(rendered.contains("GIT"), "{rendered}");
+        assert!(rendered.contains("BRANCH"), "{rendered}");
+        assert!(rendered.contains("DIRTY"), "{rendered}");
+    }
+
+    #[test]
+    fn render_ls_aligns_every_column_under_its_header() {
+        let short = LsEntry {
+            name: SandboxName::new("web").unwrap(),
+            state: SandboxState::Live,
+            sessions: Some(1),
+            age: Some(Duration::from_secs(3600)),
+            idle: Some(IdleState::Active),
+            branch: Some(BranchName::new("web").unwrap()),
+            dirty: Some(true),
+            git: Some(WorkdirGit::Worktree),
+        };
+        let long = LsEntry {
+            name: SandboxName::new("api-test").unwrap(),
+            state: SandboxState::Orphaned,
+            sessions: Some(0),
+            age: Some(Duration::from_secs(71_261)),
+            idle: Some(IdleState::Idle(Duration::from_secs(61_914))),
+            branch: Some(BranchName::new("feature/login").unwrap()),
+            dirty: None,
+            git: Some(WorkdirGit::Clone { unreturned: Some(false) }),
+        };
+
+        let rendered = render_ls(&[short, long]);
+
+        // The two rows differ in width in every column, and the header is the
+        // widest cell of some columns and the narrowest of others, so a layout
+        // that aligns any column by accident still misses this literal.
+        assert_eq!(
+            rendered,
+            concat!(
+                "NAME      STATE     SESSIONS  AGE      IDLE     GIT       BRANCH         DIRTY\n",
+                "web       live      1         1h       active   worktree  web            dirty\n",
+                "api-test  orphaned  0         19h 47m  17h 11m  clone     feature/login  -\n",
+            )
+        );
+    }
+
+    #[test]
+    fn render_ls_renders_an_absent_git_mode_as_a_dash_in_its_column() {
+        let entry = LsEntry {
+            name: SandboxName::new("demo").unwrap(),
+            state: SandboxState::Inconsistent,
+            sessions: Some(0),
+            age: Some(Duration::from_secs(3600)),
+            idle: Some(IdleState::Idle(Duration::from_secs(300))),
+            branch: Some(BranchName::new("demo").unwrap()),
+            dirty: None,
+            git: None,
+        };
+
+        let rendered = render_ls(&[entry]);
+
+        // A row that drops a cell moves every cell after it out from under its
+        // header, so the absent mode is a dash between the idle and the branch.
+        let dash_between_idle_and_branch = predicate::str::is_match("5m +- +demo").unwrap();
+        assert!(dash_between_idle_and_branch.eval(&rendered), "{rendered}");
+    }
+
+    #[test]
+    fn render_ls_prints_nothing_for_an_empty_listing() {
+        let rendered = render_ls(&[]);
+
+        // A header over no rows is a line of noise on the one screen where
+        // having nothing to say is the whole answer.
+        assert_eq!(rendered, "");
     }
 
     #[test]
