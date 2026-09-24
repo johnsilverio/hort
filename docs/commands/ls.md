@@ -11,36 +11,37 @@ Options:
 
 ## Output
 
-One line per sandbox, from every project, with no header:
+A header naming each column, then one line per sandbox, from every project:
 
 ```console
 $ hort ls
-fix-login  live  2  41m 3s 211ms 802us 45ns  active  worktree  fix-login  dirty
-pr-bot  live  1  2h 5m 12s 9ms 311us 4ns  active  clone, work only in the box  pr-bot  -
-notes  live  0  35s 73ms 521us 360ns  15s 535ms 72us 847ns  -  -
-old-spike  orphaned  0  2days 3h 4m 10s 5ms 1us 7ns  2days 2h 58m 1s 3ms 2us 9ns  worktree  old-spike  clean
-ghost  lost-record  0  -  -  -  -
+NAME       STATE        SESSIONS  AGE     IDLE    GIT                          BRANCH     DIRTY
+old-spike  orphaned     0         2d 3h   2d 2h   worktree                     old-spike  clean
+notes      live         0         35s     15s     -                            -          -
+pr-bot     live         1         2h 5m   active  clone, work only in the box  pr-bot     -
+fix-login  live         2         41m 3s  active  worktree                     fix-login  dirty
+ghost      lost-record  0         -       -       -                            -          -
     running with no record on disk; run 'hort down ghost' to stop its container and host-side helpers
 ```
 
-The columns, separated by two spaces:
+Each column is aligned under its name in the header:
 
-| # | Column | Meaning |
-| :--- | :--- | :--- |
-| 1 | name | The sandbox name. |
-| 2 | state | `live`, `orphaned`, `inconsistent` or `lost-record`. See [States](../concepts.md#states-in-hort-ls). |
-| 3 | sessions | Processes running in the sandbox besides its anchor. One shell running one command counts as 2. |
-| 4 | age | Time since `hort up` built it. |
-| 5 | idle | `active` while anything runs inside; otherwise time since the latest of creation, last attach and last announced completion. |
-| 6 | git mode | How the sandbox was built: `worktree`, or for a [clone-mode](../git-modes.md) sandbox `clone` when the project's repository has every commit in it, `clone, work only in the box` when the clone holds commits it does not, and `clone, work unknown` when hort could not tell. Absent when there is no mode to report: a `lost-record` row, a project without git, or a sandbox whose worktree or clone is gone. |
-| 7 | branch | The sandbox's branch, or `-` without git. |
-| 8 | dirty | `dirty` if the worktree has uncommitted changes, `clean` if not. Always `-` for a [clone-mode](../git-modes.md) sandbox, whose `/workdir` is a clone rather than a worktree of your repository. |
+| Column | Meaning |
+| :--- | :--- |
+| `NAME` | The sandbox name. |
+| `STATE` | `live`, `orphaned`, `inconsistent` or `lost-record`. See [States](../concepts.md#states-in-hort-ls). |
+| `SESSIONS` | Processes running in the sandbox besides its anchor. One shell running one command counts as 2. |
+| `AGE` | Time since `hort up` built it. |
+| `IDLE` | `active` while anything runs inside; otherwise time since the latest of creation, last attach and last announced completion. |
+| `GIT` | How the sandbox was built: `worktree`, or for a [clone-mode](../git-modes.md) sandbox `clone` when the project's repository has every commit in it, `clone, work only in the box` when the clone holds commits it does not, and `clone, work unknown` when hort could not tell. `-` when there is no mode to report: a `lost-record` row, a project without git, or a sandbox whose worktree or clone is gone. |
+| `BRANCH` | The sandbox's branch, or `-` without git. |
+| `DIRTY` | `dirty` if the worktree has uncommitted changes, `clean` if not. Always `-` for a [clone-mode](../git-modes.md) sandbox, whose `/workdir` is a clone rather than a worktree of your repository. |
 
-A `-` means hort could not tell: there is no record to read (a `lost-record` row), the project has no git (branch and dirty), the sandbox is in clone mode (dirty), the worktree is gone, or hort could not read the sandbox's process list (sessions, and idle with it). hort shows `-` rather than guessing.
+A `-` means hort could not tell: there is no record to read (a `lost-record` row), the project has no git (git mode, branch and dirty), the sandbox is in clone mode (dirty), the worktree is gone, or hort could not read the sandbox's process list (sessions, and idle with it). hort shows `-` rather than guessing.
 
 A `lost-record` row is followed by an indented line with the command that collects it.
 
-Durations are printed at full precision, down to nanoseconds.
+Age and idle are printed in at most two units, the larger first (`2d 3h`, `41m 3s`), and are rounded down, never up, so an idle time `ls` shows is one [`hort prune --idle`](prune.md) accepts back: a sandbox listed idle `2d 2h` is idle long enough for `hort prune --idle "2d 2h"`. A sandbox younger than a second shows `0s`.
 
 ## Behaviour
 

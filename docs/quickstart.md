@@ -76,7 +76,8 @@ Each `attach` is a new shell in the same sandbox, seeing the same files. Run a s
 
 ```console
 $ hort ls
-fix-login  live  2  41m 3s 211ms 802us 45ns  active  worktree  fix-login  dirty
+NAME       STATE  SESSIONS  AGE     IDLE    GIT       BRANCH     DIRTY
+fix-login  live   2         41m 3s  active  worktree  fix-login  dirty
 ```
 
 The columns are name, state, sessions (processes running in the box besides its idle anchor), age, idle time (`active` while anything runs), git mode (`worktree` here), branch, and whether the worktree has uncommitted changes. See [hort ls](commands/ls.md).

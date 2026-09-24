@@ -69,7 +69,7 @@ hort only builds a sandbox for a **project**. Starting from the directory you ru
 
 If the project is inside a git repository, you get the worktree and branch described above. If it is not (a folder marked only by a `.hort.json` or a devcontainer file), hort mounts **the project folder itself** at `/workdir`:
 
-- there is no branch and no worktree, so `ls` shows `-` for branch and dirty state;
+- there is no branch and no worktree, so `ls` shows `-` for git mode, branch and dirty state;
 - the agent writes directly into your folder;
 - `--branch` is refused;
 - `hort down` removes the container and the record, and **never** your folder.
