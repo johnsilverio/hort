@@ -3964,6 +3964,59 @@ fn cli_a_host_loopback_port_an_open_sandbox_did_not_declare_is_refused() {
         .success();
 }
 
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_a_host_loopback_port_an_open_sandbox_did_not_declare_does_not_answer_at_its_gateway() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let undeclared = a_host_service_answering(UNDECLARED_BANNER);
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", sandbox.name().as_str()])
+        .assert()
+        .success();
+
+    let gateway = gateway_reported_to(&sandbox.sandbox_dir());
+    // pasta hands the namespace a router, and left to its defaults it makes that
+    // address stand for the host's own loopback, a second way to every service
+    // there that no declaration governs. Once it no longer does, what comes back
+    // is up to whatever router really is at that address: a refusal, a wait, or
+    // even a connection, so only the banner, which nothing but the undeclared
+    // service says, tells the service answering from something answering. The
+    // status is read for one thing only, that the dial happened: a shell that
+    // never found the tool answers 127, and its silence would be no claim.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["run", sandbox.name().as_str(), "--", "sh", "-c"])
+        .arg(format!("nc -w 5 {gateway} {undeclared} < /dev/null; echo gateway=$?"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(UNDECLARED_BANNER.trim()).not())
+        .stdout(predicate::str::contains("gateway="))
+        .stdout(predicate::str::contains("gateway=127").not());
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", sandbox.name().as_str()])
+        .assert()
+        .success();
+}
+
 /// A banner nothing on this machine but the undeclared service below answers
 /// with, so a transcript that carries it says where it came from.
 const UNDECLARED_BANNER: &str = "the-undeclared-service-answered\n";

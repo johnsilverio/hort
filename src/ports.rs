@@ -520,9 +520,12 @@ pub struct NetworkSpec {
     pub resolver: Option<String>,
 }
 
-/// One declared database destination, realized as a single forward to this
-/// `host:port` through pasta's host gateway. The config's host-vs-network mode is
-/// informational and both are realized identically, so it does not survive here.
+/// One declared database destination, reached from inside the sandbox at its own
+/// loopback on this port. pasta splices that port to the host's loopback, where
+/// either the database itself answers or, for one living anywhere else, a
+/// forwarder on the host dials this `host:port`. The config's host-vs-network
+/// mode is informational and both are realized identically, so it does not
+/// survive here.
 pub struct DbForward {
     pub host: String,
     pub port: u16,

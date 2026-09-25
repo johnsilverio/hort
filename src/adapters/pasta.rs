@@ -3,13 +3,22 @@
 //! host. pasta provides connectivity and filters nothing; what closes an
 //! allowlist sandbox is the shape of the namespace it runs in.
 //!
-//! Both postures splice the sandbox's loopback to the host's on the declared
-//! ports and no others, so `127.0.0.1` inside a sandbox means what the project
-//! declared. Open posture also asks pasta to configure the namespace and to
-//! answer at the address the sandbox looks names up at, and filters nothing on
-//! the way out. An allowlist keeps pasta from mapping the host's loopback, adds
-//! the proxy's port to the splice, and then empties the namespace's route tables
-//! in both address families, which leaves `127.0.0.1:<declared port>` as the only
+//! Both postures ask pasta to configure the namespace and splice the sandbox's
+//! loopback to the host's on the declared ports and no others, so `127.0.0.1`
+//! inside a sandbox means what the project declared. Both also keep pasta from
+//! mapping the host's loopback to the router address it hands the namespace:
+//! left mapped, that address is a second way to every service listening on the
+//! host's loopback, one no declaration governs.
+//!
+//! Open posture adds the address the sandbox looks names up at, and filters
+//! nothing on the way out. So a host service listening on every interface,
+//! rather than on the loopback alone, is still reachable at the host's other
+//! addresses, a container bridge's among them: nothing here tells those apart
+//! from any other destination.
+//!
+//! An allowlist also keeps pasta from mapping the host's own address, adds the
+//! proxy's port to the splice, and then empties the namespace's route tables in
+//! both address families, which leaves `127.0.0.1:<declared port>` as the only
 //! address the sandbox can reach.
 //! Emptying one family alone is the trap to avoid: a surviving IPv6 default route
 //! carries traffic straight out of a namespace that looks closed.
@@ -224,15 +233,18 @@ fn pasta_arguments(
         argument(&spec.netns),
         "--config-net".to_string(),
         "--no-netns-quit".to_string(),
+        // Left mapped, the address pasta hands the namespace as its router stands
+        // for the host's own loopback, so every service listening there answers
+        // at it, declared or not, in either posture.
+        "--map-host-loopback".to_string(),
+        NO_PORTS.to_string(),
     ];
 
+    // Unmapping the host's own address as well was measured to change nothing a
+    // sandbox can reach, so only the posture that holds a sandbox to a list
+    // spells it out.
     if matches!(spec.egress, EgressPolicy::Allowlist(_)) {
-        arguments.extend([
-            "--map-host-loopback".to_string(),
-            NO_PORTS.to_string(),
-            "--map-guest-addr".to_string(),
-            NO_PORTS.to_string(),
-        ]);
+        arguments.extend(["--map-guest-addr".to_string(), NO_PORTS.to_string()]);
     }
     // Always explicit, even with nothing to splice: left out, pasta scans for
     // ports on its own and skips the range the kernel hands out, so what the
@@ -511,11 +523,16 @@ mod tests {
         // What `--no-netns-quit` gives up is pasta watching the directory of the
         // namespace file so it can leave when the file goes away. It cannot watch
         // one under /proc anyway, and without the flag it refuses to start.
-        // No mapping flag belongs here, since open mode is unfiltered by contract,
-        // but the forwarding flag does, even with nothing to forward. Left out,
-        // pasta falls back to scanning for ports on its own, and on some hosts
-        // that scan splices nothing at all, so what the sandbox's loopback reaches
-        // would depend on the host rather than on what the project declared.
+        // The host's loopback is unmapped here exactly as under an allowlist:
+        // left mapped, the address pasta hands the namespace as its router stands
+        // for the host's own loopback, and every service there answers at it,
+        // declared or not. The mapping of the host's own address that an allowlist
+        // also turns off stays as pasta has it, because turning it off changes
+        // nothing a sandbox can reach. The forwarding flag is here even with
+        // nothing to forward: left out, pasta scans for ports on its own and skips
+        // the range the kernel hands out, so what the sandbox's loopback reaches
+        // would depend on which port a service landed on rather than on what the
+        // project declared.
         assert_eq!(
             arguments,
             [
@@ -525,6 +542,8 @@ mod tests {
                 "/proc/1234/ns/net",
                 "--config-net",
                 "--no-netns-quit",
+                "--map-host-loopback",
+                "none",
                 "-T",
                 "none",
                 "-P",
@@ -553,6 +572,8 @@ mod tests {
                 "/proc/1234/ns/net",
                 "--config-net",
                 "--no-netns-quit",
+                "--map-host-loopback",
+                "none",
                 "-T",
                 "5432,6379",
                 "-P",
@@ -675,6 +696,8 @@ mod tests {
                 "/proc/1234/ns/net",
                 "--config-net",
                 "--no-netns-quit",
+                "--map-host-loopback",
+                "none",
                 "-T",
                 "none",
                 "--dns-forward",
