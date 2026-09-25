@@ -4,14 +4,17 @@ Every sandbox has its own network namespace, bridged to the host by [`pasta`](ht
 
 ## Open egress (the default)
 
-With `egress` absent or `true`, the sandbox reaches whatever your host reaches. Nothing is filtered and no proxy runs. This is what most agents need out of the box: they talk to their model provider directly.
+With `egress` absent or `true`, the sandbox reaches the internet and your network the way your host does, with one exception: your host's loopback interface, where it reaches only the databases you declared. Outbound traffic is not filtered and no proxy runs. This is what most agents need out of the box: they talk to their model provider directly.
 
 - **Name resolution** works: hort writes an `/etc/resolv.conf` into the sandbox naming `198.51.100.53`, and pasta answers that address by forwarding the query to your host's resolver.
 - **Only declared databases answer at `127.0.0.1`** inside the sandbox. A database listening on `127.0.0.1:5432` on your host answers on `127.0.0.1:5432` inside the box once it is [declared](#databases); a host service nobody declared is refused there, whatever its port.
-- **Services on the host's loopback are still reachable** at the address of the sandbox's default gateway (inside the box, the `Gateway` column of the default route in `/proc/net/route`, written in reversed hex: `01B012AC` is `172.18.176.1`), declared or not. Closing that interface without changing the whole posture is [planned](roadmap.md#closing-the-hosts-loopback-to-an-open-sandbox).
+- **The default gateway is not a way into your host.** The sandbox's default gateway is your host's own (inside the box, the `Gateway` column of the default route in `/proc/net/route`, written in reversed hex: `01B012AC` is `172.18.176.1`), and a service listening only on your host's loopback does not answer at that address, declared or not. What answers there is what answers your host at that address, usually your router.
+- **A host service listening on every interface is still reachable** at your host's other addresses, such as a Docker or Compose bridge (`172.17.0.1` for Docker's default one). A port that Docker or Compose publishes without an address, as in `ports: ["5432:5432"]`, listens on every interface. Open egress does not filter destinations, so hort leaves these reachable. To close one, publish it on `127.0.0.1` only (`"127.0.0.1:5432:5432"`) and [declare](#databases) it if the project needs it, or use an [allowlist](#an-egress-allowlist). Your host's main address is not one of these: inside the sandbox that address is the sandbox's own.
 - **No proxy variables** are set.
 
-Open egress does not prevent exfiltration. A hostile repository could send data anywhere, including to services on your host's loopback. See the [Security model](security.md).
+If a tool in the sandbox used to reach a service on your host at the gateway address, declare that service under [`network`](#databases), which takes any TCP service and not only a database, and point the tool at `127.0.0.1:<port>`. A sandbox built by an earlier version of hort keeps its old wiring until you rebuild it with `hort down <name>` and `hort up <name>`; commit what you want to keep first.
+
+Open egress does not prevent exfiltration. A hostile repository could send data anywhere the sandbox reaches, including a service on your host that listens on every interface. See the [Security model](security.md).
 
 ## An egress allowlist
 
@@ -117,7 +120,7 @@ Inside the sandbox, **every declared database is reached at `127.0.0.1:<port>`**
 
 A database on the host's loopback is reached directly. For any other address, hort starts a small forwarder on the host listening on `127.0.0.1:<port>` and relaying to the declared address, so that port must be free on your host's loopback.
 
-In both postures, only declared databases appear at `127.0.0.1:<port>`: an undeclared service on your host's loopback is refused there. Under an allowlist, only declared databases are reachable at all. Under open egress the host's loopback also answers at the sandbox's gateway address (see [Open egress](#open-egress-the-default)); an allowlist closes that address, so point your application at `127.0.0.1:<port>`, which works in both.
+In both postures, only declared databases appear at `127.0.0.1:<port>`, and that is the only way into your host's loopback: an undeclared service there is refused at `127.0.0.1` and does not answer at the sandbox's gateway address either. Under an allowlist, only declared databases are reachable at all. Point your application at `127.0.0.1:<port>`, which works in both.
 
 Two databases declared on the **same port** at different addresses cannot both be reached, because inside the sandbox both would be `127.0.0.1:<port>`. `hort up` refuses such a configuration before it builds or changes anything:
 

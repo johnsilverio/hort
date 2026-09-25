@@ -53,7 +53,9 @@ What clone mode does change is where a credential lives. If you want the agent t
 
 ### Exfiltration under open egress
 
-By default a sandbox has open network access, because agents need to reach their model provider. A hostile repository, or an agent tricked by a prompt injection, can send anything it can read to any server. That includes services listening on your host's loopback interface: from inside an open sandbox the declared databases answer at `127.0.0.1`, and every service there, declared or not, answers at the address of the sandbox's default gateway. Today an allowlist is what closes that interface; closing it on its own is [planned](roadmap.md#closing-the-hosts-loopback-to-an-open-sandbox).
+By default a sandbox has open network access, because agents need to reach their model provider. A hostile repository, or an agent tricked by a prompt injection, can send anything it can read to any server it can reach.
+
+Your host's loopback interface is closed to an open sandbox except for the databases you declared, which answer at `127.0.0.1`; an undeclared service there answers neither at `127.0.0.1` nor at the sandbox's default gateway. A service on your host that listens on **every** interface is a different case: it stays reachable at your host's other addresses, such as a Docker or Compose bridge, and a port Docker or Compose publishes without an address listens exactly like that. Publish such services on `127.0.0.1` and declare the ones the project needs, or use an allowlist, under which only the declared databases are reachable. Details are in [Networking and egress](networking.md#open-egress-the-default).
 
 ### What you mount into the box
 

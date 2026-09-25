@@ -147,7 +147,7 @@ The sandbox's `/etc/resolv.conf` should say `nameserver 198.51.100.53`. If a pro
 
 ### A database is unreachable
 
-Inside the sandbox, use `127.0.0.1:<port>`, never the host's own address. Under an allowlist, the database must be declared in `network`; declaring it later needs `hort down` and `hort up`. See [Databases](networking.md#databases).
+Inside the sandbox, use `127.0.0.1:<port>`, never the host's own address. In either posture, a database answers there only once it is declared in `network`; declaring it later needs `hort down` and `hort up`. See [Databases](networking.md#databases).
 
 ### My shell session disappeared
 

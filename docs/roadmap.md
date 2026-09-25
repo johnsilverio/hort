@@ -2,10 +2,6 @@
 
 This page lists work that has been decided but is **not available yet**. It describes what you will be able to do, not when: there are no dates and no promised order, and any of it may change. Everything else in this book describes hort as it works today.
 
-## Closing the host's loopback to an open sandbox
-
-Today an open sandbox reaches every service listening on your host's `127.0.0.1`: a development database, a cache with no password, an admin panel a project left running. That is the default mapping of the network helper, and hort unmaps it only under an [allowlist](networking.md#an-egress-allowlist), so the only way to close it is to change the whole egress posture. Planned: an open sandbox reaches the host's loopback only at the ports its [declared databases](networking.md#databases) name, and the rest of that interface is closed unless you ask for it.
-
 ## Preparing a rootfs with hort itself
 
 Today you build a rootfs, export it into a directory and fix the mode of its `/workdir` by hand ([Preparing a rootfs](rootfs.md#building-one-from-a-dockerfile)), and a forgotten final `chmod` makes `hort up` refuse the directory after all that work. Planned: `hort rootfs import` takes the tarball `podman export` or `docker export` writes, unpacks it into a directory of its own, sets the mode `/workdir` needs, checks it against [what a rootfs must provide](rootfs.md#what-a-rootfs-must-provide) and records the path in your configuration.

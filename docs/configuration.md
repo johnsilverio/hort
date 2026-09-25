@@ -205,7 +205,7 @@ Databases and other TCP services the sandbox should reach. Every entry is reacha
 
 | Value | Meaning |
 | :--- | :--- |
-| absent or `true` | Open: the sandbox reaches whatever the host reaches, no proxy. |
+| absent or `true` | Open: the sandbox reaches whatever the host reaches except the host's loopback, where only declared `network` entries answer; no proxy. |
 | `{ "allow": ["host", "*.domain"] }` | Allowlist: only these hosts, over HTTPS, through a proxy; plus declared `network` entries. |
 | `false` | An empty allowlist: no host at all; declared `network` entries still reachable. |
 
