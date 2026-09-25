@@ -4820,3 +4820,131 @@ fn cli_an_agent_commits_inside_a_clone_mode_sandbox_and_the_host_repository_is_u
         .assert()
         .success();
 }
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs carrying git (HORT_TEST_ROOTFS) and pasta"]
+fn cli_down_without_a_terminal_refuses_to_destroy_a_commit_only_the_clone_holds() {
+    let Some(rootfs) = rootfs_carrying_git() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    // Where both teardowns below are run from: another project's repository,
+    // which is where somebody cleaning up sandboxes is as likely to be standing
+    // as in this one. A check that asked the repository it runs in, instead of
+    // the project the sandbox was built from, never finds the returned commit
+    // there and keeps refusing.
+    let (_elsewhere, another_project) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+    let name = sandbox.name().as_str();
+    let bundle = sandbox.state_dir().join(format!("worktree-{name}")).join("work.bundle");
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", "--git", "clone", name])
+        .assert()
+        .success();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["run", name, "--", "sh", "-c", "echo 'work the agent did' >> /workdir/README.md"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args([
+            "run",
+            name,
+            "--",
+            "git",
+            "-c",
+            "user.name=hort agent",
+            "-c",
+            "user.email=agent@hort.invalid",
+            "commit",
+            "-am",
+            "committed from inside the box",
+        ])
+        .assert()
+        .success();
+
+    // The commit exists in the clone and nowhere else, so tearing the box down
+    // would leave it existing nowhere at all. There is no terminal here to ask
+    // at, so `down` has to refuse, and the commit has to still be where the
+    // agent left it once it has. Reading it back through `run` also says the
+    // box is still running, because `run` refuses one that is not.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&another_project)
+        .args(["down", name])
+        .assert()
+        .code(1)
+        .stderr(
+            "refusing to down without confirmation: stdin is not a TTY (pass --force to proceed)\n",
+        );
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["run", name, "--", "git", "-C", "/workdir", "log", "-1", "--format=%s"])
+        .assert()
+        .success()
+        .stdout("committed from inside the box\n");
+
+    // Those words, byte for byte, are also what an open session gets, and what
+    // a clone gets when hort cannot tell whether the host repository has its
+    // commits. On their own they would pass on a build that never looks for the
+    // commit at all, as long as one of those two refused first. Taking the work
+    // out to the host repository, through a bundle made inside the box where the
+    // borrowed history resolves, changes the one fact this refusal is about and
+    // neither of the others, so the same `down` going through afterwards is what
+    // says the first one stopped for the commit.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args([
+            "run",
+            name,
+            "--",
+            "git",
+            "-C",
+            "/workdir",
+            "bundle",
+            "create",
+            "/workdir/work.bundle",
+            name,
+        ])
+        .assert()
+        .success();
+    git(&repo_path, &["fetch", bundle.to_str().unwrap(), &format!("{name}:refs/hort/incoming")]);
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&another_project)
+        .args(["down", name])
+        .assert()
+        .success();
+}
