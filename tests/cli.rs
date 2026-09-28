@@ -5001,3 +5001,77 @@ fn cli_down_without_a_terminal_refuses_to_destroy_a_commit_only_the_clone_holds(
         .assert()
         .success();
 }
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs carrying git (HORT_TEST_ROOTFS) and pasta"]
+fn cli_ls_does_not_run_on_the_host_the_fsmonitor_an_agent_configured_in_its_clone() {
+    let Some(rootfs) = rootfs_carrying_git() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    // Under the host's `/tmp`, which the box never sees: it mounts a fresh
+    // tmpfs there, so the marker can only appear here if the hook ran on the
+    // host.
+    let witness = TempDir::new().unwrap();
+    let marker = witness.path().join("agent-code-ran");
+    let sandbox = ScratchSandbox::new();
+    let name = sandbox.name().as_str();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", "--git", "clone", name])
+        .assert()
+        .success();
+
+    // The agent writes a hook into its own repository and names it as the
+    // fsmonitor by a path relative to the worktree, which resolves on whichever
+    // side of the box git runs from there. Setting it runs no fsmonitor, so
+    // nothing in the box ever runs the hook.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args([
+            "run",
+            name,
+            "--",
+            "sh",
+            "-c",
+            &format!(
+                "printf '#!/bin/sh\\ntouch {}\\n' > /workdir/.git/hook.sh && chmod +x /workdir/.git/hook.sh && git -C /workdir config core.fsmonitor .git/hook.sh",
+                marker.display()
+            ),
+        ])
+        .assert()
+        .success();
+
+    // The clone's worktree is untouched, so the listing has a verdict to give.
+    // A listing that shows no verdict never read the clone, and then no hook
+    // running says nothing about how it would have read it.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .arg("ls")
+        .assert()
+        .success()
+        .stdout(predicate::str::is_match(format!("(?m) {name} +clean *$")).unwrap());
+    assert!(!marker.exists(), "the fsmonitor the agent configured ran on the host");
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", name])
+        .assert()
+        .success();
+}

@@ -38,13 +38,15 @@ impl GitWorktreeProvider {
         Self { repo_dir, state_root }
     }
 
+    /// The directory holding one sandbox's state, `<state_root>/sandboxes/<name>`.
+    fn sandbox_dir(&self, name: &SandboxName) -> PathBuf {
+        self.state_root.join("sandboxes").join(name.as_str())
+    }
+
     /// The on-disk worktree path for a sandbox, derived from the per-sandbox
     /// state layout `<state_root>/sandboxes/<name>/worktree-<name>`.
     fn worktree_path(&self, name: &SandboxName) -> PathBuf {
-        self.state_root
-            .join("sandboxes")
-            .join(name.as_str())
-            .join(format!("worktree-{}", name.as_str()))
+        self.sandbox_dir(name).join(format!("worktree-{}", name.as_str()))
     }
 
     /// The administrative directory the repository at `project` keeps on the
@@ -304,6 +306,9 @@ impl WorktreeProvider for GitWorktreeProvider {
 
     fn is_dirty(&self, name: &SandboxName, project: &Path) -> Result<bool, HortError> {
         let worktree = self.worktree_path(name);
+        if self.git_mode_at(&worktree) == Some(GitMode::Clone) {
+            return clone_is_dirty(&worktree, &self.sandbox_dir(name), project);
+        }
         let admin = Self::worktree_admin_dir(project, &worktree)?;
         let admin_arg = admin.to_string_lossy();
         let worktree_arg = worktree.to_string_lossy();
@@ -373,6 +378,108 @@ fn run(dir: &Path, op: &str, args: &[&str]) -> Result<String, HortError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Whether the clone at `clone` holds uncommitted changes, read from the host
+/// without obeying anything the box wrote.
+///
+/// The clone's `.git` is a directory the box writes, configuration included,
+/// and a status run there runs whatever that configuration names, such as an
+/// fsmonitor or a filter bound to a tracked file. So the clone is read as data
+/// only, its index and its objects, through a git directory of hort's own that
+/// holds nothing but the commit the clone stands on and no configuration at
+/// all. The system and global configuration are shut out too: a filter driver
+/// the user defined globally would otherwise run on content the box wrote, as
+/// soon as an attributes file the box also wrote names it. Only the tip is
+/// resolved inside the clone, the way `holds_unreturned_work` resolves it,
+/// because resolving a ref runs nothing the configuration names.
+///
+/// A gitlink in the index cannot be answered either way. Status runs git inside
+/// a submodule under the configuration the box gave it, and ignoring submodules
+/// hides a gitlink the box just added, so a clone holding one reads unknown.
+/// Submodules stay ignored in the status read regardless, so a gitlink staged
+/// between the two reads is missed rather than entered.
+///
+/// The objects the clone borrows are lent from `project`, the store the box
+/// gets by mount, because the path the clone records is one only the box has.
+fn clone_is_dirty(clone: &Path, sandbox_dir: &Path, project: &Path) -> Result<bool, HortError> {
+    let tip = run(clone, "rev-parse", &["rev-parse", "HEAD"])?;
+    let read = CloneRead::begin(sandbox_dir, tip.trim(), clone, project)?;
+    let staged = read.git("ls-files", &["ls-files", "--stage"])?;
+    if staged.lines().any(|entry| entry.starts_with("160000 ")) {
+        return Err(HortError::GitCommandFailed {
+            detail: "status: the clone records a submodule, which the host does not enter"
+                .to_string(),
+        });
+    }
+    let porcelain = read.git("status", &["status", "--porcelain", "--ignore-submodules=all"])?;
+    Ok(!porcelain.trim().is_empty())
+}
+
+/// One read of a clone, through a git directory hort writes for it and removes
+/// when the read ends, however it ends. That directory lives in the sandbox's
+/// own state directory, beside the clone and never inside it, because the box
+/// cannot write there, and it carries the reading process's id because two
+/// listings can read the same clone at once.
+struct CloneRead<'a> {
+    git_dir: PathBuf,
+    clone: &'a Path,
+    project: &'a Path,
+}
+
+impl<'a> CloneRead<'a> {
+    fn begin(
+        sandbox_dir: &Path,
+        tip: &str,
+        clone: &'a Path,
+        project: &'a Path,
+    ) -> Result<Self, HortError> {
+        let failed = |err: std::io::Error| HortError::GitCommandFailed {
+            detail: format!("clone status directory: {err}"),
+        };
+        let git_dir = sandbox_dir.join(format!("clone-status-{}", std::process::id()));
+        std::fs::create_dir(&git_dir).map_err(failed)?;
+        let read = Self { git_dir, clone, project };
+        std::fs::create_dir(read.git_dir.join("refs")).map_err(failed)?;
+        std::fs::write(read.git_dir.join("HEAD"), format!("{tip}\n")).map_err(failed)?;
+        Ok(read)
+    }
+
+    /// Run git against the clone through this read's git directory and require
+    /// success. Optional locks are off, because the index is the box's and a
+    /// refresh written back from the host would take the lock the box's own git
+    /// needs.
+    fn git(&self, op: &str, args: &[&str]) -> Result<String, HortError> {
+        let dot_git = self.clone.join(".git");
+        let output = Command::new("git")
+            .arg("--no-optional-locks")
+            .arg("--git-dir")
+            .arg(&self.git_dir)
+            .arg("--work-tree")
+            .arg(self.clone)
+            .args(args)
+            .env("GIT_INDEX_FILE", dot_git.join("index"))
+            .env("GIT_OBJECT_DIRECTORY", dot_git.join("objects"))
+            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", self.project.join(".git").join("objects"))
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .map_err(|err| HortError::GitCommandFailed { detail: format!("{op}: {err}") })?;
+        if !output.status.success() {
+            return Err(HortError::GitCommandFailed {
+                detail: format!("{op}: {}", String::from_utf8_lossy(&output.stderr).trim()),
+            });
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+}
+
+impl Drop for CloneRead<'_> {
+    fn drop(&mut self) {
+        // Nothing is left to do with a failure here: whatever stays behind goes
+        // with the rest of the sandbox's state when the sandbox is removed.
+        let _ = std::fs::remove_dir_all(&self.git_dir);
+    }
+}
+
 /// Record inside the clone where the objects it borrows will be, which is a
 /// path of the box and not of the host: git resolves that path on whichever
 /// machine it runs on, and this clone is read inside the box. Written last,
@@ -434,6 +541,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::process::Command;
+    use std::time::{Duration, SystemTime};
 
     use tempfile::TempDir;
 
@@ -543,6 +651,30 @@ mod tests {
 
     fn rev_parse(dir: &Path, rev: &str) -> String {
         git(dir, &["rev-parse", rev]).trim().to_string()
+    }
+
+    /// Write into `dir` an executable script whose only effect is creating
+    /// `marker`, and return its path. It stands in for anything a sandbox can
+    /// configure git to run, so the marker existing is that code having run on
+    /// the host.
+    fn planted_script(dir: &Path, marker: &Path) -> PathBuf {
+        let script = dir.join("run-on-read.sh");
+        fs::write(&script, format!("#!/bin/sh\ntouch {}\nprintf '%s\\0' 1\n", marker.display()))
+            .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// Give the file at `path` a modification time no checkout ever left on it,
+    /// so git can no longer vouch for it from what it recorded last time and has
+    /// to look at the file itself.
+    fn set_a_modification_time_of_its_own(path: &Path) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000))
+            .unwrap();
     }
 
     fn current_branch(worktree: &Path) -> String {
@@ -1305,6 +1437,219 @@ mod tests {
         // work" it prints a claim nobody checked; read as "nothing held" it lets
         // a teardown take commits it never looked for.
         assert!(provider.holds_unreturned_work(&name, &plain).is_err());
+    }
+
+    #[test]
+    fn clone_mode_is_dirty_reports_false_for_a_clean_clone() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Clone).unwrap();
+
+        assert!(!provider.is_dirty(&name, &repo).unwrap());
+    }
+
+    #[test]
+    fn clone_mode_is_dirty_reports_true_for_a_modified_tracked_file() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let workdir =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Clone).unwrap();
+        fs::write(workdir.path.join("README.md"), "changed\n").unwrap();
+
+        assert!(provider.is_dirty(&name, &repo).unwrap());
+    }
+
+    #[test]
+    fn clone_mode_is_dirty_reports_true_for_an_untracked_file() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let workdir =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Clone).unwrap();
+        fs::write(workdir.path.join("untracked.txt"), "x\n").unwrap();
+
+        assert!(provider.is_dirty(&name, &repo).unwrap());
+    }
+
+    #[test]
+    fn clone_mode_is_dirty_reports_false_for_a_clone_standing_on_a_commit_only_it_holds() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let workdir =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Clone).unwrap();
+        commit_in_clone(&workdir.path, &repo.join(".git").join("objects"), "work.txt");
+
+        // A box that committed its work is clean, and the commit it stands on
+        // exists in the clone's own object store and nowhere on the host. That
+        // is the state of a box between two tasks, and a read that looks for
+        // the commit only among the host's objects cannot answer for it.
+        assert!(!provider.is_dirty(&name, &repo).unwrap());
+    }
+
+    #[test]
+    fn clone_mode_is_dirty_asks_the_project_it_names_rather_than_the_repository_it_runs_from() {
+        let (_project, project) = temp_dir();
+        let (_elsewhere, elsewhere) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&project);
+        // With no commit of its own: two repositories seeded alike within the
+        // same second hold the very same commit, and this one must not hold the
+        // commit the clone stands on.
+        git(&elsewhere, &["init", "-b", "main"]);
+        let name = SandboxName::new("demo").unwrap();
+        GitWorktreeProvider::new(project.clone(), state_root.clone())
+            .create(&name, &BranchName::new("demo").unwrap(), GitMode::Clone)
+            .unwrap();
+        let run_from_elsewhere = GitWorktreeProvider::new(elsewhere, state_root);
+
+        // `ls` and `prune` are global, so the repository a provider is rooted
+        // at is whichever one the user is standing in. The commit a fresh clone
+        // stands on is one only its own project holds, so asked of any other
+        // repository the clone cannot even be read.
+        assert!(!run_from_elsewhere.is_dirty(&name, &project).unwrap());
+    }
+
+    #[test]
+    fn clone_mode_is_dirty_cannot_answer_for_a_clone_holding_a_gitlink() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let workdir =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Clone).unwrap();
+        let nested = workdir.path.join("vendored");
+        fs::create_dir(&nested).unwrap();
+        init_repo_with_commit(&nested);
+        let staged = git_borrowing_objects(
+            &workdir.path,
+            &repo.join(".git").join("objects"),
+            &["add", "vendored"],
+        );
+        assert!(staged.status.success(), "git add of the nested repository failed");
+
+        // A gitlink leaves two readings and both are wrong. Looking inside the
+        // submodule runs git there under the configuration the box wrote for
+        // it, and looking away from it hides a gitlink the box just added, so
+        // this clone reads clean. Unknown is the one answer that does neither.
+        assert!(provider.is_dirty(&name, &repo).is_err());
+    }
+
+    #[test]
+    fn clone_mode_is_dirty_does_not_run_an_fsmonitor_the_clone_configures() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let workdir =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Clone).unwrap();
+
+        // The clone's `.git` is a directory the box writes, configuration
+        // included, and a status read consults the fsmonitor that configuration
+        // names on every run.
+        let marker = state_root.join("agent-code-ran");
+        let hook = planted_script(&workdir.path.join(".git"), &marker);
+        git(&workdir.path, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+
+        let read = provider.is_dirty(&name, &repo);
+
+        assert!(read.is_ok(), "only a read that reached git can say what git ran: {read:?}");
+        assert!(!marker.exists(), "the fsmonitor the box configured ran on the host");
+    }
+
+    #[test]
+    fn clone_mode_is_dirty_does_not_run_a_clean_filter_the_clone_binds_to_a_tracked_file() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let workdir =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Clone).unwrap();
+
+        // The box defines a filter in the configuration it writes and binds it
+        // to a tracked file through an attributes file in its own worktree. The
+        // file is rewritten at its own size, so its size cannot say it changed
+        // and git has to read it through the filter to compare it.
+        let marker = state_root.join("agent-code-ran");
+        git(
+            &workdir.path,
+            &["config", "filter.planted.clean", &format!("touch {}; cat", marker.display())],
+        );
+        fs::write(workdir.path.join(".gitattributes"), "README.md filter=planted\n").unwrap();
+        fs::write(workdir.path.join("README.md"), "SEED\n").unwrap();
+        set_a_modification_time_of_its_own(&workdir.path.join("README.md"));
+
+        let read = provider.is_dirty(&name, &repo);
+
+        assert!(read.is_ok(), "only a read that reached git can say what git ran: {read:?}");
+        assert!(!marker.exists(), "the filter the box configured ran on the host");
+    }
+
+    #[test]
+    fn clone_mode_is_dirty_does_not_run_an_fsmonitor_a_submodule_of_the_clone_configures() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let workdir =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Clone).unwrap();
+        let nested = workdir.path.join("vendored");
+        fs::create_dir(&nested).unwrap();
+        init_repo_with_commit(&nested);
+        let staged = git_borrowing_objects(
+            &workdir.path,
+            &repo.join(".git").join("objects"),
+            &["add", "vendored"],
+        );
+        assert!(staged.status.success(), "git add of the nested repository failed");
+
+        // A repository nested in the clone and recorded in its index is a
+        // submodule, and a status read of the clone runs git inside it under the
+        // submodule's own configuration, which the box wrote as well.
+        let marker = state_root.join("agent-code-ran");
+        let hook = planted_script(&nested.join(".git"), &marker);
+        git(&nested, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+
+        let _ = provider.is_dirty(&name, &repo);
+
+        assert!(!marker.exists(), "the fsmonitor the box gave its submodule ran on the host");
+    }
+
+    #[test]
+    fn clone_mode_is_dirty_leaves_the_index_of_the_clone_as_it_found_it() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let workdir =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Clone).unwrap();
+        // Touched without being changed, so a read that refreshes what the index
+        // remembers about the file has something to write back. The index is
+        // the box's, and a write into it from the host takes the lock the box's
+        // own git needs to work.
+        set_a_modification_time_of_its_own(&workdir.path.join("README.md"));
+        let index = workdir.path.join(".git").join("index");
+        let before = fs::read(&index).unwrap();
+
+        let read = provider.is_dirty(&name, &repo);
+
+        assert!(read.is_ok(), "only a read that reached git can say what git wrote: {read:?}");
+        assert!(fs::read(&index).unwrap() == before, "the read wrote the clone's index");
     }
 
     #[test]

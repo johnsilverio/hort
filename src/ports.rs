@@ -177,15 +177,23 @@ pub trait WorktreeProvider {
     /// `checked_out_at`. `None` when git lists no worktree at that path, or the
     /// one it lists there holds no branch.
     fn branch_held_at(&self, path: &Path) -> Result<Option<BranchName>, HortError>;
-    /// Whether this sandbox's worktree has uncommitted changes; untracked files
-    /// count. The first behavioral consumer is `prune`.
+    /// Whether this sandbox's `/workdir` has uncommitted changes, in either git
+    /// mode; untracked files count. The first behavioral consumer is `prune`.
     ///
-    /// The verdict is read through the administrative directory `project`
-    /// keeps for the worktree, never through the worktree's own `.git`
-    /// pointer, which the sandbox can rewrite. The project is a parameter for
-    /// the reason `holds_unreturned_work` takes one: the commands that ask are
-    /// global, and the repository they run from keeps no such directory for
-    /// another project's sandbox.
+    /// A worktree's verdict is read through the administrative directory
+    /// `project` keeps for it, never through the worktree's own `.git` pointer,
+    /// which the sandbox can rewrite. A clone keeps its whole repository inside
+    /// the `/workdir` the sandbox writes, configuration included, so its verdict
+    /// is read through a git directory of hort's own that takes the clone's
+    /// index and objects as data, borrows the objects of `project`, and
+    /// consults no configuration the sandbox wrote. A clone that records a
+    /// submodule cannot be answered for that way, and is an error rather than a
+    /// verdict.
+    ///
+    /// The project is a parameter for the reason `holds_unreturned_work` takes
+    /// one: the commands that ask are global, and the repository they run from
+    /// keeps neither the administrative directory of another project's worktree
+    /// nor the objects another project's clone borrows.
     fn is_dirty(&self, name: &SandboxName, project: &Path) -> Result<bool, HortError>;
     /// Whether this sandbox's `/workdir` holds committed work the repository at
     /// `project` does not have.
