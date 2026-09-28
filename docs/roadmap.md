@@ -18,12 +18,6 @@ Today nothing at `up` time tells you which posture the box you just opened runs 
 
 Today hort is built from source, which means a Rust toolchain, the libseccomp headers and a release build before the first sandbox ([Building the binary](installation.md#building-the-binary)). Planned: a released binary for Linux you download and run, so trying hort does not begin with a compiler.
 
-## Cleaning up after clone mode
-
-[Clone mode](git-modes.md) works today. One piece of it is still missing:
-
-- `hort ls` shows a clone's git mode and whether it holds commits your repository does not have, but its dirty column reads `-` for a clone, so uncommitted changes inside one do not show in the listing.
-
 ## Deleting the sandbox's branch on `down` and `prune`
 
 Today `hort down` keeps the sandbox's branch and you delete it by hand with `git branch -d`. A planned `--delete-branch` flag (`-b`) on `hort down` and `hort prune` removes it too:
