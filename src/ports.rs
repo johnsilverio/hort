@@ -190,6 +190,12 @@ pub trait WorktreeProvider {
     /// submodule cannot be answered for that way, and is an error rather than a
     /// verdict.
     ///
+    /// The sandbox writes the directory this reads, so it can leave there a file
+    /// git opens that never answers, such as a named pipe. The read is therefore
+    /// bounded in time: one that has not answered within a few seconds is given
+    /// up on, with the git it started stopped, and is an error rather than a
+    /// verdict.
+    ///
     /// The project is a parameter for the reason `holds_unreturned_work` takes
     /// one: the commands that ask are global, and the repository they run from
     /// keeps neither the administrative directory of another project's worktree
@@ -205,7 +211,9 @@ pub trait WorktreeProvider {
     /// and host-side: reading a ref touches no object, so the clone's tip is
     /// readable even though the objects it borrows are mounted only inside the
     /// box, and the project repository is then asked whether it already has
-    /// that commit.
+    /// that commit. The tip is read in a directory the sandbox writes, so that
+    /// read is bounded in time the way `is_dirty` is, and a tip that never
+    /// answers is an error rather than a verdict.
     ///
     /// The project is a parameter because the answer depends on which
     /// repository is asked: the commands that ask are global, so the repository

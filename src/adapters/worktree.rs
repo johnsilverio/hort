@@ -3,8 +3,12 @@
 //! that back each sandbox's `/workdir`, one per sandbox at
 //! `<state_root>/sandboxes/<name>/worktree-<name>`.
 
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::mpsc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crate::domain::config::GitMode;
 use crate::domain::error::HortError;
@@ -23,6 +27,15 @@ const HOST_REMOTE: &str = "hort-base";
 /// address is ignored and the push goes through, while this one git refuses by
 /// itself, naming the reason in the message the agent reads.
 const HOST_REMOTE_PUSH_URL: &str = "hort-base-is-fetch-only";
+
+/// How long hort waits on one read of a `/workdir` before giving up on it,
+/// shared by every git that read runs. The sandbox writes that directory, so it
+/// can put a named pipe where git opens a file and hold the read for as long as
+/// it likes, and with it every command that reads the sandboxes one after
+/// another. A read that answers takes milliseconds, and a read given up on is
+/// an unknown the callers already treat as protecting the sandbox, never as
+/// clearing it.
+const WORKDIR_READ_BUDGET: Duration = Duration::from_secs(2);
 
 /// A `WorktreeProvider` backed by the system `git`, rooted at the project
 /// repository and the hort state directory the worktrees live under.
@@ -305,14 +318,15 @@ impl WorktreeProvider for GitWorktreeProvider {
     }
 
     fn is_dirty(&self, name: &SandboxName, project: &Path) -> Result<bool, HortError> {
+        let deadline = Instant::now() + WORKDIR_READ_BUDGET;
         let worktree = self.worktree_path(name);
         if self.git_mode_at(&worktree) == Some(GitMode::Clone) {
-            return clone_is_dirty(&worktree, &self.sandbox_dir(name), project);
+            return clone_is_dirty(&worktree, &self.sandbox_dir(name), project, deadline);
         }
         let admin = Self::worktree_admin_dir(project, &worktree)?;
         let admin_arg = admin.to_string_lossy();
         let worktree_arg = worktree.to_string_lossy();
-        let porcelain = run(
+        let porcelain = run_by(
             project,
             "status",
             &[
@@ -323,6 +337,7 @@ impl WorktreeProvider for GitWorktreeProvider {
                 "status",
                 "--porcelain",
             ],
+            deadline,
         )?;
         Ok(!porcelain.trim().is_empty())
     }
@@ -336,8 +351,9 @@ impl WorktreeProvider for GitWorktreeProvider {
         // its own. `cat-file -e` exits 0 for a commit the project has and 1 for
         // one it lacks; anything else, such as 128 in a folder that is no
         // repository, is a question the project could not answer.
+        let deadline = Instant::now() + WORKDIR_READ_BUDGET;
         let workdir = self.worktree_path(name);
-        let tip = run(&workdir, "rev-parse", &["rev-parse", "HEAD"])?;
+        let tip = run_by(&workdir, "rev-parse", &["rev-parse", "HEAD"], deadline)?;
         let lookup = capture(project, "cat-file", &["cat-file", "-e", tip.trim()])?;
         match lookup.status.code() {
             Some(0) => Ok(false),
@@ -353,29 +369,108 @@ impl WorktreeProvider for GitWorktreeProvider {
     }
 }
 
+/// `git -C <dir> <args>`, not yet run.
+fn git_in(dir: &Path, args: &[&str]) -> Command {
+    let mut git = Command::new("git");
+    git.arg("-C").arg(dir).args(args);
+    git
+}
+
 /// Run `git -C <dir> <args>`, mapping only a spawn failure to a domain error.
 /// The exit status is left for the caller to interpret, so probes that treat a
 /// non-zero exit as a boolean answer (not a failure) can read `status.success()`.
 fn capture(dir: &Path, op: &str, args: &[&str]) -> Result<Output, HortError> {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .map_err(|err| HortError::GitCommandFailed { detail: format!("{op}: {err}") })
+    git_in(dir, args).output().map_err(|err| failed(op, &err))
 }
 
-/// Run `git -C <dir> <args>` and require success, returning its stdout. A
-/// non-zero exit maps to a domain error whose detail names the operation and
-/// carries git's stderr.
+/// Run `git -C <dir> <args>` and require success, returning its stdout.
 fn run(dir: &Path, op: &str, args: &[&str]) -> Result<String, HortError> {
-    let output = capture(dir, op, args)?;
+    stdout_of_success(op, capture(dir, op, args)?)
+}
+
+/// `run` for a git that reads a directory the sandbox writes, given up on at
+/// `deadline`.
+fn run_by(dir: &Path, op: &str, args: &[&str], deadline: Instant) -> Result<String, HortError> {
+    stdout_of_success(op, output_by(&mut git_in(dir, args), op, deadline)?)
+}
+
+/// The stdout of a git that exited successfully. A non-zero exit maps to a
+/// domain error whose detail names the operation and carries git's stderr.
+fn stdout_of_success(op: &str, output: Output) -> Result<String, HortError> {
     if !output.status.success() {
-        return Err(HortError::GitCommandFailed {
-            detail: format!("{op}: {}", String::from_utf8_lossy(&output.stderr).trim()),
-        });
+        return Err(failed(op, String::from_utf8_lossy(&output.stderr).trim()));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn failed(op: &str, detail: impl std::fmt::Display) -> HortError {
+    HortError::GitCommandFailed { detail: format!("{op}: {detail}") }
+}
+
+/// Run `git` to completion unless `deadline` comes first, in which case it is
+/// killed and waited for, so that no git hort started is left waiting on the
+/// sandbox once hort has moved on, and the read fails like any other.
+///
+/// Both streams are drained while git runs rather than after it ends: a git
+/// writing more than a pipe holds stops until somebody reads, so a read that
+/// only waited for the end would give up on every large answer.
+fn output_by(git: &mut Command, op: &str, deadline: Instant) -> Result<Output, HortError> {
+    let mut child = git
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| failed(op, &err))?;
+    let (closed, stream_closed) = mpsc::channel();
+    let streams = [drain(child.stdout.take(), closed.clone()), drain(child.stderr.take(), closed)];
+    let all_closed = streams.iter().all(|_| {
+        stream_closed.recv_timeout(deadline.saturating_duration_since(Instant::now())).is_ok()
+    });
+    let exited = if all_closed { exited_by(&mut child, deadline) } else { None };
+    let Some(status) = exited else {
+        // Killed rather than only abandoned: a git waiting on a pipe the
+        // sandbox never answers outlives hort otherwise, for good.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(failed(op, "no answer from the sandbox's /workdir in time"));
+    };
+    let [stdout, stderr] = streams.map(|stream| match stream.join() {
+        Ok(read) => read.map_err(|err| failed(op, &err)),
+        Err(panic) => std::panic::resume_unwind(panic),
+    });
+    Ok(Output { status, stdout: stdout?, stderr: stderr? })
+}
+
+/// Read `stream` to its end on a thread of its own, saying on `closed` when it
+/// is done, whether it got there or failed on the way.
+fn drain(
+    stream: Option<impl Read + Send + 'static>,
+    closed: mpsc::Sender<()>,
+) -> JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let read = match stream {
+            Some(mut stream) => stream.read_to_end(&mut bytes).map(|_| bytes),
+            None => Ok(bytes),
+        };
+        let _ = closed.send(());
+        read
+    })
+}
+
+/// How `child` exited, or nothing if it has not by `deadline`. Asked once its
+/// streams are closed, which a process does as it exits, so the wait is
+/// normally over at the first look.
+fn exited_by(child: &mut Child, deadline: Instant) -> Option<ExitStatus> {
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// Whether the clone at `clone` holds uncommitted changes, read from the host
@@ -400,9 +495,14 @@ fn run(dir: &Path, op: &str, args: &[&str]) -> Result<String, HortError> {
 ///
 /// The objects the clone borrows are lent from `project`, the store the box
 /// gets by mount, because the path the clone records is one only the box has.
-fn clone_is_dirty(clone: &Path, sandbox_dir: &Path, project: &Path) -> Result<bool, HortError> {
-    let tip = run(clone, "rev-parse", &["rev-parse", "HEAD"])?;
-    let read = CloneRead::begin(sandbox_dir, tip.trim(), clone, project)?;
+fn clone_is_dirty(
+    clone: &Path,
+    sandbox_dir: &Path,
+    project: &Path,
+    deadline: Instant,
+) -> Result<bool, HortError> {
+    let tip = run_by(clone, "rev-parse", &["rev-parse", "HEAD"], deadline)?;
+    let read = CloneRead::begin(sandbox_dir, tip.trim(), clone, project, deadline)?;
     let staged = read.git("ls-files", &["ls-files", "--stage"])?;
     if staged.lines().any(|entry| entry.starts_with("160000 ")) {
         return Err(HortError::GitCommandFailed {
@@ -423,6 +523,7 @@ struct CloneRead<'a> {
     git_dir: PathBuf,
     clone: &'a Path,
     project: &'a Path,
+    deadline: Instant,
 }
 
 impl<'a> CloneRead<'a> {
@@ -431,15 +532,14 @@ impl<'a> CloneRead<'a> {
         tip: &str,
         clone: &'a Path,
         project: &'a Path,
+        deadline: Instant,
     ) -> Result<Self, HortError> {
-        let failed = |err: std::io::Error| HortError::GitCommandFailed {
-            detail: format!("clone status directory: {err}"),
-        };
+        let unwritable = |err: io::Error| failed("clone status directory", &err);
         let git_dir = sandbox_dir.join(format!("clone-status-{}", std::process::id()));
-        std::fs::create_dir(&git_dir).map_err(failed)?;
-        let read = Self { git_dir, clone, project };
-        std::fs::create_dir(read.git_dir.join("refs")).map_err(failed)?;
-        std::fs::write(read.git_dir.join("HEAD"), format!("{tip}\n")).map_err(failed)?;
+        std::fs::create_dir(&git_dir).map_err(unwritable)?;
+        let read = Self { git_dir, clone, project, deadline };
+        std::fs::create_dir(read.git_dir.join("refs")).map_err(unwritable)?;
+        std::fs::write(read.git_dir.join("HEAD"), format!("{tip}\n")).map_err(unwritable)?;
         Ok(read)
     }
 
@@ -449,8 +549,8 @@ impl<'a> CloneRead<'a> {
     /// needs.
     fn git(&self, op: &str, args: &[&str]) -> Result<String, HortError> {
         let dot_git = self.clone.join(".git");
-        let output = Command::new("git")
-            .arg("--no-optional-locks")
+        let mut git = Command::new("git");
+        git.arg("--no-optional-locks")
             .arg("--git-dir")
             .arg(&self.git_dir)
             .arg("--work-tree")
@@ -460,15 +560,8 @@ impl<'a> CloneRead<'a> {
             .env("GIT_OBJECT_DIRECTORY", dot_git.join("objects"))
             .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", self.project.join(".git").join("objects"))
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .output()
-            .map_err(|err| HortError::GitCommandFailed { detail: format!("{op}: {err}") })?;
-        if !output.status.success() {
-            return Err(HortError::GitCommandFailed {
-                detail: format!("{op}: {}", String::from_utf8_lossy(&output.stderr).trim()),
-            });
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        stdout_of_success(op, output_by(&mut git, op, self.deadline)?)
     }
 }
 
@@ -537,11 +630,13 @@ fn parse_worktree_records(porcelain: &str) -> Vec<WorktreeRecord<'_>> {
 mod tests {
     use super::*;
 
+    use std::ffi::CString;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::path::Path;
     use std::process::Command;
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, Instant, SystemTime};
 
     use tempfile::TempDir;
 
@@ -554,6 +649,76 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = fs::canonicalize(dir.path()).unwrap();
         (dir, path)
+    }
+
+    /// How long a read of a sandbox's `/workdir` may take before whoever asked
+    /// for it would call hort hung. It bounds how long these tests wait, never
+    /// how long a read is allowed to take: a read still waiting on the sandbox
+    /// after this long was not going to come back by itself.
+    const WHAT_A_CALLER_WAITS: Duration = Duration::from_secs(10);
+
+    /// A file in a directory the sandbox writes, replaced by a named pipe that
+    /// nothing writes to. Whatever opens it for reading waits until something
+    /// opens the other end, which is all a sandbox needs to hold a read the host
+    /// makes there for as long as it likes.
+    struct PlantedPipe {
+        path: PathBuf,
+    }
+
+    impl PlantedPipe {
+        fn plant(path: &Path) -> Self {
+            let _ = fs::remove_file(path);
+            let spelled = CString::new(path.as_os_str().as_bytes()).unwrap();
+            let made = unsafe { libc::mkfifo(spelled.as_ptr(), 0o644) };
+            assert_eq!(made, 0, "no pipe planted at {}", path.display());
+            Self { path: path.to_path_buf() }
+        }
+
+        /// Answer whatever is waiting to read the pipe with an end of file, and
+        /// say whether anything was. Opening the writing end without blocking
+        /// succeeds only while a reader holds the other end or waits for it.
+        fn answer_a_waiting_reader(&self) -> bool {
+            fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&self.path)
+                .is_ok()
+        }
+    }
+
+    impl Drop for PlantedPipe {
+        fn drop(&mut self) {
+            // A reader still waiting when its directory is removed waits forever,
+            // because nothing can open a pipe that is no longer there. So every
+            // reader is answered first, a read's leftover included, and so is one
+            // that opens the pipe again right after its answer.
+            let mut quiet = 0;
+            while quiet < 20 {
+                quiet = if self.answer_a_waiting_reader() { 0 } else { quiet + 1 };
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    /// Run `read`, and once a caller would have given up on it, answer every
+    /// reader of `pipe` until it comes back, so a read waiting on the pipe fails
+    /// its own test instead of holding the whole suite. Returns what the read
+    /// returned and whether it came back by itself, before anything had to be
+    /// answered for it.
+    fn read_watched<T: Send>(pipe: &PlantedPipe, read: impl FnOnce() -> T + Send) -> (T, bool) {
+        std::thread::scope(|scope| {
+            let reading = scope.spawn(read);
+            let given_up_at = Instant::now() + WHAT_A_CALLER_WAITS;
+            let mut answered = false;
+            while !reading.is_finished() {
+                if Instant::now() >= given_up_at {
+                    answered |= pipe.answer_a_waiting_reader();
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let returned = reading.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            (returned, !answered)
+        })
     }
 
     /// Run a real git command in `dir`, asserting it succeeded, and return its
@@ -1208,6 +1373,75 @@ mod tests {
     }
 
     #[test]
+    fn git_worktree_is_dirty_gives_up_on_an_ignore_file_that_never_answers() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let worktree =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
+        // The sandbox writes its whole worktree, and a status read opens every
+        // ignore file in it.
+        let planted = PlantedPipe::plant(&worktree.path.join(".gitignore"));
+
+        let (read, came_back_by_itself) =
+            read_watched(&planted, || provider.is_dirty(&name, &repo));
+
+        assert!(came_back_by_itself, "the read was still waiting on the sandbox: {read:?}");
+        // Answered "clean", a read that never finished lets `prune` collect a
+        // worktree nobody looked at.
+        assert!(
+            matches!(read, Err(HortError::GitCommandFailed { .. })),
+            "a read that could not finish answered as if it had: {read:?}"
+        );
+    }
+
+    #[test]
+    fn git_worktree_is_dirty_leaves_no_git_waiting_on_the_worktree_once_it_gives_up() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let worktree =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
+        let planted = PlantedPipe::plant(&worktree.path.join(".gitignore"));
+
+        let (read, came_back_by_itself) =
+            read_watched(&planted, || provider.is_dirty(&name, &repo));
+
+        // hort exits right after it lists, so a git it stopped waiting for is
+        // not stopped with it: it stays behind, waiting on the sandbox for good.
+        assert!(came_back_by_itself, "only a read that gave up can leave a git behind: {read:?}");
+        assert!(
+            !planted.answer_a_waiting_reader(),
+            "a git the read started still waits on the pipe"
+        );
+    }
+
+    #[test]
+    fn git_worktree_is_dirty_reports_true_for_a_worktree_holding_thousands_of_untracked_files() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let worktree =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
+        // Two thousand untracked files with long names make a status of over two
+        // hundred kilobytes, several times what a pipe holds. Git stops writing
+        // until somebody reads, so a read that only waits for git to end never
+        // sees it end, and gives up on a worktree that is simply busy.
+        for ordinal in 0..2000 {
+            let file = format!("untracked-{}-{ordinal:05}.txt", "x".repeat(90));
+            fs::write(worktree.path.join(file), "").unwrap();
+        }
+
+        assert!(provider.is_dirty(&name, &repo).unwrap());
+    }
+
+    #[test]
     fn git_worktree_prune_stale_clears_vanished_registration() {
         let (_repo, repo) = temp_dir();
         let (_state, state_root) = temp_dir();
@@ -1440,6 +1674,29 @@ mod tests {
     }
 
     #[test]
+    fn clone_mode_gives_up_asking_for_unreturned_work_when_the_head_of_the_clone_never_answers() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let workdir =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Clone).unwrap();
+        // The clone's `.git` is the sandbox's to write, and the tip is resolved
+        // there, through the file that names it.
+        let planted = PlantedPipe::plant(&workdir.path.join(".git").join("HEAD"));
+
+        let (read, came_back_by_itself) =
+            read_watched(&planted, || provider.holds_unreturned_work(&name, &repo));
+
+        assert!(came_back_by_itself, "the read was still waiting on the sandbox: {read:?}");
+        assert!(
+            matches!(read, Err(HortError::GitCommandFailed { .. })),
+            "a read that could not finish answered as if it had: {read:?}"
+        );
+    }
+
+    #[test]
     fn clone_mode_is_dirty_reports_false_for_a_clean_clone() {
         let (_repo, repo) = temp_dir();
         let (_state, state_root) = temp_dir();
@@ -1650,6 +1907,54 @@ mod tests {
 
         assert!(read.is_ok(), "only a read that reached git can say what git wrote: {read:?}");
         assert!(fs::read(&index).unwrap() == before, "the read wrote the clone's index");
+    }
+
+    #[test]
+    fn clone_mode_is_dirty_gives_up_when_the_head_of_the_clone_never_answers() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let workdir =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Clone).unwrap();
+        // The read starts from the commit the clone stands on, which only the
+        // clone's own `.git` can name.
+        let planted = PlantedPipe::plant(&workdir.path.join(".git").join("HEAD"));
+
+        let (read, came_back_by_itself) =
+            read_watched(&planted, || provider.is_dirty(&name, &repo));
+
+        assert!(came_back_by_itself, "the read was still waiting on the sandbox: {read:?}");
+        assert!(
+            matches!(read, Err(HortError::GitCommandFailed { .. })),
+            "a read that could not finish answered as if it had: {read:?}"
+        );
+    }
+
+    #[test]
+    fn clone_mode_is_dirty_gives_up_when_the_index_of_the_clone_never_answers() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let workdir =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Clone).unwrap();
+        // Past the commit it stands on, the clone is read as data, its index
+        // first, by a git that is not the one that named the commit. Either can
+        // be left waiting, and a HEAD that never answers stops the read before
+        // the second is ever started.
+        let planted = PlantedPipe::plant(&workdir.path.join(".git").join("index"));
+
+        let (read, came_back_by_itself) =
+            read_watched(&planted, || provider.is_dirty(&name, &repo));
+
+        assert!(came_back_by_itself, "the read was still waiting on the sandbox: {read:?}");
+        assert!(
+            matches!(read, Err(HortError::GitCommandFailed { .. })),
+            "a read that could not finish answered as if it had: {read:?}"
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command as GitCommand, Stdio};
@@ -5065,6 +5065,134 @@ fn cli_ls_does_not_run_on_the_host_the_fsmonitor_an_agent_configured_in_its_clon
         .stdout(predicate::str::is_match(format!("(?m) {name} +clean *$")).unwrap());
     assert!(!marker.exists(), "the fsmonitor the agent configured ran on the host");
 
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["down", name])
+        .assert()
+        .success();
+}
+
+/// A named pipe a sandbox made in its own `/workdir`, seen from the host. Whatever
+/// opens it for reading waits until something opens the other end.
+struct PipeTheSandboxPlanted {
+    path: PathBuf,
+}
+
+impl PipeTheSandboxPlanted {
+    /// Answer whatever is waiting to read the pipe with an end of file, and say
+    /// whether anything was. Opening the writing end without blocking succeeds
+    /// only while a reader holds the other end or waits for it.
+    fn answer_a_waiting_reader(&self) -> bool {
+        fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(&self.path).is_ok()
+    }
+}
+
+impl Drop for PipeTheSandboxPlanted {
+    fn drop(&mut self) {
+        // A reader still waiting when the worktree is removed waits forever,
+        // because nothing can open a pipe that is no longer there. So every
+        // reader is answered first, one a run left behind included, and so is
+        // one that opens the pipe again right after its answer.
+        let mut quiet = 0;
+        while quiet < 20 {
+            quiet = if self.answer_a_waiting_reader() { 0 } else { quiet + 1 };
+            sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// Run `hort ls` for `sandbox`, and once its user would have given up on it,
+/// answer every reader of `pipe` until it ends, so a listing waiting on the pipe
+/// fails its test instead of holding the suite. Returns how the run ended and
+/// whether it ended by itself, before anything had to be answered for it.
+///
+/// Killing the run on the deadline would not do: what waits on the pipe is a
+/// git that hort started, and a git whose parent was killed goes on waiting.
+fn listed_watched(
+    sandbox: &ScratchSandbox,
+    config_home: &Path,
+    repo: &Path,
+    pipe: &PipeTheSandboxPlanted,
+) -> (std::process::Output, bool) {
+    let listing = std::process::Command::new(assert_cmd::cargo::cargo_bin("hort"))
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(repo)
+        .arg("ls")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::scope(|scope| {
+        let running = scope.spawn(|| listing.wait_with_output().unwrap());
+        let given_up_at = Instant::now() + ANSWERED_BY;
+        let mut answered = false;
+        while !running.is_finished() {
+            if Instant::now() >= given_up_at {
+                answered |= pipe.answer_a_waiting_reader();
+            }
+            sleep(Duration::from_millis(10));
+        }
+        (running.join().unwrap(), !answered)
+    })
+}
+
+#[test]
+#[ignore = "needs unprivileged user namespaces, a prepared rootfs (HORT_TEST_ROOTFS) and pasta"]
+fn cli_ls_still_lists_a_sandbox_whose_worktree_holds_a_file_that_never_answers() {
+    let Some(rootfs) = prepared_rootfs() else { return };
+    let (_config, config_home) = temp_config_home(&format!(r#"{{ "rootfs": "{rootfs}" }}"#));
+    let (_repo, repo_path) = temp_git_repo();
+    let sandbox = ScratchSandbox::new();
+    let name = sandbox.name().as_str();
+
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["up", "-d", name])
+        .assert()
+        .success();
+
+    // A worktree, the mode every sandbox gets unless told otherwise, and the
+    // sandbox writes all of it. Reading whether it is dirty opens every ignore
+    // file in it on the host, so one that is a pipe nothing writes to holds that
+    // read for as long as the sandbox likes, and `ls` with it.
+    Command::cargo_bin("hort")
+        .unwrap()
+        .env("XDG_STATE_HOME", sandbox.state_home())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", sandbox.runtime_dir())
+        .current_dir(&repo_path)
+        .args(["run", name, "--", "mkfifo", "/workdir/.gitignore"])
+        .assert()
+        .success();
+    let planted = PipeTheSandboxPlanted {
+        path: sandbox.state_dir().join(format!("worktree-{name}")).join(".gitignore"),
+    };
+
+    let (listing, ended_by_itself) = listed_watched(&sandbox, &config_home, &repo_path, &planted);
+
+    assert!(ended_by_itself, "ls was still waiting on the sandbox when its user would give up");
+    // The dirty column is the last one, after the branch, which here is the name.
+    let listed = String::from_utf8_lossy(&listing.stdout);
+    assert!(listing.status.success(), "ls failed: {}", String::from_utf8_lossy(&listing.stderr));
+    assert!(
+        predicate::str::is_match(format!("(?m) {name} +-$")).unwrap().eval(&listed),
+        "the sandbox is not listed with its dirty state unknown:\n{listed}"
+    );
+
+    // Anything still waiting on the pipe is answered before the worktree goes,
+    // since nothing can open it once it has.
+    drop(planted);
     Command::cargo_bin("hort")
         .unwrap()
         .env("XDG_STATE_HOME", sandbox.state_home())
