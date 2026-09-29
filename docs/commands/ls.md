@@ -37,7 +37,7 @@ Each column is aligned under its name in the header:
 | `BRANCH` | The sandbox's branch, or `-` without git. |
 | `DIRTY` | `dirty` if the worktree, or the clone of a [clone-mode](../git-modes.md) sandbox, has uncommitted changes, `clean` if not. `-` for a clone holding a submodule, a repository added inside it, because hort does not look inside one. |
 
-A `-` means hort could not tell: there is no record to read (a `lost-record` row), the project has no git (git mode, branch and dirty), a clone holds a submodule (dirty), the worktree is gone, or hort could not read the sandbox's process list (sessions, and idle with it). hort shows `-` rather than guessing.
+A `-` means hort could not tell: there is no record to read (a `lost-record` row), the project has no git (git mode, branch and dirty), a clone holds a submodule (dirty), reading the sandbox's worktree or clone did not answer within a few seconds (dirty, and for a clone the work it holds too), the worktree is gone, or hort could not read the sandbox's process list (sessions, and idle with it). hort shows `-` rather than guessing.
 
 A `lost-record` row is followed by an indented line with the command that collects it.
 
