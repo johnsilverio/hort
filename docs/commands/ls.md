@@ -35,9 +35,9 @@ Each column is aligned under its name in the header:
 | `IDLE` | `active` while anything runs inside; otherwise time since the latest of creation, last attach and last announced completion. |
 | `GIT` | How the sandbox was built: `worktree`, or for a [clone-mode](../git-modes.md) sandbox `clone` when the project's repository has every commit in it, `clone, work only in the box` when the clone holds commits it does not, and `clone, work unknown` when hort could not tell. `-` when there is no mode to report: a `lost-record` row, a project without git, or a sandbox whose worktree or clone is gone. |
 | `BRANCH` | The sandbox's branch, or `-` without git. |
-| `DIRTY` | `dirty` if the worktree, or the clone of a [clone-mode](../git-modes.md) sandbox, has uncommitted changes, `clean` if not. `-` for a clone holding a submodule, a repository added inside it, because hort does not look inside one. |
+| `DIRTY` | `dirty` if the worktree, or the clone of a [clone-mode](../git-modes.md) sandbox, has uncommitted changes, `clean` if not. `-` when the worktree or the clone records a submodule, a repository added inside it, because hort does not look inside one. |
 
-A `-` means hort could not tell: there is no record to read (a `lost-record` row), the project has no git (git mode, branch and dirty), a clone holds a submodule (dirty), reading the sandbox's worktree or clone did not answer within a few seconds (dirty, and for a clone the work it holds too), the worktree is gone, or hort could not read the sandbox's process list (sessions, and idle with it). hort shows `-` rather than guessing.
+A `-` means hort could not tell: there is no record to read (a `lost-record` row), the project has no git (git mode, branch and dirty), the worktree or the clone records a submodule (dirty), reading the sandbox's worktree or clone did not answer within a few seconds (dirty, and for a clone the work it holds too), the worktree is gone, or hort could not read the sandbox's process list (sessions, and idle with it). hort shows `-` rather than guessing.
 
 A `lost-record` row is followed by an indented line with the command that collects it.
 
