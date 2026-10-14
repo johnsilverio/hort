@@ -186,9 +186,12 @@ pub trait WorktreeProvider {
     /// the `/workdir` the sandbox writes, configuration included, so its verdict
     /// is read through a git directory of hort's own that takes the clone's
     /// index and objects as data, borrows the objects of `project`, and
-    /// consults no configuration the sandbox wrote. A clone that records a
-    /// submodule cannot be answered for that way, and is an error rather than a
-    /// verdict.
+    /// consults no configuration the sandbox wrote.
+    ///
+    /// In either mode the read never enters a submodule, because whatever
+    /// stands at a submodule's path is the sandbox's to write. A `/workdir`
+    /// whose index records a submodule therefore cannot be answered for, and is
+    /// an error rather than a verdict.
     ///
     /// The sandbox writes the directory this reads, so it can leave there a file
     /// git opens that never answers, such as a named pipe. The read is therefore

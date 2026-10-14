@@ -324,22 +324,7 @@ impl WorktreeProvider for GitWorktreeProvider {
             return clone_is_dirty(&worktree, &self.sandbox_dir(name), project, deadline);
         }
         let admin = Self::worktree_admin_dir(project, &worktree)?;
-        let admin_arg = admin.to_string_lossy();
-        let worktree_arg = worktree.to_string_lossy();
-        let porcelain = run_by(
-            project,
-            "status",
-            &[
-                "--git-dir",
-                admin_arg.as_ref(),
-                "--work-tree",
-                worktree_arg.as_ref(),
-                "status",
-                "--porcelain",
-            ],
-            deadline,
-        )?;
-        Ok(!porcelain.trim().is_empty())
+        worktree_is_dirty(&worktree, &admin, project, deadline)
     }
 
     fn holds_unreturned_work(&self, name: &SandboxName, project: &Path) -> Result<bool, HortError> {
@@ -473,6 +458,60 @@ fn exited_by(child: &mut Child, deadline: Instant) -> Option<ExitStatus> {
     }
 }
 
+/// Whether the `/workdir` that `git` reads holds uncommitted changes, read
+/// without the host ever running git inside a submodule of it. `git` runs one
+/// git command against that `/workdir`, under the name of the operation it is
+/// for, and returns what it printed.
+///
+/// A gitlink in the index cannot be answered either way. Status runs git inside
+/// a submodule it finds checked out, under the configuration that checkout
+/// carries, which is the sandbox's to write; and ignoring submodules reads clean
+/// whatever stands at one, a gitlink just added included. So a `/workdir` whose
+/// index records one reads unknown, and the status is never run on it.
+/// Submodules stay ignored in the status read regardless, so a gitlink staged
+/// between the two reads is missed rather than entered.
+fn dirty_without_entering_a_submodule(
+    git: impl Fn(&str, &[&str]) -> Result<String, HortError>,
+) -> Result<bool, HortError> {
+    let staged = git("ls-files", &["ls-files", "--stage"])?;
+    if staged.lines().any(|entry| entry.starts_with("160000 ")) {
+        return Err(failed(
+            "status",
+            "the /workdir records a submodule, which the host does not enter",
+        ));
+    }
+    let porcelain = git("status", &["status", "--porcelain", "--ignore-submodules=all"])?;
+    Ok(!porcelain.trim().is_empty())
+}
+
+/// Whether the linked worktree at `worktree` holds uncommitted changes, read
+/// through `admin`, the administrative directory `project` keeps for it on the
+/// host, never through the worktree's own `.git` pointer.
+///
+/// The index that says whether the worktree records a submodule lives in that
+/// directory, which the sandbox cannot write, so every submodule the status
+/// could enter is in sight before the status runs. The worktree's own files,
+/// `.gitmodules` included, are the sandbox's to write and to remove, so none of
+/// them is asked. What the sandbox does write is whatever stands at a
+/// submodule's path, which is why a worktree recording one reads unknown even
+/// while nothing stands there yet. The status read ignores submodules as well,
+/// because the index can still change from the host side between the two
+/// reads: a gitlink the user stages in that moment is missed rather than
+/// entered.
+fn worktree_is_dirty(
+    worktree: &Path,
+    admin: &Path,
+    project: &Path,
+    deadline: Instant,
+) -> Result<bool, HortError> {
+    let admin_arg = admin.to_string_lossy();
+    let worktree_arg = worktree.to_string_lossy();
+    dirty_without_entering_a_submodule(|op, args| {
+        let through_admin = ["--git-dir", admin_arg.as_ref(), "--work-tree", worktree_arg.as_ref()];
+        run_by(project, op, &[&through_admin[..], args].concat(), deadline)
+    })
+}
+
 /// Whether the clone at `clone` holds uncommitted changes, read from the host
 /// without obeying anything the box wrote.
 ///
@@ -487,12 +526,6 @@ fn exited_by(child: &mut Child, deadline: Instant) -> Option<ExitStatus> {
 /// resolved inside the clone, the way `holds_unreturned_work` resolves it,
 /// because resolving a ref runs nothing the configuration names.
 ///
-/// A gitlink in the index cannot be answered either way. Status runs git inside
-/// a submodule under the configuration the box gave it, and ignoring submodules
-/// hides a gitlink the box just added, so a clone holding one reads unknown.
-/// Submodules stay ignored in the status read regardless, so a gitlink staged
-/// between the two reads is missed rather than entered.
-///
 /// The objects the clone borrows are lent from `project`, the store the box
 /// gets by mount, because the path the clone records is one only the box has.
 fn clone_is_dirty(
@@ -503,15 +536,7 @@ fn clone_is_dirty(
 ) -> Result<bool, HortError> {
     let tip = run_by(clone, "rev-parse", &["rev-parse", "HEAD"], deadline)?;
     let read = CloneRead::begin(sandbox_dir, tip.trim(), clone, project, deadline)?;
-    let staged = read.git("ls-files", &["ls-files", "--stage"])?;
-    if staged.lines().any(|entry| entry.starts_with("160000 ")) {
-        return Err(HortError::GitCommandFailed {
-            detail: "status: the clone records a submodule, which the host does not enter"
-                .to_string(),
-        });
-    }
-    let porcelain = read.git("status", &["status", "--porcelain", "--ignore-submodules=all"])?;
-    Ok(!porcelain.trim().is_empty())
+    dirty_without_entering_a_submodule(|op, args| read.git(op, args))
 }
 
 /// One read of a clone, through a git directory hort writes for it and removes
@@ -1439,6 +1464,78 @@ mod tests {
         }
 
         assert!(provider.is_dirty(&name, &repo).unwrap());
+    }
+
+    #[test]
+    fn git_worktree_is_dirty_cannot_answer_for_a_worktree_of_a_project_with_a_submodule() {
+        let (_repo, repo) = temp_dir();
+        let (_upstream, upstream) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&upstream);
+        init_repo_with_commit(&repo);
+        // git takes a submodule's source from what a repository says rather
+        // than from whoever runs it, so it refuses a local path unless told
+        // otherwise. Both repositories here are this test's own.
+        git(
+            &repo,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                upstream.to_str().unwrap(),
+                "vendored",
+            ],
+        );
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=hort-test",
+                "-c",
+                "user.email=hort-test@localhost",
+                "commit",
+                "-m",
+                "vendor",
+            ],
+        );
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
+
+        let read = provider.is_dirty(&name, &repo);
+
+        // Nothing stands at the submodule's path yet, but whatever comes to
+        // stand there is the sandbox's to write, and a status read runs git
+        // inside a submodule it finds checked out under the configuration that
+        // checkout carries. A read that answers until then leaves to the
+        // sandbox whether the host looks inside, so a project with a submodule
+        // reads unknown however its worktree stands.
+        assert!(read.is_err(), "a read that cannot look inside the submodule answered: {read:?}");
+    }
+
+    #[test]
+    fn git_worktree_is_dirty_cannot_answer_for_a_worktree_holding_a_gitlink() {
+        let (_repo, repo) = temp_dir();
+        let (_state, state_root) = temp_dir();
+        init_repo_with_commit(&repo);
+        let provider = GitWorktreeProvider::new(repo.clone(), state_root.clone());
+        let name = SandboxName::new("demo").unwrap();
+        let worktree =
+            provider.create(&name, &BranchName::new("demo").unwrap(), GitMode::Worktree).unwrap();
+        let nested = worktree.path.join("vendored");
+        fs::create_dir(&nested).unwrap();
+        init_repo_with_commit(&nested);
+        git(&worktree.path, &["add", "vendored"]);
+
+        let read = provider.is_dirty(&name, &repo);
+
+        // Staged on the host and declared nowhere else: no commit records this
+        // submodule and no `.gitmodules` names it, so only the index the host
+        // keeps for the worktree says it is there. The worktree's own files
+        // are the sandbox's to write and to remove, so they cannot be what
+        // decides whether a submodule is there.
+        assert!(read.is_err(), "a read that cannot look inside the submodule answered: {read:?}");
     }
 
     #[test]
