@@ -80,7 +80,7 @@ hort down api-feature    # tear it down (asks first if sessions are open, or if 
 
 Inside, you run agents however you already do: `claude`, `aider`, `gemini`, whatever you reach for. hort doesn't wrap them or replace them. It just makes the ground under them safe to stand on.
 
-By default the agent writes files and you review and commit them from the host, where your real repository lives; git deliberately doesn't work inside the box. When you'd rather the agent finish the job itself, `hort up <name> --git clone` gives the box its own clone, so it can commit, push and open a pull request with a token you scope. Either way your repository is never written from inside it. See [Git inside the sandbox](./docs/git-modes.md).
+By default the agent writes files and you review and commit them from the host, where your real repository lives; git deliberately doesn't work inside the box. When you'd rather the agent finish the job itself, `hort up <name> --git clone` gives the box its own clone, so it can commit, push and open a pull request with a token you scope. Either way your repository is never written from inside it. Committing from the host has one exception, a project that records a submodule: the box can write the submodule's directory, and your own git looks inside it and may obey what it finds, so use clone mode there ([how to tell](./docs/concepts.md#a-project-that-records-a-submodule)). See [Git inside the sandbox](./docs/git-modes.md).
 
 <br>
 

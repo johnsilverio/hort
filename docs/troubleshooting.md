@@ -67,7 +67,7 @@ The sandbox is `orphaned`: its container is gone, usually because the machine re
 
 ### `sandbox '<name>' is running but its container state is gone, so no session can join it (...)`
 
-Something deleted hort's runtime files under `$XDG_RUNTIME_DIR/hort/containers/` while the sandbox ran. hort does not reconstruct them. Commit what you want to keep from the worktree named in the message, then run the two commands the message gives.
+Something deleted hort's runtime files under `$XDG_RUNTIME_DIR/hort/containers/` while the sandbox ran. hort does not reconstruct them. Commit what you want to keep from the worktree named in the message (not safe in [a project that records a submodule](concepts.md#a-project-that-records-a-submodule)), then run the two commands the message gives.
 
 ### The changes I had in my checkout are not in the sandbox
 
@@ -99,7 +99,7 @@ Claude Code sees uid 0. In a hort sandbox that is the root of an unprivileged us
 
 ### git says the directory is not a repository
 
-Expected in the default worktree mode, by design, because the worktree's `.git` points at your host repository, which the box does not have. Run git on the host, in the worktree (`~/.local/state/hort/sandboxes/<name>/worktree-<name>`, also printed by `echo $HORT_WORKTREE` inside). See [Git is a host activity](concepts.md#git-is-a-host-activity).
+Expected in the default worktree mode, by design, because the worktree's `.git` points at your host repository, which the box does not have. Run git on the host, in the worktree (`~/.local/state/hort/sandboxes/<name>/worktree-<name>`, also printed by `echo $HORT_WORKTREE` inside). See [Git is a host activity](concepts.md#git-is-a-host-activity), and do not do this in [a project that records a submodule](concepts.md#a-project-that-records-a-submodule), where it is not safe.
 
 If you want git to work inside instead, build the sandbox with `hort up <name> --git clone`, which gives it a clone of its own: see [Git inside the sandbox](git-modes.md).
 
@@ -110,7 +110,7 @@ error: unable to normalize alternate object path: /run/hort/objects
 fatal: bad object HEAD
 ```
 
-You ran git **on the host** inside a [clone-mode](git-modes.md) sandbox's directory. The clone borrows your history at an address that exists inside the sandbox and not on your machine, so git run from outside cannot resolve it. Nothing is damaged. Ask the sandbox instead:
+You ran git **on the host** inside a [clone-mode](git-modes.md) sandbox's directory. The clone borrows your history at an address that exists inside the sandbox and not on your machine, so git run from outside cannot resolve it. Nothing is damaged, and [working around it from the host would not be safe](git-modes.md#reading-the-clone-from-the-host). Ask the sandbox instead:
 
 ```bash
 hort run <name> -- git -C /workdir status
@@ -183,7 +183,7 @@ Its worktree directory was deleted on the host while it ran. Anything uncommitte
 hort down <name>
 ```
 
-It stops the container and its helpers. It cannot remove the worktree, because its path was in the lost record: if the directory `~/.local/state/hort/sandboxes/<name>/worktree-<name>` still exists, commit anything you need from it on the host, then run `git worktree remove --force <that path>` in the repository it belonged to (or delete the directory and run `git worktree prune`). Adopting such a sandbox back into hort is not supported yet; it is on the [Roadmap](roadmap.md#adopting-a-sandbox-whose-record-was-lost).
+It stops the container and its helpers. It cannot remove the worktree, because its path was in the lost record: if the directory `~/.local/state/hort/sandboxes/<name>/worktree-<name>` still exists, commit anything you need from it on the host (not safe in [a project that records a submodule](concepts.md#a-project-that-records-a-submodule)), then run `git worktree remove --force <that path>` in the repository it belonged to (or delete the directory and run `git worktree prune`). Adopting such a sandbox back into hort is not supported yet; it is on the [Roadmap](roadmap.md#adopting-a-sandbox-whose-record-was-lost).
 
 ### `hort prune` ends with `git command failed: worktree prune: fatal: not a git repository ...`
 

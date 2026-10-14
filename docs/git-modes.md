@@ -13,7 +13,7 @@ A sandbox gets its `/workdir` in one of two ways, and the choice decides whether
 
 Worktree mode is the default and is the right one when you review and commit the work yourself. Clone mode exists for the case where the agent has to finish the job on its own: commit, push and open a pull request without you in the loop.
 
-In both modes your repository is safe from what happens inside the box. The difference is only how the work comes back.
+In both modes your repository is safe from what happens inside the box, except in worktree mode for a project that records a submodule ([see below](#which-one-to-use)). The difference is only how the work comes back.
 
 ## Worktree mode
 
@@ -116,7 +116,7 @@ error: unable to normalize alternate object path: /run/hort/objects
 fatal: bad object HEAD
 ```
 
-That is not damage. The clone records the address where it borrows objects, and that address exists inside the sandbox, not on your host. Ask the sandbox instead:
+That is not damage. The clone records the address where it borrows objects, and that address exists inside the sandbox, not on your host. Do not work around it from the host: the clone's `.git`, its configuration included, is the sandbox's to write, and a git that read it on your host may obey what the sandbox put there, as you. Ask the sandbox instead:
 
 ```bash
 hort run fix-login -- git -C /workdir status
@@ -150,5 +150,7 @@ Take what you want out of it first, then tear it down and build again.
 ## Which one to use
 
 Use **worktree mode** when you are the one reviewing and committing, which is most of the time. It is the default, it has fewer moving parts, and nothing inside the box can run git at all.
+
+The exception is a project that records a submodule: use **clone mode** for it even when you do the reviewing yourself, asking the sandbox with `hort run` as [above](#reading-the-clone-from-the-host). In worktree mode the git you run on the host in the worktree looks inside the submodule's directory, which the box writes, and may obey what it finds there ([how to tell whether your project records one](concepts.md#a-project-that-records-a-submodule)).
 
 Use **clone mode** when an agent has to deliver finished work by itself, typically several agents in parallel each opening its own pull request. The cost is that a token now lives inside the box, so scope it narrowly and protect the branches on the remote.

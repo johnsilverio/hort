@@ -47,9 +47,23 @@ Committing in the worktree advances that branch in your real repository, which i
 
 The worktree's `.git` is a small file pointing at your repository's real `.git` directory by its host path, and that path does not exist inside the sandbox. So in this mode **no git command works inside a sandbox**: not `status`, not `diff`, not `commit`, even if git is installed in the rootfs. This is deliberate. Making git work inside by mounting your repository's `.git` into the box writable would let an unrestricted agent rewrite history or delete branches in your real repository, instead of being limited to one disposable worktree.
 
-So the division of labour is: **the agent writes files, you commit them from the host.** Review with `git diff` in the worktree directory, commit there, while the sandbox is still running. `$HORT_WORKTREE`, set in every session, holds the host path of that directory.
+So the division of labour is: **the agent writes files, you commit them from the host.** Review with `git diff` in the worktree directory, commit there, while the sandbox is still running, unless the project records a submodule ([see below](#a-project-that-records-a-submodule)). `$HORT_WORKTREE`, set in every session, holds the host path of that directory.
 
 **When you need git inside, there is a second mode.** `hort up <name> --git clone` gives the sandbox its own clone of the repository instead of a worktree, so an agent can commit, branch and open a pull request with its own tools. Your repository is still never written from inside: the clone borrows its history read-only and can only push to a remote you gave it credentials for. Worktrees stay the default. See [Git inside the sandbox](git-modes.md).
+
+### A project that records a submodule
+
+Running git on the host in a sandbox's worktree is not safe when the project records a submodule. The submodule's directory is part of `/workdir`, so whatever stands there is the box's to write; `git status` and `git diff` look inside it by default and may obey what the box left there, as you, on the host ([Security model](security.md#your-repository)). Build such a project's sandboxes in [clone mode](git-modes.md) instead, where you ask the sandbox about its work with `hort run` and never run git on the host inside the sandbox's directory. hort's own reads already stay out: [`hort ls`](commands/ls.md#output) shows such a worktree's dirty state as `-` rather than look inside it.
+
+To tell whether your project records one, run this in your own checkout, never in a sandbox's directory:
+
+```bash
+git ls-tree -r --full-tree HEAD | grep '^160000'
+```
+
+It prints one line per submodule recorded in `HEAD`, the commit a new sandbox starts from, whether `.gitmodules` declares it or not, and nothing when there is none. To check a branch you build on with `--branch`, name it instead of `HEAD`.
+
+A repository the box creates inside the worktree becomes a submodule too once your own `git add` records it, which git warns about as adding an embedded repository. If `git add` gives you that warning in a sandbox's worktree, that worktree now records a submodule, and the same holds for it.
 
 ### What `down` keeps
 

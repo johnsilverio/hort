@@ -97,7 +97,7 @@ If a sandbox of that name is `orphaned` (its container died, for example after a
 | `branch '<name>' already exists (a 'hort down' keeps a sandbox's branch) — run 'hort up <name> --branch <name>' to build the sandbox on it, or choose another name` | See [above](#building-on-a-branch-a-down-kept). |
 | `branch '<branch>' is already checked out in another worktree` | git allows a branch in one worktree at a time. Switch that other checkout to a different branch, or pick another branch or name. |
 | `branch '<branch>' does not exist; create it first or omit --branch to create a new branch named '<name>'` | `--branch` names a branch that does not exist. |
-| `sandbox '<name>' holds branch '<held>', not '<requested>' — run 'hort down <name>' first, then 'hort up <name> --branch <requested>'` | You are resuming a half-built sandbox, whose worktree is on another branch than the `--branch` you gave. Commit what you need from its worktree first. |
+| `sandbox '<name>' holds branch '<held>', not '<requested>' — run 'hort down <name>' first, then 'hort up <name> --branch <requested>'` | You are resuming a half-built sandbox, whose worktree is on another branch than the `--branch` you gave. Commit what you need from its worktree first (not safe in [a project that records a submodule](../concepts.md#a-project-that-records-a-submodule)). |
 | `sandbox '<name>' was built in <built> git mode, not <requested> — run 'hort down <name>' first, or repeat it with 'hort up <name> --git <built>'` | You are resuming a half-built sandbox that was built in the other [git mode](../git-modes.md). Finish it in the mode it has, or tear it down and build again. |
 
 ### Failures while building

@@ -132,7 +132,7 @@ How a sandbox of this project gets git into `/workdir`.
 
 | Value | Meaning |
 | :--- | :--- |
-| `"worktree"` | `/workdir` is a git worktree of your repository. git does not work inside the sandbox; you commit from the host. |
+| `"worktree"` | `/workdir` is a git worktree of your repository. git does not work inside the sandbox; you commit from the host, which is not safe in [a project that records a submodule](concepts.md#a-project-that-records-a-submodule): use `"clone"` there. |
 | `"clone"` | `/workdir` is a clone of your repository, with a writable `.git` of its own, so an agent can commit, branch and open a pull request from inside. |
 
 **Before you turn `"clone"` on for a project, two things are worth knowing.** Any credential you pass into the sandbox so the agent can push lives *inside* the box, with the agent, so scope it to one repository and protect the branches on the remote ([security](security.md#in-clone-mode)). And the clone borrows your history rather than copying it, so it costs about as much disk as a worktree: measured on a repository with 2.3 GB of history, the sandbox's own `.git` was about 6 MB and the new disk was the checkout alone. See [git inside the sandbox](git-modes.md) for the whole picture, including what `hort down` asks before it removes a clone.

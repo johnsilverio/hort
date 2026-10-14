@@ -67,7 +67,7 @@ Inside a sandbox the hostname is also the sandbox name, so prompts that show `\h
 
 ## Keeping track
 
-`hort ls` lists every sandbox on the machine, from every project, with its sessions, idle time and whether its worktree holds uncommitted work. A sandbox you forgot keeps running until you remove it; it costs memory, never work. Review and commit from the host, then `hort down` what you are finished with.
+`hort ls` lists every sandbox on the machine, from every project, with its sessions, idle time and whether its worktree holds uncommitted work. A sandbox you forgot keeps running until you remove it; it costs memory, never work. Review and commit from the host (not safe in [a project that records a submodule](concepts.md#a-project-that-records-a-submodule)), then `hort down` what you are finished with.
 
 ## Notifications
 

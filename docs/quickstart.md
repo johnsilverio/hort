@@ -86,6 +86,8 @@ The columns are name, state, sessions (processes running in the box besides its 
 
 Git does not work inside a sandbox built the default way (see [why](concepts.md#git-is-a-host-activity), and [clone mode](git-modes.md) for the sandbox that does have it). You review and commit on the host, against the worktree, while the sandbox is still running. The worktree lives at `~/.local/state/hort/sandboxes/<name>/worktree-<name>`; inside the box, `$HORT_WORKTREE` prints that host path too.
 
+Do this only in a project that records no submodule, and stop if `git add` warns that it is adding an embedded repository: in either case git run here may obey what the box wrote. [A project that records a submodule](concepts.md#a-project-that-records-a-submodule) says how to tell and which mode to use instead.
+
 ```bash
 cd ~/.local/state/hort/sandboxes/fix-login/worktree-fix-login
 git status
