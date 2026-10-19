@@ -149,7 +149,7 @@ Take what you want out of it first, then tear it down and build again.
 
 ## Which one to use
 
-Use **worktree mode** when you are the one reviewing and committing, which is most of the time. It is the default, it has fewer moving parts, and nothing inside the box can run git at all.
+Use **worktree mode** when you are the one reviewing and committing, which is most of the time. It is the default, it has fewer moving parts, and git inside the box cannot reach your repository at all.
 
 The exception is a project that records a submodule: use **clone mode** for it even when you do the reviewing yourself, asking the sandbox with `hort run` as [above](#reading-the-clone-from-the-host). In worktree mode the git you run on the host in the worktree looks inside the submodule's directory, which the box writes, and may obey what it finds there ([how to tell whether your project records one](concepts.md#a-project-that-records-a-submodule)).
 

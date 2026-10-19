@@ -4,7 +4,7 @@
 
 ---
 
-You are running inside a **hort sandbox**: an isolated Linux container around a git worktree. It exists so you can work with full permissions without any risk to the user's machine. These facts hold for every hort sandbox:
+You are running inside a **hort sandbox**: an isolated Linux container around a git worktree. It exists so you can work with full permissions while the user's machine stays outside it. These facts hold for every hort sandbox:
 
 ## Where you are
 

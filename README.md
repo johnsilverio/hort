@@ -40,7 +40,7 @@ That single change is what makes the rest possible:
 
 - **Run agents in parallel.** Point several at the same project at once: one writing a feature, one reviewing it, one chasing a failing test, all looking at the same files.
 - **Detach and come back.** The box isn't tied to the terminal you opened it from. Drop the SSH connection or close the tab and it keeps running; reattach whenever you want.
-- **Be root on a server without the fear.** Run it on a VPS and the agent can have root inside the box while your host stays completely out of reach.
+- **Be root on a server without the fear.** Run it on a VPS and the agent can have root inside the box, and that root counts for nothing on your host.
 
 <br>
 
@@ -52,7 +52,7 @@ That single change is what makes the rest possible:
 
 **It's quick to start and simple to install.** hort is one binary, written in Rust, that you drop into `~/.local/bin`. There's no daemon to reach and no image to pull, because you bring a prepared root filesystem, so a box comes up fast.
 
-**Your repository is never on the line.** The real `.git` stays on the host. The agent only ever sees a throwaway worktree on its own branch, so the worst a bad command can do is ruin a scratch branch. If you turn on clone mode so the agent can use git itself, it gets a clone that borrows your history read-only and cannot push back into your repository. Inside, your session is root of its own user namespace, mapped to your own unprivileged user on the host and holding no capabilities, so being root in there buys nothing on the machine.
+**Your repository is never written from inside.** The real `.git` stays on the host. The agent only ever sees a throwaway worktree on its own branch, so the most a bad command can ruin is a scratch branch, unless the project [records a submodule](./docs/concepts.md#a-project-that-records-a-submodule). If you turn on clone mode so the agent can use git itself, it gets a clone that borrows your history read-only and cannot push back into your repository. Inside, your session is root of its own user namespace, mapped to your own unprivileged user on the host and holding no capabilities, so being root in there buys nothing on the machine.
 
 <br>
 
@@ -60,7 +60,7 @@ That single change is what makes the rest possible:
 
 A security tool that oversells itself is worse than none, so here is the line drawn plainly.
 
-hort contains destruction. The filesystem and the processes are walled off from the host, and the most a rogue command can wreck is the worktree, never the machine and never your real repository.
+hort contains destruction. The filesystem and the processes are walled off from the host, and the most a rogue command can wreck is the worktree, never the machine and never your real repository (a project that [records a submodule](./docs/concepts.md#a-project-that-records-a-submodule) needs clone mode for that).
 
 It does not promise to stop exfiltration. By default the box has open internet, because the agent needs it to reach its model, and a genuinely hostile repo could use that same connection to send data back out. You can turn on an egress allowlist, and the box will then reach only the hosts you name, which closes the easy paths. It raises the floor; it is not a vault, and a host you allowed can still be misused.
 

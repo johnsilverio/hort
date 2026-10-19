@@ -14,7 +14,7 @@ The idea everything else follows from: **the sandbox outlives every session insi
 
 What you get:
 
-- **Destruction stays in the box.** The host filesystem does not exist inside. The real `.git` stays on the host, so the worst a bad command can do is wreck one uncommitted worktree.
+- **Destruction stays in the box.** The host filesystem does not exist inside. The real `.git` stays on the host, so the worst a bad command can do is wreck one uncommitted worktree, unless the project [records a submodule](concepts.md#a-project-that-records-a-submodule).
 - **Your environment comes with you.** Dotfiles and credentials are mounted read-only, so your shell and editor config work inside.
 - **Several agents at once.** Open as many sessions as you like in one sandbox, or run several sandboxes on separate branches.
 - **Nothing is lost by accident.** hort never kills an idle sandbox. `hort ls` shows every box with its age, idle time and whether its worktree holds uncommitted work.

@@ -60,7 +60,7 @@ Start the agent the way you always do. The sandbox never starts one for you.
 claude --dangerously-skip-permissions
 ```
 
-The agent can write anywhere in `/workdir`, install packages, and delete whatever it likes. The worst it can do is wreck this worktree. For Claude Code to accept that flag inside a sandbox, your rootfs needs `IS_SANDBOX=1` (see [Agents that refuse to run as root](rootfs.md#agents-that-refuse-to-run-as-root)), and its credentials have to be mounted; the recipe is in [Configuration recipes](recipes.md#agent-credentials).
+The agent can write anywhere in `/workdir`, install packages, and delete whatever it likes. The most it can wreck is this worktree, unless the project [records a submodule](concepts.md#a-project-that-records-a-submodule). For Claude Code to accept that flag inside a sandbox, your rootfs needs `IS_SANDBOX=1` (see [Agents that refuse to run as root](rootfs.md#agents-that-refuse-to-run-as-root)), and its credentials have to be mounted; the recipe is in [Configuration recipes](recipes.md#agent-credentials).
 
 ## 5. Open more sessions
 

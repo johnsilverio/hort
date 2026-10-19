@@ -25,7 +25,7 @@ The whole root is writable, so tools that write to `/usr` or `/etc` work. The gu
 
 ### Your repository
 
-**In worktree mode, the default.** The real `.git` directory stays on the host and is not mounted. The agent sees a worktree whose `.git` is a pointer file naming a host path that does not exist inside. That pointer is mounted **read-only**: the agent cannot rewrite or replace it, and the mount point itself cannot be removed or renamed from inside. It can delete every other file in `/workdir`; your history, your other branches and your main checkout are untouched. **The most a rogue command can destroy is the uncommitted content of one worktree.** That is also why git does not work inside a sandbox in this mode.
+**In worktree mode, the default.** The real `.git` directory stays on the host and is not mounted. The agent sees a worktree whose `.git` is a pointer file naming a host path that does not exist inside. That pointer is mounted **read-only**: the agent cannot rewrite or replace it, and the mount point itself cannot be removed or renamed from inside. It can delete every other file in `/workdir`; your history, your other branches and your main checkout are untouched. **The most a rogue command can destroy is the uncommitted content of one worktree, unless that worktree records a submodule** (see below). That is also why git does not work inside a sandbox in this mode.
 
 You commit the work from the host, in that same worktree, while the sandbox is up. In a worktree that records no submodule, the read-only pointer is what makes that safe: a `git` you run there reads the genuine pointer, not one the agent rewrote to name a repository it planted with its own hooks or filters. Such a planted pointer would run the agent's configuration as you, on the host, outside every layer hort has, the moment you ran an ordinary git command in the worktree. Committing advances the sandbox's own branch in your repository; the commits are yours, made on the host.
 
@@ -62,6 +62,10 @@ Your host's loopback interface is closed to an open sandbox except for the datab
 ### What you mount into the box
 
 Read-only means the agent cannot modify your dotfiles and credentials. It can still **read** them, and under open egress it can send them anywhere. Mount only what the agent needs, and only development or personal session credentials. Environment variables you forward with `auth.env` are equally readable. Nothing is mounted until you configure it: both lists start empty, and `hort config` offers an agent's credential directory rather than assuming it ([a question that says what the mount exposes is planned](roadmap.md#a-credentials-question-that-says-what-it-exposes)).
+
+### Your own git in a worktree that records a submodule
+
+In worktree mode, a `git` you run on the host in a sandbox's worktree may obey what the agent left there when that worktree records a submodule, and it runs as you, outside every layer hort has. Use [clone mode](git-modes.md) for such a project; [Your repository](#your-repository) says why, and [A project that records a submodule](concepts.md#a-project-that-records-a-submodule) how to tell.
 
 ### Abuse of an allowed host
 
